@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clarion Seam Spike — Target Form</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 480px;
+      margin: 80px auto;
+      padding: 0 24px;
+      color: #1a1a1a;
+    }
+    h1 { font-size: 1.25rem; margin-bottom: 1.5rem; }
+    .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 1.25rem; }
+    label { font-weight: 600; font-size: 0.9rem; }
+    input[type="text"] {
+      padding: 10px 12px;
+      font-size: 1rem;
+      border: 2px solid #ccc;
+      border-radius: 6px;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    input[type="text"]:focus {
+      outline: none;
+      border-color: #2563eb;
+      box-shadow: 0 0 0 3px rgba(37,99,235,0.2);
+    }
+    button[type="submit"] {
+      padding: 10px 20px;
+      font-size: 1rem;
+      font-weight: 600;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    button[type="submit"]:hover { background: #1d4ed8; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Spike Target — Single Field Form</h1>
+    <form id="spike-form" action="#" method="post">
+      <div class="field">
+        <label for="full-name">Full name</label>
+        <input
+          type="text"
+          id="full-name"
+          name="full-name"
+          autocomplete="name"
+          placeholder="e.g. Jane Smith"
+        >
+      </div>
+      <button type="submit">Submit</button>
+    </form>
+  </main>
+</body>
+</html>
