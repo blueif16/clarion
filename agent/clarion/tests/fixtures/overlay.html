@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clarion A1 — Overlay / occlusion + native-setter fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 0;
+      padding: 40px;
+      color: #1a1a1a;
+    }
+    h1 { font-size: 1.25rem; }
+
+    /* The base page: a form with a button that the modal will cover. */
+    .page label { display: block; font-weight: 600; margin: 16px 0 6px; }
+    .page input[type="text"] {
+      width: 320px;
+      padding: 10px 12px;
+      font-size: 1rem;
+      border: 2px solid #ccc;
+      border-radius: 6px;
+    }
+    /* Top-left, well away from the centered modal — so it is occluded by the
+       full-screen scrim only, not by the modal card. */
+    #pay-now {
+      position: absolute;
+      top: 90px;
+      left: 40px;
+      padding: 12px 24px;
+      font-size: 1rem;
+      font-weight: 600;
+      background: #16a34a;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    /* A full-screen scrim + a centered modal that visually covers #pay-now.
+       The scrim has a HIGHER paint order (later in DOM + position:fixed +
+       z-index) so PaintOrderRemover must see it on top. */
+    #scrim {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.55);
+      z-index: 1000;
+    }
+    #modal {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 420px;
+      padding: 28px;
+      background: #fff;
+      border-radius: 12px;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.3);
+      z-index: 1001;
+    }
+    #modal h2 { margin-top: 0; font-size: 1.1rem; }
+    #accept-cookies {
+      margin-top: 16px;
+      padding: 12px 24px;
+      font-size: 1rem;
+      font-weight: 600;
+      background: #2563eb;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <h1>Electric Bill — Payment</h1>
+
+    <!-- The base-page action button. The modal scrim sits ON TOP of it, so a
+         sighted user can't click it and the agent must NOT number it. It is
+         positioned in the top-left corner, OUTSIDE the centered modal, so it is
+         occluded by the scrim alone (not by the modal card). -->
+    <button id="pay-now" type="button">Pay now</button>
+  </main>
+
+  <!-- The overlay. The scrim dims the whole page (and occludes #pay-now). The
+       modal sits on top of the scrim and carries the genuinely-interactive,
+       visible controls the agent MUST number: the controlled card input and the
+       Accept button. -->
+  <div id="scrim"></div>
+  <div id="modal" role="dialog" aria-label="Cookie consent">
+    <h2>We use cookies</h2>
+    <p>Accept cookies to continue to your account.</p>
+
+    <!-- A controlled input INSIDE the modal (on top of the scrim, so visible).
+         A JS reflector REVERTS .value to its committed state UNLESS the change
+         arrived via a real 'input' event. A naive element.value = "..." fires NO
+         'input' event, so it is silently wiped; only the native-setter (which
+         dispatches 'input') makes the value persist. The controlled-input proof. -->
+    <label for="card">Card number</label>
+    <input
+      type="text"
+      id="card"
+      name="card"
+      autocomplete="off"
+      placeholder="•••• •••• •••• ••••"
+    >
+
+    <button id="accept-cookies" type="button">Accept cookies</button>
+  </div>
+
+  <script>
+    // Controlled-input behaviour: a React-like reflector. The component's
+    // "state" is the last value committed through a *real* input event. Any
+    // value the DOM holds that did NOT come through an input event is reverted
+    // on the next tick — exactly the failure mode `el.value = x` hits.
+    (function () {
+      const card = document.getElementById('card');
+      let committed = '';            // the component's "state"
+      let userIsTyping = false;
+
+      // A real user keystroke or a dispatched 'input' event commits the value.
+      card.addEventListener('input', function (e) {
+        committed = card.value;      // controlled component accepts the change
+      });
+
+      // The reflector: periodically force the DOM back to committed state, so a
+      // bare `.value =` write (which fires NO input event) is silently reverted.
+      setInterval(function () {
+        if (card.value !== committed) {
+          card.value = committed;
+        }
+      }, 30);
+
+      // #accept-cookies dismisses the modal (used by the click → diff test).
+      document.getElementById('accept-cookies').addEventListener('click', function () {
+        document.getElementById('scrim').remove();
+        document.getElementById('modal').remove();
+        // Reveal a confirmation marker so the page-diff is non-empty.
+        const note = document.createElement('p');
+        note.id = 'cookie-note';
+        note.textContent = 'Cookies accepted.';
+        document.querySelector('main').appendChild(note);
+      });
+    })();
+  </script>
+</body>
+</html>
