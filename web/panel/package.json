@@ -1,0 +1,23 @@
+{
+  "name": "clarion-panel",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port 3001",
+    "build": "next build",
+    "start": "next start --port 3001"
+  },
+  "dependencies": {
+    "next": "16.2.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "@livekit/components-react": "^2.9.0",
+    "livekit-client": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "typescript": "^5"
+  }
+}
