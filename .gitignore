@@ -1,0 +1,35 @@
+# ── OS / editor cruft ──
+.DS_Store
+*.swp
+*~
+
+# ── Secrets (real env files never committed; template is kept) ──
+.env
+.env.*
+!.env.example
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Node / Next.js ──
+node_modules/
+.next/
+out/
+build/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+*.log
+
+# ── Local Claude Code tooling (vendored plugins, not part of Clarion) ──
+.claude/
+
+# ── Generated docs (regenerable from README.md) ──
+README.pdf
