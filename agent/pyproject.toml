@@ -1,0 +1,57 @@
+[project]
+name = "clarion-agent"
+version = "0.0.1"
+description = "Clarion — a voice web co-pilot (kernel + ports). C1 contracts + fakes."
+requires-python = ">=3.12"
+dependencies = [
+    "langgraph>=1.0,<2.0",
+    "pydantic>=2.7,<3.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+# S1 — the seam spike (execution §7). Real providers live ONLY here, never in
+# contracts/ or kernel/. Install with: pip install -e ".[spike]".
+spike = [
+    "livekit-agents>=1.0",
+    "livekit-plugins-google",
+    "livekit-plugins-deepgram",
+    "livekit-plugins-silero",
+    "livekit-plugins-turn-detector",
+    "playwright>=1.40",
+    "google-genai>=1.0",
+    "python-dotenv>=1.0",
+]
+# R-Moss — the live Retriever + Ingest + Memory stack (Moss + Gemini embeddings).
+# Makes the latency-meter beat real. `inferedge-moss-core` is the native runtime
+# Moss loads for in-memory sub-ms search. Install with: pip install -e ".[retrieval]".
+retrieval = [
+    "moss==1.2.0",
+    "inferedge-moss-core==0.14.0",
+    "google-genai>=1.0",
+    "python-dotenv>=1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["clarion*"]
+
+[tool.pytest.ini_options]
+# asyncio_mode=auto lets `async def test_*` run without a per-test decorator,
+# but we also keep explicit @pytest.mark.asyncio markers for clarity.
+asyncio_mode = "auto"
+testpaths = ["clarion/tests"]
+# The regression gate is DETERMINISTIC: live Moss/Gemini integration tests are
+# excluded by default (they hit an intermittently-available sponsor service).
+# Run them on demand:  pytest clarion -m live
+addopts = "-m 'not live'"
+markers = [
+    "live: network-dependent integration test (Moss/Gemini); excluded by default",
+]
