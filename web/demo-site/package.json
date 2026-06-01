@@ -1,0 +1,22 @@
+{
+  "name": "clarion-demo-site",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted fake utility-account site shell for the Clarion demo. Scaffold only — scripted a11y flaws arrive in D2; the LiveKit panel in U1.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "16.2.2",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "@types/react": "19.2.0",
+    "@types/react-dom": "19.2.0",
+    "typescript": "5.7.2"
+  }
+}

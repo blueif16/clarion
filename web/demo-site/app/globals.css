@@ -1,0 +1,205 @@
+:root {
+  --bg: #f4f6f8;
+  --panel: #ffffff;
+  --ink: #1a2330;
+  --muted: #5b6b7e;
+  --line: #d9e0e8;
+  --brand: #0b6b5e;
+  --brand-ink: #ffffff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  line-height: 1.5;
+}
+
+a {
+  color: var(--brand);
+}
+
+.shell {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 24px 20px 64px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  background: var(--brand);
+  color: var(--brand-ink);
+}
+
+.topbar a {
+  color: var(--brand-ink);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.2px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 24px;
+  margin-top: 20px;
+}
+
+.field {
+  display: block;
+  margin: 14px 0;
+}
+
+.field label {
+  display: block;
+  font-size: 14px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.field input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 15px;
+}
+
+.btn {
+  display: inline-block;
+  background: var(--brand);
+  color: var(--brand-ink);
+  border: none;
+  border-radius: 8px;
+  padding: 10px 18px;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.disclosure {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 32px;
+  text-align: center;
+}
+
+/* ── D2 additions ──────────────────────────────────────────────────────── */
+
+/* Unlabeled-input adjacent text — visually looks like a label but is NOT
+   programmatically associated (no htmlFor / aria-labelledby). */
+.field-hint {
+  display: block;
+  font-size: 14px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.field-error {
+  color: #c0392b;
+  font-size: 14px;
+  margin: 8px 0 0;
+}
+
+.field-processing {
+  color: var(--muted);
+  font-size: 14px;
+  margin: 8px 0;
+}
+
+/* Demo hint below the login form */
+.hint-block {
+  margin-top: 14px;
+  font-size: 13px;
+}
+
+/* ── Autopay upsell modal ──────────────────────────────────────────────── */
+.upsell-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 999;
+}
+
+.upsell-box {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 32px;
+  max-width: 420px;
+  width: 90%;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.24);
+}
+
+.upsell-box h2 {
+  margin: 0 0 12px;
+  font-size: 20px;
+}
+
+.upsell-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 24px;
+  flex-wrap: wrap;
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--brand);
+  border: 1.5px solid var(--brand);
+}
+
+/* ── Layout-shifting confirmation banner ──────────────────────────────── */
+/* Async-injected after submit; pushes content down (real layout shift). */
+.confirm-banner {
+  background: #e6f4ea;
+  border: 1.5px solid #2d7a4f;
+  border-radius: 8px;
+  padding: 14px 18px;
+  margin-bottom: 16px;
+  color: #1b4d32;
+  font-size: 15px;
+}
