@@ -1,0 +1,575 @@
+{
+  "recorded_at": 1780238657.381878,
+  "source_url": "http://localhost:8770/",
+  "states": {
+    "login": {
+      "nodes": {
+        "0": {
+          "index": 0,
+          "role": "link",
+          "name": "Northwind Utilities",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            20.0,
+            16.0,
+            145.0,
+            24.0
+          ],
+          "node_id": "40"
+        },
+        "1": {
+          "index": 1,
+          "role": "link",
+          "name": "My Account",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            1170.140625,
+            19.0,
+            89.859375,
+            18.0
+          ],
+          "node_id": "43"
+        },
+        "2": {
+          "index": 2,
+          "role": "textbox",
+          "name": "Username",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            278.875,
+            670.0,
+            39.0
+          ],
+          "node_id": "54"
+        },
+        "3": {
+          "index": 3,
+          "role": "textbox",
+          "name": "",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            356.875,
+            670.0,
+            39.0
+          ],
+          "node_id": "62"
+        },
+        "4": {
+          "index": 4,
+          "role": "button",
+          "name": "Sign in",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            305.0,
+            409.875,
+            86.0,
+            37.0
+          ],
+          "node_id": "65"
+        }
+      },
+      "token_estimate": 28
+    },
+    "account": {
+      "nodes": {
+        "0": {
+          "index": 0,
+          "role": "link",
+          "name": "Northwind Utilities",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            20.0,
+            16.0,
+            145.0,
+            24.0
+          ],
+          "node_id": "232"
+        },
+        "1": {
+          "index": 1,
+          "role": "link",
+          "name": "My Account",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            1170.140625,
+            19.0,
+            89.859375,
+            18.0
+          ],
+          "node_id": "234"
+        },
+        "2": {
+          "index": 2,
+          "role": "link",
+          "name": "Pay bill",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            305.0,
+            466.6875,
+            86.953125,
+            42.5
+          ],
+          "node_id": "250"
+        },
+        "3": {
+          "index": 3,
+          "role": "link",
+          "name": "sign in",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            338.640625,
+            569.1875,
+            47.015625,
+            18.0
+          ],
+          "node_id": "252"
+        }
+      },
+      "token_estimate": 23
+    },
+    "pay_upsell": {
+      "nodes": {
+        "0": {
+          "index": 0,
+          "role": "button",
+          "name": "Enable AutoPay",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            462.0,
+            439.5,
+            149.640625,
+            39.0
+          ],
+          "node_id": "392"
+        },
+        "1": {
+          "index": 1,
+          "role": "button",
+          "name": "No thanks, close this offer",
+          "state": {
+            "focusable": true,
+            "focused": true
+          },
+          "bbox": [
+            623.640625,
+            439.5,
+            110.515625,
+            39.0
+          ],
+          "node_id": "393"
+        }
+      },
+      "token_estimate": 17
+    },
+    "pay_form": {
+      "nodes": {
+        "0": {
+          "index": 0,
+          "role": "link",
+          "name": "Northwind Utilities",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            20.0,
+            16.0,
+            145.0,
+            24.0
+          ],
+          "node_id": "383"
+        },
+        "1": {
+          "index": 1,
+          "role": "link",
+          "name": "My Account",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            1170.140625,
+            19.0,
+            89.859375,
+            18.0
+          ],
+          "node_id": "385"
+        },
+        "2": {
+          "index": 2,
+          "role": "textbox",
+          "name": "Payment amount",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            278.875,
+            670.0,
+            39.0
+          ],
+          "node_id": "400"
+        },
+        "3": {
+          "index": 3,
+          "role": "textbox",
+          "name": "Card number",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            356.875,
+            670.0,
+            39.0
+          ],
+          "node_id": "404"
+        },
+        "4": {
+          "index": 4,
+          "role": "textbox",
+          "name": "Expiry",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            434.875,
+            670.0,
+            39.0
+          ],
+          "node_id": "409"
+        },
+        "5": {
+          "index": 5,
+          "role": "button",
+          "name": "Submit payment",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            305.0,
+            487.875,
+            152.6875,
+            37.0
+          ],
+          "node_id": "412"
+        },
+        "6": {
+          "index": 6,
+          "role": "link",
+          "name": "account & billing",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            338.640625,
+            568.875,
+            120.65625,
+            18.0
+          ],
+          "node_id": "414"
+        }
+      },
+      "token_estimate": 46
+    },
+    "pay_filled": {
+      "nodes": {
+        "0": {
+          "index": 0,
+          "role": "link",
+          "name": "Northwind Utilities",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            20.0,
+            16.0,
+            145.0,
+            24.0
+          ],
+          "node_id": "383"
+        },
+        "1": {
+          "index": 1,
+          "role": "link",
+          "name": "My Account",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            1170.140625,
+            19.0,
+            89.859375,
+            18.0
+          ],
+          "node_id": "385"
+        },
+        "2": {
+          "index": 2,
+          "role": "textbox",
+          "name": "Payment amount",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            278.875,
+            670.0,
+            39.0
+          ],
+          "node_id": "400"
+        },
+        "3": {
+          "index": 3,
+          "role": "textbox",
+          "name": "Card number",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            356.875,
+            670.0,
+            39.0
+          ],
+          "node_id": "404"
+        },
+        "4": {
+          "index": 4,
+          "role": "textbox",
+          "name": "Expiry",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            434.875,
+            670.0,
+            39.0
+          ],
+          "node_id": "409"
+        },
+        "5": {
+          "index": 5,
+          "role": "button",
+          "name": "Submit payment",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            305.0,
+            487.875,
+            152.6875,
+            37.0
+          ],
+          "node_id": "412"
+        },
+        "6": {
+          "index": 6,
+          "role": "link",
+          "name": "account & billing",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            338.640625,
+            568.875,
+            120.65625,
+            18.0
+          ],
+          "node_id": "414"
+        }
+      },
+      "token_estimate": 46
+    },
+    "pay_submitted": {
+      "nodes": {
+        "0": {
+          "index": 0,
+          "role": "link",
+          "name": "Northwind Utilities",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            20.0,
+            16.0,
+            145.0,
+            24.0
+          ],
+          "node_id": "383"
+        },
+        "1": {
+          "index": 1,
+          "role": "link",
+          "name": "My Account",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            1170.140625,
+            19.0,
+            89.859375,
+            18.0
+          ],
+          "node_id": "385"
+        },
+        "2": {
+          "index": 2,
+          "role": "textbox",
+          "name": "Payment amount",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            347.375,
+            670.0,
+            39.0
+          ],
+          "node_id": "400"
+        },
+        "3": {
+          "index": 3,
+          "role": "textbox",
+          "name": "Card number",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            425.375,
+            670.0,
+            39.0
+          ],
+          "node_id": "404"
+        },
+        "4": {
+          "index": 4,
+          "role": "textbox",
+          "name": "Expiry",
+          "state": {
+            "focusable": true,
+            "settable": true,
+            "multiline": false,
+            "readonly": false,
+            "required": false
+          },
+          "bbox": [
+            305.0,
+            503.375,
+            670.0,
+            39.0
+          ],
+          "node_id": "409"
+        },
+        "5": {
+          "index": 5,
+          "role": "button",
+          "name": "Submitted",
+          "state": {
+            "disabled": true
+          },
+          "bbox": [
+            305.0,
+            556.375,
+            109.34375,
+            37.0
+          ],
+          "node_id": "412"
+        },
+        "6": {
+          "index": 6,
+          "role": "link",
+          "name": "account & billing",
+          "state": {
+            "focusable": true
+          },
+          "bbox": [
+            338.640625,
+            637.375,
+            120.65625,
+            18.0
+          ],
+          "node_id": "414"
+        }
+      },
+      "token_estimate": 45
+    }
+  },
+  "reads": {
+    "nw_auth": {
+      "value": "1"
+    },
+    "pay_form_values": {
+      "amount": "84.32",
+      "card": "4242 4242 4242 4242",
+      "expiry": "12 / 28"
+    },
+    "confirmation": {
+      "conf_num": "NW-474145",
+      "banner": "Payment submitted! Confirmation: NW-474145. Allow 1\u20132 business days to process."
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "recorded_at": 1780239755.286763,
+  "index": "clarion-kb",
+  "query": "What is the late fee policy and does autopay avoid it?",
+  "last_runtime_ms": 1,
+  "last_query_ms": 2610.34,
+  "facts": [
+    {
+      "value": "## AutoPay\nCustomers enrolled in AutoPay never incur a late fee. The balance is drawn\nautomatically from the payment method on file on the statement due date. You can\nenroll in AutoPay from the \"Billing\" tab of your online account; enrollment takes\neffect on the next billing cycle.",
+      "source_node_id": "clarion-kb::8533335ca606",
+      "polarity": "present",
+      "verified": false
+    },
+    {
+      "value": "## Late fees\nNorthwind Utilities charges a flat $15 late fee when a residential bill is not\npaid in full by the due date printed on the statement. The late fee is assessed\nonce per billing cycle and appears on the following month's statement.",
+      "source_node_id": "clarion-kb::9d3de8332e29",
+      "polarity": "present",
+      "verified": false
+    },
+    {
+      "value": "# Northwind Utilities \u2014 Billing Policy (demo KB)",
+      "source_node_id": "clarion-kb::b1fcd9337b34",
+      "polarity": "present",
+      "verified": false
+    }
+  ]
+}
