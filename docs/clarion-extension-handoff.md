@@ -1,56 +1,131 @@
-# Clarion extension — hand-off for the next session
+# Clarion extension — hand-off (voice is the open bug)
 
-Branch: `feat/clarion-extension`. You are continuing the browser-extension + voice work.
+Branch: `feat/clarion-extension`. The **relay-coupling bug is FIXED and verified**; the
+**browser-voice path does nothing** and is the next session's job. Read this in full,
+then the three memory entries (`clarion-runtime-and-logs`, `no-fakes-and-direct-logs`,
+`chrome-debugger-devtools-conflict`).
 
-## YOUR MANDATE (read first — non-negotiable)
-- **Fix every bug. Do not hand back partial work.** The owner is done being the manual tester.
-- **You verify, not the human.** Drive the REAL system yourself and read the logs from files. Only involve the human for the *single final* confirmation, and only once you are *certain* it works — never as a debugging loop.
-- **No fake tests.** Do NOT prove anything with `relay-interop` canned CDP, `_fake_extension_client`, or `CLARION_DEMO_MODE=1` fixtures. Drive the real stack; automate only the two human actions: the shortcut keystroke (osascript `System Events` → Chrome) and "speech" via text (`session.generate_reply(user_input=...)`).
-- **Read logs directly — never ask for copy-paste.** `tail` the files below.
-- Be **certain and specific** about how it moves forward before you ask the human anything.
+## YOUR MANDATE (non-negotiable)
+- **Make voice actually work, end to end, on the real Mac.** The owner is done being the
+  manual tester and done with back-and-forth. Drive the real system yourself; read the
+  logs from files; only bring the owner in for the single mic-grant + speech, and only
+  once you are CERTAIN the rest works.
+- **You will be on the Mac with the mic available.** "Open up the Mac and have the voice
+  input channels ready" — confirm the OS/Chrome mic permission for the dedicated Clarion
+  Chrome profile BEFORE testing, so a denied mic isn't a false negative.
+- **Check EVERY method against Context7 docs before trusting it.** Use Context7 MCP
+  (`resolve-library-id` → `get-library-docs`) for: `livekit-client` (browser SDK —
+  `Room.connect`, `setMicrophoneEnabled`, track subscription/playback), `livekit-agents`
+  (Python worker — `AgentSession`, STT/LLM/TTS plumbing, `RoomInputOptions`), and the
+  Chrome MV3 APIs (`chrome.offscreen`, `navigator.permissions.query` in a service worker,
+  dynamic `import()` support in MV3 SWs, `getUserMedia` from an offscreen document). Don't
+  assume an API shape — verify it. (This is how the `confirm_consent` bug below was found:
+  `RunContext.disallow_interruptions()` is a plain call in livekit-agents 1.5.x, not a
+  context manager.)
+- **No fakes.** Drive the real stack; automate only the human actions. NOTE: in the prior
+  session's environment, osascript `System Events` keystrokes TIMED OUT (-1712, no
+  Accessibility grant) — so `Cmd+Shift+Y` could NOT be injected. If that's still true,
+  the shortcut press is a human action; verify everything else first. The agent→broker→tab
+  pipe is verifiable WITHOUT the keystroke via an honest Playwright-Chromium "extension
+  stand-in" (see `/tmp/clarion_ext_standin.py` — real DOM, real CDP, not canned).
 
-## Logs you can read directly
-- Agent side: `/tmp/clarion-worker.log` — every phase tagged `[loop]`.
-- Browser side (SW + HUD): `/tmp/clarion-ext.log` — via the always-on sink (`scripts/clarion-logsink.py`, HTTP :8772).
-- `tail -f` both. Verify a change by reading these, not by asking the user.
+## Logs you read directly (never copy-paste)
+- `/tmp/clarion-worker.log` — agent worker; phases tagged `[loop]`.
+- `/tmp/clarion-broker.log` — the always-on relay broker (ext/agent connects, session.start cache/replay).
+- `/tmp/clarion-ext.log` — browser SW + HUD via the sink (`scripts/clarion-logsink.py`).
+
+## What is DONE + VERIFIED this session (don't redo)
+- **Always-on relay broker** (`agent/clarion/actuator/relay_broker.py`) fixes the relay
+  coupling: it binds **8771** (extension, FROZEN v1 wire) + **8773** (agent) at BOOT,
+  independent of voice/dispatch/mic. The worker's `ExtensionActuator` is now a CLIENT of
+  the broker (`relay.BrokerCdpRelay`) and never binds the port. Broker caches + replays
+  `session.start` to a late-joining agent. `clarion-up` starts it first and proves 8771
+  LISTENING. VERIFIED: 8771 up immediately post-up; real-sim → dispatch → AgentSession
+  started → advance_task tool-call; with a real Chromium tab bridged through the broker,
+  advance_task perceived + clicked + filled the live page and PAY hard-stopped at consent.
+- **`confirm_consent` fix** (`voice_entry.py`): `context.disallow_interruptions()` is a
+  plain call now (was a broken `with` that raised TypeError on the consent→act resume).
+- **clarion-down reaps the worker's whole job-subprocess tree + orphan sweep.** LiveKit
+  jobs run as `python -c from multiprocessing.spawn` (argv lacks "voice_entry"); they
+  leaked, stayed registered, and STOLE dispatches (made a sim land on a stale job). Fixed.
+- **Relay attach CONFIRMED with the REAL extension** (owner pressed the shortcut twice):
+  `service worker started → debugger attached → CDP domains enabled → relay connected ✓
+  perceiving` on https://www.usa.gov/benefits. The tab bridge is solid.
+- Commits: `df023be` (decouple + observability), `3a7438b` (broker), `bb3be0c`
+  (down reap), `9998333` (voice observability + robust config). `pytest clarion -q` = 89.
+
+## THE OPEN BUG — browser voice does NOTHING
+Symptom: owner presses `Cmd+Shift+Y` → relay attaches fine, but **no greeting is heard and
+speaking produces no response** ("no reflection"). No `request-mic` tab opens.
+
+Evidence (from `/tmp/clarion-ext.log`, owner pressed at 16:04:28):
+```
+16:04:28 service worker started ... → debugger attached → CDP domains enabled → relay connected ✓ perceiving
+```
+…and then **NOTHING** — even though `startVoice` was instrumented to log `voice: starting`
+as its first line, and the offscreen reports `voice ready/connecting/connected/error`.
+`/tmp/clarion-broker.log` shows `extension connected` + `session.start cached` but **never
+`agent connected`** → no job ever dispatched for voice → the offscreen never joined the room.
+
+### PRIME SUSPECT (rule out FIRST): the extension is running STALE code
+`clarion-up` relaunches Chrome with the SAME `--user-data-dir=/tmp/clarion-chrome-profile`.
+If a Chrome instance on that profile is already alive, the new invocation just focuses it
+and does **NOT** reload the extension from disk — so SW code edits silently don't take.
+"service worker started" can also appear from a normal SW eviction/wake of the OLD code, so
+it does NOT prove the new code loaded.
+- **Fix the test loop:** fully quit the Clarion Chrome (`scripts/clarion-down.sh` kills the
+  profile instance) and confirm it's gone BEFORE `clarion-up`; OR reload at
+  `chrome://extensions` (⟳). Then PROVE the new code is live by pressing the shortcut and
+  seeing the NEW `voice: starting` line in `/tmp/clarion-ext.log`. Until that line appears,
+  you are debugging old code.
+
+### Once on confirmed-fresh code, walk the voice gates (now instrumented)
+`startVoice` (web/extension/service-worker.js) logs each gate to the sink:
+`voice: starting → voice: config loaded → voice: mic granted → voice: offscreen ready —
+sending CONNECT`, and the offscreen logs `voice ready/connecting/connected/error`. Find the
+FIRST gate that's missing and fix that:
+1. **config** — `loadVoiceConfig` now tries dynamic `import()` then falls back to
+   `fetch()`+parse of `config.js`. If `voice: NO config.js` appears, check `config.js`
+   exists + the fetch works in the SW (verify MV3 SW dynamic-import support via Context7).
+2. **mic** — `micAlreadyGranted()` uses `navigator.permissions.query({name:"microphone"})`
+   IN THE SERVICE WORKER. Verify that's reliable in an MV3 SW (Context7 / MDN); it may
+   throw or mis-report. If not granted, `request-mic.html` (a full tab) must open and the
+   owner clicks Allow. Confirm the OS mic permission for the Clarion Chrome profile too.
+3. **offscreen** — `chrome.offscreen.createDocument` + `offscreen.js` loads the vendored
+   `vendor/livekit-client.umd.js` (`globalThis.LivekitClient`). If `voice error: vendored
+   livekit-client not loaded`, the vendor bundle path/CSP is wrong. Then `Room.connect(url,
+   token)` + `setMicrophoneEnabled(true)` — verify both against Context7 `livekit-client`.
+4. **dispatch** — once the offscreen joins room `clarion-hero`, the worker dispatches and
+   greets (the offscreen plays it — no mic needed to HEAR the greeting). If you hear the
+   greeting, voice-out works; then the mic enables voice-in.
+
+### Also confirmed-flaky: LiveKit cloud connectivity
+The worker logged a storm of `Cannot connect to host aaa-lqsava47.livekit.cloud:443`
+(status 1006) and went silent/stale for ~1h; a worker restart fixed it. If the offscreen
+joins but no agent appears, the worker's LiveKit link may be stale — restart the worker and
+re-check (the host was reachable via curl 200 even while the worker's WS was wedged).
 
 ## Run / drive
-- Up/down: `scripts/clarion-up.sh` (mints token → `web/extension/config.js`; starts log sink :8772 + voice worker + Chrome+extension), `scripts/clarion-down.sh`.
-- Real-sim (no mic, no Chrome): `scripts/clarion-sim.py <hold_s>` joins room `clarion-hero` → triggers real agent dispatch. Arm the worker with `CLARION_SIM_UTTERANCES="pay my electric bill|yes"` to inject text-as-speech.
-- Deterministic gate (must stay green): `cd agent && .venv/bin/python -m pytest clarion -q` → 89 passed.
+- Up/down: `scripts/clarion-up.sh` (NO arg → opens https://www.usa.gov/benefits, the real
+  page the owner wants for probing) and `scripts/clarion-down.sh`. Do NOT pass the demo URL.
+- Real-sim (no mic/Chrome): `CLARION_SIM_GAP=4 scripts/clarion-sim.py 80` joins the room →
+  real dispatch; arm the worker with `CLARION_SIM_UTTERANCES="pay my electric bill|yes"`.
+  Use a LONG hold (≥60s) — first dispatch is cold (~12s) and LiveKit closes the session
+  when the sim participant leaves (`close_on_disconnect`).
+- Real browser pipe WITHOUT the keystroke: `agent/.venv/bin/python /tmp/clarion_ext_standin.py`
+  (real Chromium bridged to the broker) — proves agent→broker→tab perceive/act/consent.
+- Gate (must stay green): `cd agent && .venv/bin/python -m pytest clarion -q` → 89 passed.
 
-## What was DONE this session (verified)
-- **Voice decoupled from the tab relay** in `agent/clarion/app/voice_entry.py`: `AgentSession.start()` + greet happen immediately on dispatch (agent hears the user right away); the tab relay attaches + `StageGraphRunner` binds in a background `attach_tab` task; `advance_task` returns "connecting to your tab" until `runner.ready`. Proven via real-sim: injected "pay my electric bill" → real Gemini `advance_task` tool-call. 89 tests pass.
-- **Debug HUD** (`web/extension/hud.js`): toolbar badge + on-page overlay (selectable + ⧉ copy button); wired through `service-worker.js` for attach/relay/voice phases; `manifest.json` gained `action` + `connect-src` for ws://8771 and http://8772.
-- **Durable log sink** (`scripts/clarion-logsink.py` + `hud.js sinkLog`), wired into up/down.
-- Memory written: `clarion-runtime-and-logs`, `no-fakes-and-direct-logs`, `chrome-debugger-devtools-conflict`.
+## Current machine state (left running for you)
+- broker 8771/8773 up, log sink 8772 up, worker registered, Chrome on usa.gov/benefits,
+  demo-site on :8770. `lsof -iTCP:8771 -sTCP:LISTEN` to confirm.
 
-## THE OPEN BUG (fix this first — it's why the human can't trust the relay)
-**The CDP relay (port 8771, the tab bridge) only binds when the voice agent DISPATCHES, and dispatch needs a room participant** (the extension's offscreen, which needs the mic grant). So the backend port stays closed until mic-granted → "relay dropped, reconnecting" → the human is never sure the relay is open. Proven live: 8771 is closed at idle and only binds the instant a participant joins the room.
-
-The relay is the *tab* bridge; it must **not** be gated behind *voice*. Constraint: LiveKit `dev` runs each job in a **subprocess** (verified: job pid ≠ worker pid), so the `ExtensionActuator` and the relay must be co-located in the job — which is *why* the relay got nested there.
-
-**Robust fix to implement (your call on approach, but the port must be ALWAYS-ON):**
-- **Option A — relay broker (preferred):** make the relay a standalone always-on server started by `clarion-up` (binds 8771 at boot, independent of voice). The extension connects as today; the agent's `ExtensionActuator` becomes a *client* of the broker (sends CDP over a socket, gets results back). Preserves the FROZEN extension-facing wire (`docs/extension-build.md`, relay protocol v1).
-- **Option B — in-process jobs:** run jobs threaded/in-process so a relay bound at worker startup is reachable by the entrypoint's actuator. Smaller if LiveKit supports it cleanly (check docs first).
-
-## Acceptance criteria — you must self-verify ALL of these from the logs before involving the human
-1. `scripts/clarion-up.sh` → **8771 is LISTENING immediately**, before any shortcut/mic (the decoupling). Confirm with `lsof -iTCP:8771 -sTCP:LISTEN`.
-2. Real-sim: arm `CLARION_SIM_UTTERANCES`, run `clarion-sim.py` → `/tmp/clarion-worker.log` shows `dispatched → AgentSession STARTED → [SIM] 'pay my electric bill' → advance_task tool-call`.
-3. With a tab attached (real extension OR `web/demo-site` up on :8770), `advance_task` actually drives the page (not "connecting to your tab"); the PAY step HARD-STOPS at the consent gate; grounded facts carry `source_node_id`.
-4. `/tmp/clarion-ext.log` shows the browser loop: `service worker started → debugger attached → relay connected → voice connected`.
-5. `pytest clarion -q` stays green (89).
-6. Only THEN: ask the human to do the one real-hardware confirmation (reload extension, close DevTools, Cmd+Shift+Y, grant mic, speak) — with you already certain, and watching both logs to narrate it.
-
-## Gotchas (don't relearn these)
-- `chrome.debugger.attach` fails while **DevTools is open on the tab** ("attach FAILED — close DevTools"; ⌘⌥I closes it). The page tab's DevTools is not needed — use the HUD + the sink.
-- The extension must be **reloaded** (chrome://extensions → ⟳) after any `web/extension/*` change; confirm by seeing `service worker started` land in `/tmp/clarion-ext.log`.
-- Relay protocol v1 framing is FROZEN — keep `relay-client.js` / the extension-facing wire intact through any broker refactor.
-- Git: scope to `git -C /Users/tk/Desktop/conv-agent`, feature branch, conventional commits, don't push unless asked. Several files are uncommitted (see `git status`); consider committing the decouple + observability as one unit before the broker work.
-- Provider state: LiveKit/Deepgram/Gemini are live; `config.js` is minted by `clarion-up`.
-
-## First moves for the next session
-1. Read this file + the three memory entries.
-2. Implement the always-on relay (Option A or B), update `clarion-up.sh` to start it at boot.
-3. Self-verify acceptance criteria 1–5 from the logs. Fix until green.
-4. Commit. Then hand the human exactly ONE confirmation step, certain it works.
+## Acceptance for voice (self-verify from logs before involving the owner)
+1. On confirmed-fresh extension code, pressing the shortcut prints the full `voice: …` gate
+   sequence in `/tmp/clarion-ext.log` (no silent bail).
+2. The offscreen joins room `clarion-hero` → `/tmp/clarion-broker.log` shows the voice job's
+   agent activity / the worker logs `[loop] dispatched`, and the agent GREETS (owner hears it).
+3. Mic granted → owner speaks → worker logs `advance_task` and the agent reads back grounded,
+   sourced facts; PAY hard-stops at consent.
+4. `pytest clarion -q` stays green (89).
+5. THEN the single owner step: press shortcut, grant mic, speak — with you certain + watching.
