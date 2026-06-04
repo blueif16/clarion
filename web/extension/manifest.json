@@ -1,0 +1,30 @@
+{
+  "manifest_version": 3,
+  "name": "Clarion",
+  "version": "0.1.0",
+  "description": "Voice co-pilot that bridges your live tab to the Clarion brain over a local relay.",
+  "permissions": [
+    "debugger",
+    "commands",
+    "offscreen",
+    "alarms",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "commands": {
+    "start-clarion": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "Attach Clarion to the active tab and bridge it to the local relay"
+    }
+  }
+}
