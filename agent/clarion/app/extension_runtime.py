@@ -42,7 +42,11 @@ import sys
 from typing import Any, Optional
 
 from clarion.actuator.extension_actuator import ExtensionActuator
-from clarion.actuator.relay import WebSocketCdpRelay
+from clarion.actuator.relay import (
+    DEFAULT_AGENT_PORT,
+    BrokerCdpRelay,
+    WebSocketCdpRelay,
+)
 from clarion.app.runtime import HeroRuntime
 
 DEFAULT_RELAY_HOST = "127.0.0.1"
@@ -82,6 +86,7 @@ class ExtensionRuntime:
         *,
         host: str = DEFAULT_RELAY_HOST,
         port: int = DEFAULT_RELAY_PORT,
+        agent_port: int = DEFAULT_AGENT_PORT,
         demo_url: str = "http://localhost:8770/",
         mode: str = "fast",
         room: Optional[Any] = None,
@@ -90,6 +95,7 @@ class ExtensionRuntime:
     ) -> None:
         self._host = host
         self._port = port
+        self._agent_port = agent_port
         self._demo_url = demo_url
         self._mode = mode
         self._room = room
@@ -98,7 +104,10 @@ class ExtensionRuntime:
         # ``HeroRuntime.create`` does not reach for live Moss creds. None keeps the
         # live default (LIVE Moss, or CachedRetriever under CLARION_DEMO_MODE=1).
         self._kb_retriever = kb_retriever
-        self.relay: Optional[WebSocketCdpRelay] = None
+        # Either a server relay (start_relay; standalone + tests) or a broker
+        # client (attach_broker; the live voice path). Both expose the CdpRelay
+        # surface + .session + wait_connected, so everything downstream is shared.
+        self.relay: Optional[Any] = None
         self.actuator: Optional[ExtensionActuator] = None
         self.runtime: Optional[HeroRuntime] = None
 
@@ -122,13 +131,39 @@ class ExtensionRuntime:
         _log(f"relay listening on ws://{self._host}:{relay.port} — waiting for the extension")
         return relay
 
+    async def attach_broker(self) -> BrokerCdpRelay:
+        """Connect to the ALWAYS-ON relay broker as a client (the live voice path).
+
+        The broker owns the FROZEN 8771 extension wire independently of voice; we
+        dial its agent port (8773) and learn the tab's state from the broker's
+        (live or replayed) ``session.start``. This is what decouples the tab
+        bridge from voice dispatch: the port is already bound at boot, so we never
+        bind it here and never gate it on the mic."""
+        relay = BrokerCdpRelay(host=self._host, port=self._agent_port)
+
+        def _on_start(msg: dict) -> None:
+            _log(
+                f"session.start (via broker) — tabId={msg.get('tabId')} "
+                f"url={msg.get('url')!r} title={msg.get('title')!r}"
+            )
+
+        def _on_end(msg: dict) -> None:
+            _log(f"session.end (via broker) — reason={msg.get('reason')!r}")
+
+        relay.on_session_start = _on_start
+        relay.on_session_end = _on_end
+        await relay.connect()
+        self.relay = relay
+        _log(f"connected to relay broker at {relay.uri} — waiting for the tab")
+        return relay
+
     async def wait_for_session(self, *, timeout: Optional[float] = None) -> dict:
         """Block until the extension connects AND emits its ``session.start`` frame.
 
         Returns the ``session`` dict (tabId/url/title). The relay surfaces the
         latest lifecycle state on ``relay.session``; we wait for the socket then
         for the frame (the extension emits it on attach)."""
-        assert self.relay is not None, "start_relay() first"
+        assert self.relay is not None, "start_relay() or attach_broker() first"
         await self.relay.wait_connected(timeout=timeout)
         # The lifecycle frame arrives just after the socket; poll briefly for it.
         deadline = None if timeout is None else asyncio.get_event_loop().time() + timeout
@@ -142,7 +177,7 @@ class ExtensionRuntime:
         """Build the ``ExtensionActuator`` over the started relay and assemble the
         ``HeroRuntime`` with it injected — the SAME stage graph + retrievers +
         PanelPublisher the hero flow uses, only the actuator transport differs."""
-        assert self.relay is not None, "start_relay() first"
+        assert self.relay is not None, "start_relay() or attach_broker() first"
         self.actuator = ExtensionActuator(self.relay)
         self.runtime = await HeroRuntime.create(
             self._demo_url,

@@ -212,8 +212,11 @@ def build_voice_tools(runner: StageGraphRunner):
         if not runner.ready:
             return "I'm not connected to your tab yet — one moment."
         decision = ConsentDecision(decision="approve" if approved else "reject")
-        with context.disallow_interruptions():
-            next_req = await runner.resume(decision)
+        # The atomic act: a stray "um" must not fracture the consent→act (§5). In
+        # livekit-agents 1.5.x this is a plain call (sets allow_interruptions=False
+        # on this function-call's speech handle), NOT a context manager.
+        context.disallow_interruptions()
+        next_req = await runner.resume(decision)
         if next_req is None:
             return "Done."
         return next_req.utterance  # next consequential step's readback
@@ -308,8 +311,11 @@ async def entrypoint(ctx) -> None:
                 from clarion.app.extension_runtime import ExtensionRuntime
 
                 ext = ExtensionRuntime(demo_url=demo_url, mode="fast", room=ctx.room)
-                await ext.start_relay()
-                loop("relay up on :8771 — waiting for the extension to attach the tab…")
+                # The tab bridge is the ALWAYS-ON broker (started by clarion-up),
+                # NOT a port we bind here — that's what decouples it from voice.
+                # We dial the broker as a client and wait for the tab to attach.
+                await ext.attach_broker()
+                loop("connected to relay broker — waiting for the extension to attach the tab…")
                 await ext.wait_for_session(timeout=None)
                 loop("extension attached the tab — building the stage graph…")
                 runtime = await ext.build_runtime()
