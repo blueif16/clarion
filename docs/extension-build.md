@@ -92,7 +92,11 @@ enable `DOM`/`Accessibility`/`DOMSnapshot`/`Runtime`/`Page`; perceive via
   untouched. The real-tab run (real Chrome on a gov portal) is **#6b**.
 
 ## Live runbook (#6 — human-in-the-loop)
-1. `cd web/extension && lk token create --api-key $LIVEKIT_API_KEY --api-secret $LIVEKIT_API_SECRET --identity human --room clarion-hero --join --valid-for 4h` → paste JWT into `config.js` (`ROOM_NAME=clarion-hero`).
+1. Mint a human participant token (offline, uses the creds already in `agent/.env` — no `lk` CLI needed):
+   ```
+   cd agent && .venv/bin/python -c "import os;from dotenv import load_dotenv;load_dotenv();from livekit import api;print(api.AccessToken(os.environ['LIVEKIT_API_KEY'],os.environ['LIVEKIT_API_SECRET']).with_identity('human').with_grants(api.VideoGrants(room_join=True,room='clarion-hero')).to_jwt())"
+   ```
+   Copy `web/extension/config.example.js` → `config.js`; set `TOKEN` to that JWT, `LIVEKIT_URL` to the `LIVEKIT_URL` in `agent/.env`, `ROOM_NAME=clarion-hero`. (Alt: `lk token create … --room clarion-hero --join` if the LiveKit CLI is installed.)
 2. Start the Python side. Two ways, both starting `WebSocketCdpRelay` on `127.0.0.1:8771`:
    - **read-only operator loop** (relay + `ExtensionActuator` + perceive→readback, no voice):
      `cd agent && CLARION_ACTUATOR=extension .venv/bin/python -m clarion.app.extension_runtime`
