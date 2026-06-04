@@ -21,6 +21,11 @@ import {
   errorToMessage,
 } from "./relay-client.js";
 
+// DEBUG-ONLY visual feedback (toolbar badge + on-page HUD) + a file log sink so
+// the logs are readable directly (tail /tmp/clarion-ext.log), not copy-pasted.
+// Remove this import and the setBadge/pushHud/sinkLog call sites to strip it all.
+import { setBadge, pushHud, sinkLog } from "./hud.js";
+
 // --- configuration ----------------------------------------------------------
 
 const RELAY_URL = "ws://127.0.0.1:8771";
@@ -51,14 +56,23 @@ const RECONNECT_MAX_MS = 10000;
 /** @type {Session|null} */
 let session = null;
 
+// Debug: show an idle badge the moment the worker boots, so a blank toolbar icon
+// means "worker not running" and "·" means "loaded, waiting for the shortcut".
+setBadge("·", "info");
+sinkLog({ phase: "service worker started — waiting for the shortcut", level: "info" });
+
 // ---------------------------------------------------------------------------
 // Shortcut → attach + connect.
 // ---------------------------------------------------------------------------
 
 chrome.commands.onCommand.addListener((command) => {
   if (command !== "start-clarion") return;
+  // Instant proof the keystroke reached the worker. If the badge never changes
+  // on press, the shortcut isn't registered (chrome://extensions/shortcuts).
+  setBadge("…", "info");
   startClarion().catch((err) => {
     console.error("[clarion] start failed:", errorToMessage(err));
+    setBadge("ERR", "err");
   });
 });
 
@@ -66,12 +80,15 @@ async function startClarion() {
   const tab = await getActiveTab();
   if (!tab || tab.id == null) {
     console.warn("[clarion] no active tab to attach to");
+    setBadge("ERR", "err");
     return;
   }
 
   // If a session is already live on this exact tab, do nothing (idempotent).
   if (session && session.tabId === tab.id && session.attached) {
     console.log("[clarion] already attached to tab", tab.id);
+    setBadge("ON", "ok");
+    pushHud(tab.id, { phase: "already attached", level: "ok" });
     return;
   }
   // Otherwise tear down any prior session before starting fresh.
@@ -90,13 +107,33 @@ async function startClarion() {
     title: tab.title || "",
   };
 
-  await chrome.debugger.attach({ tabId }, CDP_VERSION);
+  pushHud(tabId, { phase: "attaching debugger…", detail: session.url });
+  try {
+    await chrome.debugger.attach({ tabId }, CDP_VERSION);
+  } catch (err) {
+    // The most common cause: DevTools is open on this tab (only one debugger
+    // client per tab). The error otherwise dies in the worker console.
+    const msg = errorToMessage(err);
+    console.error("[clarion] debugger attach failed:", msg);
+    setBadge("ERR", "err");
+    pushHud(tabId, {
+      phase: "attach FAILED",
+      detail: /already attached|DevTools/i.test(msg)
+        ? "close DevTools on this tab, then retry"
+        : msg,
+      level: "err",
+    });
+    session = null;
+    return;
+  }
   session.attached = true;
+  pushHud(tabId, { phase: "debugger attached", level: "ok" });
 
   // Enable the domains the §4 perception pipeline reads from.
   for (const domain of CDP_DOMAINS) {
     await chrome.debugger.sendCommand({ tabId }, `${domain}.enable`);
   }
+  pushHud(tabId, { phase: "CDP domains enabled", detail: "connecting relay…" });
 
   ensureKeepalive();
   connectRelay();
@@ -140,6 +177,8 @@ function connectRelay() {
       encodeSessionStart({ tabId: s.tabId, url: s.url, title: s.title })
     );
     console.log("[clarion] relay connected:", RELAY_URL);
+    setBadge("ON", "ok");
+    pushHud(s.tabId, { phase: "relay connected ✓", detail: "perceiving", level: "ok" });
   });
 
   ws.addEventListener("message", (event) => {
@@ -152,12 +191,19 @@ function connectRelay() {
     s.ws = null;
     if (s.closing) return;
     console.warn("[clarion] relay closed — reconnecting");
+    setBadge("RC", "warn");
+    pushHud(s.tabId, {
+      phase: "relay dropped — reconnecting",
+      detail: "is the Python relay up on :8771?",
+      level: "warn",
+    });
     scheduleReconnect();
   });
 
   ws.addEventListener("error", () => {
     // `close` follows `error`; reconnection is driven from there.
     console.warn("[clarion] relay socket error");
+    setBadge("RC", "warn");
   });
 }
 
@@ -284,6 +330,8 @@ async function teardown(reason) {
     s.attached = false;
   }
 
+  pushHud(s.tabId, { phase: "session ended", detail: reason, level: "warn" });
+  setBadge("·", "info");
   session = null;
   clearKeepalive();
   console.log("[clarion] session ended:", reason);
@@ -492,5 +540,12 @@ chrome.runtime.onMessage.addListener((msg) => {
     }
   } else if (msg.type === VOICE_MSG.STATE) {
     console.log("[clarion] voice state:", msg.state, msg.detail || "");
+    const level =
+      msg.state === "error" ? "err" : msg.state === "connected" ? "ok" : "info";
+    sinkLog({ phase: `voice ${msg.state}`, detail: msg.detail || "", level });
+    setBadge(
+      msg.state === "connected" ? "MIC" : msg.state === "error" ? "ERR" : "·",
+      level
+    );
   }
 });
