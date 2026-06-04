@@ -100,6 +100,12 @@ async function startClarion() {
 
   ensureKeepalive();
   connectRelay();
+  // Voice rides a SEPARATE LiveKit/WebRTC connection in the offscreen document
+  // (additive — the CDP relay above is untouched). Start it with the session;
+  // failures here never block the relay.
+  startVoice().catch((err) =>
+    console.warn("[clarion] voice start failed:", errorToMessage(err))
+  );
   console.log("[clarion] attached to tab", tabId, "—", session.url);
 }
 
@@ -252,6 +258,11 @@ async function teardown(reason) {
   if (!s) return;
   s.closing = true;
 
+  // Tear down browser-side voice (leave the room + close the offscreen doc).
+  await stopVoice().catch((err) =>
+    console.warn("[clarion] voice stop failed:", errorToMessage(err))
+  );
+
   if (s.ws) {
     try {
       if (s.ws.readyState === WebSocket.OPEN) {
@@ -310,14 +321,176 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 });
 
 // ---------------------------------------------------------------------------
-// #5 voice: create offscreen document here
+// #5 voice: browser-side voice via an offscreen LiveKit client.
 //
-// The next feature wires browser-side voice: create an offscreen document that
-// runs an @livekit/client and joins the same room as the unchanged voice_entry
-// worker. Intentionally NOT built here — this is only the marked extension point.
-//   e.g. await chrome.offscreen.createDocument({
-//          url: "offscreen.html",
-//          reasons: ["USER_MEDIA"],
-//          justification: "Clarion browser-side voice co-pilot",
-//        });
+// Voice rides a SEPARATE LiveKit/WebRTC connection from the CDP relay above. It
+// lives in an OFFSCREEN document because MV3 service workers die at ~30s idle and
+// would drop the long-lived WebRTC connection; offscreen documents are exempt.
+// The offscreen doc joins the SAME room as the unchanged Python `voice_entry`
+// worker, publishes the user's mic, and plays the agent's incoming audio.
+//
+// getUserMedia() cannot prompt from an offscreen doc/side panel/popup, so the
+// mic grant is first obtained from a FULL extension tab (request-mic.html) and
+// then remembered by Chrome for the extension origin.
 // ---------------------------------------------------------------------------
+
+const OFFSCREEN_URL = "offscreen.html";
+const REQUEST_MIC_URL = "request-mic.html";
+
+// Message channel between the worker and the offscreen / request-mic pages.
+// Kept in sync with offscreen.js and request-mic.js.
+const VOICE_MSG = {
+  CONNECT: "voice.connect", // SW → offscreen
+  DISCONNECT: "voice.disconnect", // SW → offscreen
+  STATE: "voice.state", // offscreen → SW
+  MIC_RESULT: "voice.mic-result", // request-mic → SW
+};
+const OFFSCREEN_TARGET = "offscreen-voice";
+const SW_VOICE_TARGET = "service-worker-voice";
+
+/** Resolver for an in-flight mic-permission request, or null. */
+let micGrantResolver = null;
+
+/**
+ * Load the voice config from the gitignored config.js (falls back to nothing if
+ * absent — voice is then skipped and the CDP relay still works). config.js does
+ * `export default { LIVEKIT_URL, ROOM_NAME, TOKEN }`.
+ * @returns {Promise<{LIVEKIT_URL:string, ROOM_NAME?:string, TOKEN:string}|null>}
+ */
+async function loadVoiceConfig() {
+  try {
+    const mod = await import(chrome.runtime.getURL("config.js"));
+    return mod && mod.default ? mod.default : null;
+  } catch {
+    // No config.js (or it failed to parse) — voice is opt-in, so this is fine.
+    return null;
+  }
+}
+
+/**
+ * Whether the mic permission is already granted for the extension origin. Uses
+ * the Permissions API where available; a `prompt`/`denied` state means we must
+ * open the full-tab request page.
+ * @returns {Promise<boolean>}
+ */
+async function micAlreadyGranted() {
+  try {
+    if (!navigator.permissions || !navigator.permissions.query) return false;
+    const status = await navigator.permissions.query({ name: "microphone" });
+    return status.state === "granted";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ensure the mic grant: if not already granted, open request-mic.html (a full
+ * extension tab — the only context that can prompt) and await its result.
+ * @returns {Promise<boolean>} true if granted
+ */
+async function ensureMicPermission() {
+  if (await micAlreadyGranted()) return true;
+  const granted = await new Promise((resolve) => {
+    micGrantResolver = resolve;
+    chrome.tabs.create({ url: chrome.runtime.getURL(REQUEST_MIC_URL) });
+    // Safety timeout so a closed/ignored tab doesn't hang the session forever.
+    setTimeout(() => {
+      if (micGrantResolver === resolve) {
+        micGrantResolver = null;
+        resolve(false);
+      }
+    }, 120000);
+  });
+  return granted;
+}
+
+/** True if an offscreen document already exists (the one-doc-at-a-time rule). */
+async function hasOffscreenDocument() {
+  if (chrome.offscreen && chrome.offscreen.hasDocument) {
+    return chrome.offscreen.hasDocument();
+  }
+  // Fallback for older runtimes: inspect existing contexts.
+  if (chrome.runtime.getContexts) {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: ["OFFSCREEN_DOCUMENT"],
+      documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
+    });
+    return contexts.length > 0;
+  }
+  return false;
+}
+
+/** Create the offscreen document if one is not already open. */
+async function ensureOffscreenDocument() {
+  if (await hasOffscreenDocument()) return;
+  await chrome.offscreen.createDocument({
+    url: OFFSCREEN_URL,
+    reasons: ["USER_MEDIA", "WEB_RTC", "AUDIO_PLAYBACK"],
+    justification: "voice co-pilot mic + audio",
+  });
+}
+
+/**
+ * Start browser-side voice: ensure the mic grant, open the offscreen document,
+ * and post it the LiveKit room config. No-op (with a log) if config.js is absent
+ * or the mic is denied — the CDP relay is unaffected either way.
+ */
+async function startVoice() {
+  const cfg = await loadVoiceConfig();
+  if (!cfg || !cfg.LIVEKIT_URL || !cfg.TOKEN) {
+    console.log("[clarion] voice: no config.js — skipping browser voice");
+    return;
+  }
+
+  const granted = await ensureMicPermission();
+  if (!granted) {
+    console.warn("[clarion] voice: mic not granted — skipping browser voice");
+    return;
+  }
+
+  await ensureOffscreenDocument();
+  chrome.runtime.sendMessage({
+    type: VOICE_MSG.CONNECT,
+    target: OFFSCREEN_TARGET,
+    livekitUrl: cfg.LIVEKIT_URL,
+    token: cfg.TOKEN,
+    roomName: cfg.ROOM_NAME || "",
+  });
+  console.log("[clarion] voice: offscreen joining room", cfg.ROOM_NAME || "");
+}
+
+/**
+ * Stop browser-side voice: tell the offscreen doc to leave the room, then close
+ * the document. Idempotent and safe when voice was never started.
+ */
+async function stopVoice() {
+  if (!(await hasOffscreenDocument())) return;
+  try {
+    chrome.runtime.sendMessage({
+      type: VOICE_MSG.DISCONNECT,
+      target: OFFSCREEN_TARGET,
+    });
+  } catch {
+    /* offscreen may already be gone */
+  }
+  try {
+    await chrome.offscreen.closeDocument();
+  } catch {
+    /* already closed */
+  }
+  console.log("[clarion] voice: offscreen closed");
+}
+
+// Voice messages back from the offscreen / request-mic pages.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.target !== SW_VOICE_TARGET) return;
+  if (msg.type === VOICE_MSG.MIC_RESULT) {
+    if (micGrantResolver) {
+      const resolve = micGrantResolver;
+      micGrantResolver = null;
+      resolve(!!msg.granted);
+    }
+  } else if (msg.type === VOICE_MSG.STATE) {
+    console.log("[clarion] voice state:", msg.state, msg.detail || "");
+  }
+});

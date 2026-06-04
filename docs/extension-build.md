@@ -45,7 +45,7 @@ enable `DOM`/`Accessibility`/`DOMSnapshot`/`Runtime`/`Page`; perceive via
 | 2 | Shared §4 pipeline (`pipeline.py`) | orchestrator | ✅ | `pytest clarion` 82/82 | c1a998d |
 | 3 | CDP relay + `ExtensionActuator` (Py) | `ext-actuator` | ✅ | parity + act + live-WS, 89/89 | this |
 | 4 | MV3 extension shell (shortcut + debugger relay) | `ext-shell` | ✅ | manifest+syntax+framing 14/14+lint; live-load → #6 | this |
-| 5 | Voice in browser (offscreen LiveKit) | subagent | ☐ | spoken round-trip | — |
+| 5 | Voice in browser (offscreen LiveKit) | `ext-voice` | ✅ | manifest/CSP+syntax+SDK smoke+lint; spoken join → #6 | this |
 | 6 | Integrate + real gov-portal up-to-the-wall | orchestrator | ☐ | live read-only run | — |
 
 ## Log
@@ -68,3 +68,18 @@ enable `DOM`/`Accessibility`/`DOMSnapshot`/`Runtime`/`Page`; perceive via
   copy-lint clean. Live load-unpacked + the real-tab perceive are deferred to **#6**.
   (`ext-shell` also ran a live interop pass vs the real `WebSocketCdpRelay`.) `node_modules`
   is gitignored; `package.json` keeps `ws` as the interop devDep.
+- 2026-06-04 — **#5** voice in the browser (`offscreen.html/js`, `request-mic.html/js`,
+  `vendor/livekit-client.umd.js` v2.19.1): offscreen-doc LiveKit client joins the same
+  room as the unchanged Python `voice_entry` worker — mic in, agent TTS out — wired into
+  the SW session lifecycle (`startVoice`/`stopVoice`). Honors the three gotchas: mic
+  permission via a full extension tab, LiveKit connection in the offscreen doc, livekit-
+  client vendored (CSP `script-src 'self'`). Verified: manifest/CSP (no remote code),
+  `node --check`, SDK smoke (`Room`/`connect`/`setMicrophoneEnabled`), copy-lint, no secret
+  committed (`config.js` gitignored), changes confined to `web/extension/`. The live spoken
+  round-trip needs a mic + a live room + the voice worker → proven in **#6**.
+
+## Live runbook (#6 — human-in-the-loop)
+1. `cd web/extension && lk token create --api-key $LIVEKIT_API_KEY --api-secret $LIVEKIT_API_SECRET --identity human --room clarion-hero --join --valid-for 4h` → paste JWT into `config.js` (`ROOM_NAME=clarion-hero`).
+2. Start the Python relay + `voice_entry` worker (joined to `clarion-hero`).
+3. Launch Chrome with `--silent-debugger-extension-api`; load `web/extension/` unpacked; grant mic when `request-mic.html` opens.
+4. Open a real **government/benefits portal**, press `Ctrl/Cmd+Shift+Y`, run **read-only up to the auth wall** (no creds, no submit — §9 recording rules).
