@@ -141,7 +141,9 @@ async function startClarion() {
   // (additive — the CDP relay above is untouched). Start it with the session;
   // failures here never block the relay.
   startVoice().catch((err) =>
-    console.warn("[clarion] voice start failed:", errorToMessage(err))
+    // Surface voice-start failures in the durable log (not just the SW console),
+    // so the voice path is debuggable from /tmp/clarion-ext.log like everything else.
+    pushHud(tabId, { phase: "voice start FAILED", detail: errorToMessage(err), level: "err" })
   );
   console.log("[clarion] attached to tab", tabId, "—", session.url);
 }
@@ -406,11 +408,34 @@ let micGrantResolver = null;
  * @returns {Promise<{LIVEKIT_URL:string, ROOM_NAME?:string, TOKEN:string}|null>}
  */
 async function loadVoiceConfig() {
+  // Primary: dynamic import of the ESM config. Some MV3 service-worker runtimes
+  // restrict dynamic import(), so fall back to fetching + parsing the text (the
+  // file's shape is fixed: export default { LIVEKIT_URL, ROOM_NAME, TOKEN }).
+  const url = chrome.runtime.getURL("config.js");
   try {
-    const mod = await import(chrome.runtime.getURL("config.js"));
-    return mod && mod.default ? mod.default : null;
-  } catch {
-    // No config.js (or it failed to parse) — voice is opt-in, so this is fine.
+    const mod = await import(url);
+    if (mod && mod.default && mod.default.LIVEKIT_URL && mod.default.TOKEN) {
+      return mod.default;
+    }
+  } catch (err) {
+    sinkLog({
+      phase: "voice: dynamic import(config.js) failed — trying fetch",
+      detail: errorToMessage(err),
+      level: "warn",
+    });
+  }
+  try {
+    const text = await (await fetch(url)).text();
+    const pick = (k) =>
+      (text.match(new RegExp(k + '\\s*:\\s*"([^"]*)"')) || [])[1] || "";
+    const cfg = {
+      LIVEKIT_URL: pick("LIVEKIT_URL"),
+      ROOM_NAME: pick("ROOM_NAME"),
+      TOKEN: pick("TOKEN"),
+    };
+    return cfg.LIVEKIT_URL && cfg.TOKEN ? cfg : null;
+  } catch (err) {
+    sinkLog({ phase: "voice: fetch(config.js) failed", detail: errorToMessage(err), level: "err" });
     return null;
   }
 }
@@ -484,19 +509,33 @@ async function ensureOffscreenDocument() {
  * or the mic is denied — the CDP relay is unaffected either way.
  */
 async function startVoice() {
+  // Every gate is sink-logged so a silent voice failure is visible in
+  // /tmp/clarion-ext.log (the offscreen + mic path is otherwise a black box).
+  sinkLog({ phase: "voice: starting", level: "info" });
   const cfg = await loadVoiceConfig();
   if (!cfg || !cfg.LIVEKIT_URL || !cfg.TOKEN) {
-    console.log("[clarion] voice: no config.js — skipping browser voice");
+    sinkLog({
+      phase: "voice: NO config.js — skipping",
+      detail: "config.js failed to import or is missing LIVEKIT_URL/TOKEN",
+      level: "err",
+    });
     return;
   }
+  sinkLog({ phase: "voice: config loaded", detail: cfg.ROOM_NAME || "" });
 
   const granted = await ensureMicPermission();
   if (!granted) {
-    console.warn("[clarion] voice: mic not granted — skipping browser voice");
+    sinkLog({
+      phase: "voice: mic NOT granted — skipping",
+      detail: "grant the mic in the request-mic tab, then re-run the shortcut",
+      level: "err",
+    });
     return;
   }
+  sinkLog({ phase: "voice: mic granted", level: "ok" });
 
   await ensureOffscreenDocument();
+  sinkLog({ phase: "voice: offscreen ready — sending CONNECT" });
   chrome.runtime.sendMessage({
     type: VOICE_MSG.CONNECT,
     target: OFFSCREEN_TARGET,
@@ -504,7 +543,6 @@ async function startVoice() {
     token: cfg.TOKEN,
     roomName: cfg.ROOM_NAME || "",
   });
-  console.log("[clarion] voice: offscreen joining room", cfg.ROOM_NAME || "");
 }
 
 /**
