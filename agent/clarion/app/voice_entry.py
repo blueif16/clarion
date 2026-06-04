@@ -101,11 +101,28 @@ class StageGraphRunner:
     the kernel's ACT once-flag prevent any double-act on a re-delivered resume).
     """
 
-    def __init__(self, runtime, *, thread_id: str = "voice-hero") -> None:
+    def __init__(self, runtime=None, *, thread_id: str = "voice-hero") -> None:
         self._runtime = runtime
-        self._graph = runtime.build_stage_graph()
+        # The stage graph bakes in the actuator, so it can only be built once the
+        # runtime (and its actuator) exists. In the DECOUPLED entrypoint the runner
+        # starts PENDING (runtime=None) so the AgentSession can greet + listen
+        # before the tab relay is up; `bind()` builds the graph once it attaches.
+        self._graph = runtime.build_stage_graph() if runtime is not None else None
         self._thread_id = thread_id
         self._seed = None  # set on first advance
+
+    @property
+    def ready(self) -> bool:
+        """True once a runtime is bound and the stage graph is built — i.e. the
+        tab relay has attached and tab actions are available."""
+        return self._graph is not None
+
+    def bind(self, runtime) -> None:
+        """Bind the now-attached runtime and build the stage graph. Called from the
+        background actuator-attach task once the tab relay is live (decoupled from
+        the voice plane, which is already greeting/listening)."""
+        self._runtime = runtime
+        self._graph = runtime.build_stage_graph()
 
     @property
     def _cfg(self) -> dict:
@@ -172,6 +189,13 @@ def build_voice_tools(runner: StageGraphRunner):
     async def advance_task(context: RunContext, user_intent: str = "") -> str:
         """Advance the payment task one consequential step. Speak the returned
         readback VERBATIM, then wait for the user's yes/no."""
+        if not runner.ready:
+            # Voice is live but the tab relay hasn't attached yet (decoupled loop).
+            # Never fabricate an action — say so plainly (the §-invariant: no action
+            # without a connected surface).
+            return (
+                "I'm still connecting to your tab — give me a moment, then ask again."
+            )
         consent_req = await advance_non_blocking(
             context.speech_handle,
             runner.advance,
@@ -185,6 +209,8 @@ def build_voice_tools(runner: StageGraphRunner):
     async def confirm_consent(context: RunContext, approved: bool) -> str:
         """Deliver the user's consent decision to the parked task graph. Wrapped in
         disallow_interruptions so a stray 'um' can't fracture the act (execution §5)."""
+        if not runner.ready:
+            return "I'm not connected to your tab yet — one moment."
         decision = ConsentDecision(decision="approve" if approved else "reject")
         with context.disallow_interruptions():
             next_req = await runner.resume(decision)
@@ -210,50 +236,47 @@ _INSTRUCTIONS = (
 )
 
 
+# Background tasks (tab-attach + real-sim) outlive the entrypoint body; keep a
+# strong reference so the event loop can't GC them mid-flight.
+_BG_TASKS: set = set()
+
+
+def _spawn(coro):
+    task = asyncio.ensure_future(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
 async def entrypoint(ctx) -> None:
-    """LiveKit worker entrypoint (execution §5). Builds the real AgentSession with
-    Deepgram STT + Gemini LLM + AI-Studio Gemini TTS + Silero VAD + MultilingualModel
-    turn detection, attaches the `advance_task` seam over the ST1 stage graph driving
-    the live demo site, publishes PanelState per step, and starts the session."""
+    """LiveKit worker entrypoint (execution §5), DECOUPLED. The AgentSession starts
+    and greets IMMEDIATELY on dispatch — the agent hears the user right away — while
+    the chrome.debugger tab-relay attaches and the ST1 stage-graph runner binds in
+    the BACKGROUND. Voice never waits on the tab: `advance_task` says "connecting to
+    your tab" until the runner is ready. This removes the old coupling where the
+    agent's ears only turned on AFTER the relay attached. Every phase is logged with
+    a `[loop]` prefix so the whole post-shortcut loop is observable in one place."""
     from livekit.agents import Agent, AgentSession
 
     from clarion.adapters.tts_vertex import VertexExpressSynthesizer
+    from clarion.app.extension_runtime import extension_actuator_selected
     from clarion.app.runtime import HeroRuntime
 
+    def loop(msg: str) -> None:
+        """One observable line per loop phase — tail /tmp/clarion-worker.log."""
+        print(f"  [loop] {msg}", flush=True)
+
     await ctx.connect()
+    loop("dispatched + connected to the room")
 
-    # The runtime over the live demo site, publishing PanelState to THIS room.
-    demo_url = os.environ.get("DEMO_SITE_URL", "http://localhost:8770/")
-    # CLARION_ACTUATOR=extension drives the user's OWN tab over the chrome.debugger
-    # relay (the extension joins the room as the human; this worker is the agent).
-    # Default stays the spawned-browser PlaywrightActuator; CLARION_DEMO_MODE=1 still
-    # selects the CachedActuator inside HeroRuntime.create.
-    from clarion.app.extension_runtime import extension_actuator_selected
-
-    if extension_actuator_selected():
-        from clarion.app.extension_runtime import ExtensionRuntime
-
-        ext = ExtensionRuntime(demo_url=demo_url, mode="fast", room=ctx.room)
-        await ext.start_relay()
-        print(
-            "  [voice_entry] CLARION_ACTUATOR=extension — relay up; press the "
-            "extension shortcut on your tab to attach…",
-            flush=True,
-        )
-        await ext.wait_for_session(timeout=None)
-        runtime = await ext.build_runtime()
-    else:
-        runtime = await HeroRuntime.create(
-            demo_url, mode="fast", room=ctx.room, headless=True
-        )
-    runner = StageGraphRunner(runtime)
+    # The stage-graph runner starts PENDING — bound once the tab relay attaches, so
+    # the AgentSession below can greet + listen before the tab is up.
+    runner = StageGraphRunner()
     tools = build_voice_tools(runner)
 
-    # Contract-correct TTS the kernel sees (AI Studio by default — the live key).
-    # The session's audio-output TTS uses the google.beta plugin; the express path
-    # activates with a project-backed cred. We construct the AI-Studio synthesizer
-    # so the wiring is genuine and live.
-    synth = VertexExpressSynthesizer()  # mode defaults to ai_studio
+    # Contract-correct TTS the kernel sees (AI Studio by default — the live key);
+    # constructed so the wiring is genuine even though the audio path uses google.beta.
+    _synth = VertexExpressSynthesizer()  # noqa: F841 - mode defaults to ai_studio
 
     vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") else None
     session = AgentSession(
@@ -271,13 +294,71 @@ async def entrypoint(ctx) -> None:
         turn_detection=_MultilingualModel() if _MultilingualModel else None,
     )
     agent = Agent(instructions=_INSTRUCTIONS, tools=tools)
+
+    # *** The agent's ears turn ON here — BEFORE the tab relay. Speak → heard. ***
     await session.start(agent=agent, room=ctx.room)
-    await session.generate_reply(
-        instructions=(
-            "Greet the user briefly and tell them you can pay their electric bill, "
-            "step by step, with their confirmation before anything irreversible."
-        )
-    )
+    loop("AgentSession STARTED — listening now (no tab required to talk)")
+
+    # Attach the tab surface in the BACKGROUND; bind the runner when it's live.
+    demo_url = os.environ.get("DEMO_SITE_URL", "http://localhost:8770/")
+
+    async def attach_tab() -> None:
+        try:
+            if extension_actuator_selected():
+                from clarion.app.extension_runtime import ExtensionRuntime
+
+                ext = ExtensionRuntime(demo_url=demo_url, mode="fast", room=ctx.room)
+                await ext.start_relay()
+                loop("relay up on :8771 — waiting for the extension to attach the tab…")
+                await ext.wait_for_session(timeout=None)
+                loop("extension attached the tab — building the stage graph…")
+                runtime = await ext.build_runtime()
+            else:
+                runtime = await HeroRuntime.create(
+                    demo_url, mode="fast", room=ctx.room, headless=True
+                )
+            runner.bind(runtime)
+            loop("stage-graph runner READY — tab actions enabled")
+        except Exception as exc:  # noqa: BLE001 - the voice plane must survive this
+            loop(f"tab attach FAILED (voice still works): {exc!r}")
+
+    _spawn(attach_tab())
+
+    # Greet, then (optionally) drive the REAL-SIM — both in ONE background task so
+    # the entrypoint returns while the session keeps running, and the greeting is
+    # awaited first so a scripted "user" turn never collides with it.
+    #
+    # REAL-SIM (no fakes): scripted user turns driven AS TEXT through the real LLM +
+    # tools + TTS — "speaking" via text input; the only un-real link is mic→STT.
+    #   CLARION_SIM_UTTERANCES="pay my electric bill|yes"   CLARION_SIM_GAP=4
+    sim = os.environ.get("CLARION_SIM_UTTERANCES", "").strip()
+    loop(f"sim armed = {bool(sim)} ({sim!r})")
+
+    async def greet_then_sim() -> None:
+        try:
+            await session.generate_reply(
+                instructions=(
+                    "Greet the user briefly and tell them you can pay their electric "
+                    "bill, step by step, with their confirmation before anything "
+                    "irreversible."
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            loop(f"greet failed: {exc!r}")
+        if not sim:
+            return
+        loop("[SIM] scripted run starting")
+        gap = float(os.environ.get("CLARION_SIM_GAP", "4"))
+        for utt in [u.strip() for u in sim.split("|") if u.strip()]:
+            await asyncio.sleep(gap)
+            loop(f"[SIM] user (text-as-speech): {utt!r}")
+            try:
+                await session.generate_reply(user_input=utt)
+            except Exception as exc:  # noqa: BLE001
+                loop(f"[SIM] generate_reply failed: {exc!r}")
+        loop("[SIM] scripted utterances complete")
+
+    _spawn(greet_then_sim())
 
 
 def _build_audio_tts():
