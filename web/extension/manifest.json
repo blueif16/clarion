@@ -18,6 +18,21 @@
     "service_worker": "service-worker.js",
     "type": "module"
   },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' wss: https:; media-src 'self' blob:"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "offscreen.html",
+        "offscreen.js",
+        "request-mic.html",
+        "request-mic.js",
+        "vendor/livekit-client.umd.js"
+      ],
+      "matches": ["chrome-extension://*/*"]
+    }
+  ],
   "commands": {
     "start-clarion": {
       "suggested_key": {
