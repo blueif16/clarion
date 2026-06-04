@@ -21,17 +21,13 @@ reap_tree() {
 # multiprocessing subprocess whose argv is `python -c from multiprocessing.spawn`
 # (it does NOT contain "voice_entry"), so a name-only kill LEAKS them — they
 # linger as ppid=1 orphans, stay registered, and STEAL future dispatches (a real
-# bug that made the sim land on a stale, mis-configured job). Reap the tree.
-if [ -f "$WORKER_PID_FILE" ]; then
-  PID="$(cat "$WORKER_PID_FILE" 2>/dev/null || true)"
-  if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
-    reap_tree "$PID"
-    echo "  stopped worker PID $PID + its job-subprocess tree"
-  fi
-  rm -f "$WORKER_PID_FILE"
-fi
-# Any stray worker mains (and their trees) not tracked by the pid file.
-for p in $(pgrep -f "clarion.app.voice_entry" 2>/dev/null || true); do reap_tree "$p"; done
+# bug that made the sim land on a stale, mis-configured job). We match the worker
+# by argv via pgrep (NOT the pid file — nohup forks, so the recorded pid is
+# off-by-one and could be recycled to an unrelated process) and reap its tree.
+for p in $(pgrep -f "clarion.app.voice_entry" 2>/dev/null || true); do
+  reap_tree "$p"; echo "  stopped voice worker tree (pid $p)"
+done
+rm -f "$WORKER_PID_FILE"
 # Orphaned LiveKit job subprocesses (ppid=1, multiprocessing-spawn) left by an
 # earlier crash/kill — sweep them so they can't keep competing for dispatches.
 ORPHANS="$(ps -axo pid=,ppid=,command= 2>/dev/null | awk '$2==1 && /from multiprocessing.spawn/ {print $1}')"
@@ -40,15 +36,11 @@ if [ -n "$ORPHANS" ]; then
   kill -9 $ORPHANS 2>/dev/null || true
 fi
 
-# Relay broker (by recorded PID, then anything still holding :8771 / :8773).
-if [ -f "$BROKER_PID_FILE" ]; then
-  BPID="$(cat "$BROKER_PID_FILE" 2>/dev/null || true)"
-  if [ -n "${BPID:-}" ] && kill -0 "$BPID" 2>/dev/null; then
-    kill "$BPID" 2>/dev/null || true
-    echo "  stopped relay broker PID $BPID"
-  fi
-  rm -f "$BROKER_PID_FILE"
-fi
+# Relay broker (match by argv; then free the ports as a backstop).
+for p in $(pgrep -f "clarion.actuator.relay_broker" 2>/dev/null || true); do
+  kill "$p" 2>/dev/null && echo "  stopped relay broker (pid $p)" || true
+done
+rm -f "$BROKER_PID_FILE"
 STILL="$(lsof -t -i tcp:8771 -i tcp:8773 2>/dev/null || true)"
 if [ -n "$STILL" ]; then
   echo "  freeing relay ports :8771/:8773 (PIDs $STILL)"; kill $STILL 2>/dev/null || true
