@@ -224,9 +224,28 @@ async def entrypoint(ctx) -> None:
 
     # The runtime over the live demo site, publishing PanelState to THIS room.
     demo_url = os.environ.get("DEMO_SITE_URL", "http://localhost:8770/")
-    runtime = await HeroRuntime.create(
-        demo_url, mode="fast", room=ctx.room, headless=True
-    )
+    # CLARION_ACTUATOR=extension drives the user's OWN tab over the chrome.debugger
+    # relay (the extension joins the room as the human; this worker is the agent).
+    # Default stays the spawned-browser PlaywrightActuator; CLARION_DEMO_MODE=1 still
+    # selects the CachedActuator inside HeroRuntime.create.
+    from clarion.app.extension_runtime import extension_actuator_selected
+
+    if extension_actuator_selected():
+        from clarion.app.extension_runtime import ExtensionRuntime
+
+        ext = ExtensionRuntime(demo_url=demo_url, mode="fast", room=ctx.room)
+        await ext.start_relay()
+        print(
+            "  [voice_entry] CLARION_ACTUATOR=extension — relay up; press the "
+            "extension shortcut on your tab to attach…",
+            flush=True,
+        )
+        await ext.wait_for_session(timeout=None)
+        runtime = await ext.build_runtime()
+    else:
+        runtime = await HeroRuntime.create(
+            demo_url, mode="fast", room=ctx.room, headless=True
+        )
     runner = StageGraphRunner(runtime)
     tools = build_voice_tools(runner)
 

@@ -46,7 +46,8 @@ enable `DOM`/`Accessibility`/`DOMSnapshot`/`Runtime`/`Page`; perceive via
 | 3 | CDP relay + `ExtensionActuator` (Py) | `ext-actuator` | ✅ | parity + act + live-WS, 89/89 | this |
 | 4 | MV3 extension shell (shortcut + debugger relay) | `ext-shell` | ✅ | manifest+syntax+framing 14/14+lint; live-load → #6 | this |
 | 5 | Voice in browser (offscreen LiveKit) | `ext-voice` | ✅ | manifest/CSP+syntax+SDK smoke+lint; spoken join → #6 | this |
-| 6 | Integrate + real gov-portal up-to-the-wall | orchestrator | ☐ | live read-only run | — |
+| 6a | Python entrypoint: relay server + `ExtensionActuator` runtime | `ext-runtime` | ✅ | headless relay→fake-ext perceive 2/2; 89/89 | this |
+| 6b | Integrate + real gov-portal up-to-the-wall | orchestrator | ☐ | live read-only run (real Chrome) | — |
 
 ## Log
 - 2026-06-04 — **#2** refactor: extracted the pure §4 perception pipeline to
@@ -77,9 +78,28 @@ enable `DOM`/`Accessibility`/`DOMSnapshot`/`Runtime`/`Page`; perceive via
   `node --check`, SDK smoke (`Room`/`connect`/`setMicrophoneEnabled`), copy-lint, no secret
   committed (`config.js` gitignored), changes confined to `web/extension/`. The live spoken
   round-trip needs a mic + a live room + the voice worker → proven in **#6**.
+- 2026-06-04 — **#6a** Python entrypoint (`app/extension_runtime.py`): starts
+  `WebSocketCdpRelay` on `127.0.0.1:8771`, waits for the extension's `session.start`, builds
+  `ExtensionActuator(relay)`, and assembles the SAME `HeroRuntime` stage/perceive path the
+  hero flow uses (actuator injected — only the transport differs) to drive a read-only
+  perceive→readback loop + a PanelState publish. Selected by `CLARION_ACTUATOR=extension`
+  (a one-branch seam in `runtime.py`/`voice_entry.py`); the default keeps `PlaywrightActuator`
+  and `CLARION_DEMO_MODE=1` keeps the `CachedActuator`. Verified headless
+  (`test_extension_runtime.py`, `-m live`): relay server up → in-test fake-extension WS client
+  replays the real `overlay.html` CDP → runtime's `perceive()` yields a non-empty, parity-correct
+  selector_map + a published PanelState — no real Chrome, no LiveKit. `pytest clarion` 89
+  passed / 6 deselected; demo-mode hero still GREEN; copy-lint clean. Contracts/kernel/stages
+  untouched. The real-tab run (real Chrome on a gov portal) is **#6b**.
 
 ## Live runbook (#6 — human-in-the-loop)
 1. `cd web/extension && lk token create --api-key $LIVEKIT_API_KEY --api-secret $LIVEKIT_API_SECRET --identity human --room clarion-hero --join --valid-for 4h` → paste JWT into `config.js` (`ROOM_NAME=clarion-hero`).
-2. Start the Python relay + `voice_entry` worker (joined to `clarion-hero`).
+2. Start the Python side. Two ways, both starting `WebSocketCdpRelay` on `127.0.0.1:8771`:
+   - **read-only operator loop** (relay + `ExtensionActuator` + perceive→readback, no voice):
+     `cd agent && CLARION_ACTUATOR=extension .venv/bin/python -m clarion.app.extension_runtime`
+     (env: `CLARION_RELAY_PORT` default `8771`; `CLARION_EXT_PERCEIVE_INTERVAL=2` to re-perceive every 2 s).
+   - **with voice** (the worker joins `clarion-hero` as the agent; the extension joins as the human):
+     `cd agent && CLARION_ACTUATOR=extension .venv/bin/python -m clarion.app.voice_entry dev`
+     Both print the `session.start` + a perceived-node summary so the operator sees the attach. The
+     default (flag unset) keeps `PlaywrightActuator`; `CLARION_DEMO_MODE=1` keeps the `CachedActuator`.
 3. Launch Chrome with `--silent-debugger-extension-api`; load `web/extension/` unpacked; grant mic when `request-mic.html` opens.
 4. Open a real **government/benefits portal**, press `Ctrl/Cmd+Shift+Y`, run **read-only up to the auth wall** (no creds, no submit — §9 recording rules).

@@ -314,6 +314,7 @@ class HeroRuntime:
         panel_sink: Optional[Callable[[Any, str], None]] = None,
         retriever: Optional[Retriever] = None,
         kb_retriever: Optional[Retriever] = None,
+        actuator: Optional[Actuator] = None,
     ) -> "HeroRuntime":
         """Build the runtime over the live demo site.
 
@@ -329,7 +330,10 @@ class HeroRuntime:
           ``CachedActuator`` that REPLAYS the recorded fixture (no browser, no
           network) so the FULL hero run is judge-proof even with the site/network
           down (execution §9). Only PERCEPTION is cached; the K1 kernel + ST1
-          stage graph + consent gate + policy still execute for real.
+          stage graph + consent gate + policy still execute for real. An explicit
+          ``actuator`` (e.g. an ``ExtensionActuator`` over a started
+          ``WebSocketCdpRelay`` — the chrome.debugger / extension path) is injected
+          verbatim, so the SAME stage/perceive path drives the user's real tab.
         - ``PanelPublisher`` (live if ``room`` given, else recording sink).
         """
         from clarion.app.demo_mode import CachedActuator, demo_mode_enabled
@@ -340,7 +344,10 @@ class HeroRuntime:
         kb = kb_retriever if kb_retriever is not None else await select_kb_retriever(
             demo_mode=demo
         )
-        if demo:
+        if actuator is not None:
+            # Injected transport (the extension path) — used as-is; no browser spawn.
+            pass
+        elif demo:
             actuator = await CachedActuator.create(demo_site_url, headless=headless)
         else:
             from clarion.actuator.actuator import PlaywrightActuator
