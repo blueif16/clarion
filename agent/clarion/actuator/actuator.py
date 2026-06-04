@@ -74,6 +74,7 @@ from clarion.actuator.pipeline import (  # noqa: F401  (re-exported)
     _READ_JS,
     build_candidates,
     containment_filter,
+    diff_maps,
     estimate_tokens,
     order_reading,
     parse_snapshot,
@@ -214,27 +215,9 @@ class PlaywrightActuator(Actuator):
 
     async def diff(self, before: SelectorMap, after: SelectorMap) -> PageDiff:
         """Page-diff by stable node identity (role+name+node_id), detecting a
-        silently-failed step (execution §4.3)."""
-
-        def key(n: AxNode) -> str:
-            return f"{n.role}\x00{n.name}\x00{n.node_id}"
-
-        before_by_key = {key(n): n for n in before.nodes.values()}
-        after_by_key = {key(n): n for n in after.nodes.values()}
-        added_keys = set(after_by_key) - set(before_by_key)
-        removed_keys = set(before_by_key) - set(after_by_key)
-        changed_keys = {
-            k
-            for k in set(before_by_key) & set(after_by_key)
-            if before_by_key[k].state != after_by_key[k].state
-            or before_by_key[k].bbox != after_by_key[k].bbox
-        }
-        added = [after_by_key[k].index for k in added_keys]
-        removed = [before_by_key[k].index for k in removed_keys]
-        changed = [after_by_key[k].index for k in changed_keys]
-        return PageDiff(
-            added=sorted(added), removed=sorted(removed), changed=sorted(changed)
-        )
+        silently-failed step (execution §4.3). The pure logic lives in
+        ``pipeline.diff_maps`` — shared verbatim with ``ExtensionActuator``."""
+        return diff_maps(before, after)
 
     async def perceive_vision(self) -> SelectorMap:
         """Vision fallback for AX-blind widgets (canvas / unlabeled custom
