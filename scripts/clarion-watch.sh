@@ -12,7 +12,7 @@ set -uo pipefail
 
 INTERVAL="${CLARION_WATCH_INTERVAL:-10}"
 STATUS="/tmp/clarion-status.log"
-RELAY_LOG="/tmp/clarion-relay.log"
+BROKER_LOG="/tmp/clarion-broker.log"
 WORKER_LOG="/tmp/clarion-worker.log"
 echo $$ > /tmp/clarion-watch.pid
 
@@ -22,20 +22,23 @@ trap 'echo "[$(date "+%H:%M:%S")] watch stopped" | tee -a "$STATUS"; exit 0' INT
 while true; do
   TS="$(date '+%H:%M:%S')"
 
-  # Relay WebSocket server on :8771 (the thing the extension connects to).
-  RELAY_PID="$(lsof -ti tcp:8771 -sTCP:LISTEN 2>/dev/null | head -1)"
-  [ -n "$RELAY_PID" ] && PORT="UP(pid $RELAY_PID)" || PORT="DOWN"
+  # Relay broker: extension side (:8771, what the extension connects to) and the
+  # agent side (:8773, what the actuator connects to).
+  EXT_PID="$(lsof -ti tcp:8771 -sTCP:LISTEN 2>/dev/null | head -1)"
+  [ -n "$EXT_PID" ] && EXT="UP(pid $EXT_PID)" || EXT="DOWN"
+  AGT_PID="$(lsof -ti tcp:8773 -sTCP:LISTEN 2>/dev/null | head -1)"
+  [ -n "$AGT_PID" ] && AGT="UP" || AGT="DOWN"
 
   # Voice worker (LiveKit agent), if running.
   pgrep -f "clarion.app.voice_entry" >/dev/null 2>&1 && WORKER="up" || WORKER="down"
 
-  # Most recent extension session lifecycle + perception activity, from the log.
-  SESS="$(grep -aE 'session\.(start|end)' "$RELAY_LOG" 2>/dev/null | tail -1 \
-          | sed -E 's/.*(session\.[a-z]+[^|]*)/\1/' | cut -c1-46)"
-  PERC="$(grep -a 'perceived' "$RELAY_LOG" 2>/dev/null | tail -1 \
-          | sed -E 's/.*(perceived [0-9]+ [a-z ]*nodes).*/\1/' | cut -c1-30)"
+  # Most recent session lifecycle (broker log) + the latest worker loop phase.
+  SESS="$(grep -aE 'session\.(start|end)' "$BROKER_LOG" 2>/dev/null | tail -1 \
+          | sed -E 's/.*\[relay-broker\] //' | cut -c1-46)"
+  LOOP="$(grep -a '\[loop\]' "$WORKER_LOG" 2>/dev/null | tail -1 \
+          | sed -E 's/.*\[loop\] //' | cut -c1-40)"
 
-  echo "[$TS] relay:8771=$PORT  worker=$WORKER  | ${SESS:-no-session}  | ${PERC:-no-perceive}" \
+  echo "[$TS] broker:8771=$EXT 8773=$AGT  worker=$WORKER  | ${SESS:-no-session}  | ${LOOP:-no-loop}" \
     | tee -a "$STATUS"
   sleep "$INTERVAL"
 done
