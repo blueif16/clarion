@@ -42,8 +42,8 @@ enable `DOM`/`Accessibility`/`DOMSnapshot`/`Runtime`/`Page`; perceive via
 ## Status
 | # | Feature | Owner | Status | Verified by | Commit |
 |---|---|---|---|---|---|
-| 2 | Shared §4 pipeline (`pipeline.py`) | orchestrator | ✅ | `pytest clarion` 82/82 | (this) |
-| 3 | CDP relay + `ExtensionActuator` (Py) | subagent | ◐ | parity + fake-relay tests | — |
+| 2 | Shared §4 pipeline (`pipeline.py`) | orchestrator | ✅ | `pytest clarion` 82/82 | c1a998d |
+| 3 | CDP relay + `ExtensionActuator` (Py) | `ext-actuator` | ✅ | parity + act + live-WS, 89/89 | this |
 | 4 | MV3 extension shell (shortcut + debugger relay) | subagent | ☐ | load-unpacked perceive | — |
 | 5 | Voice in browser (offscreen LiveKit) | subagent | ☐ | spoken round-trip | — |
 | 6 | Integrate + real gov-portal up-to-the-wall | orchestrator | ☐ | live read-only run | — |
@@ -53,3 +53,10 @@ enable `DOM`/`Accessibility`/`DOMSnapshot`/`Runtime`/`Page`; perceive via
   `actuator/pipeline.py` (shared by both actuator transports); `PlaywrightActuator`
   re-imports the names + keeps a `_containment_filter` shim → zero test changes,
   `pytest clarion` 82 passed / 3 deselected.
+- 2026-06-04 — **#3** `ExtensionActuator` + `CdpRelay` (`relay.py`, `extension_actuator.py`):
+  the §4 pipeline now runs over the chrome.debugger CDP relay (`WebSocketCdpRelay`
+  server + `FakeRelay`). Verified independently: transport **parity** (replayed CDP →
+  identical `(index,role,name,bbox)` map), act-correctness (native-setter / dispatchMouse
+  / Page.navigate / read), live loopback WS round-trip. `pytest clarion` 89 passed /
+  4 deselected; no playwright import; copy-lint clean. (`diff_maps` lifted to `pipeline.py`,
+  shared by both actuators.)

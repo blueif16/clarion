@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from clarion.contracts.state import AxNode
+from clarion.contracts.state import AxNode, PageDiff, SelectorMap
 
 # AX roles we treat as "interactive" for the numbered map (execution §4.1.5).
 # Anything outside this set is structural and never gets an index — only things
@@ -345,6 +345,35 @@ def extract_state(ax: dict) -> dict[str, bool]:
         if isinstance(pval, bool):
             state[pname] = pval
     return state
+
+
+def diff_maps(before: SelectorMap, after: SelectorMap) -> PageDiff:
+    """Page-diff two SelectorMaps by stable node identity (role+name+node_id),
+    so a silently-failed step shows up as added/removed/changed (execution §4.3).
+
+    Pure over the maps and transport-agnostic — shared verbatim by
+    ``PlaywrightActuator.diff`` and ``ExtensionActuator.diff``. Indices refer to
+    the *after* map for added/changed nodes and the *before* map for removed."""
+
+    def key(n: AxNode) -> str:
+        return f"{n.role}\x00{n.name}\x00{n.node_id}"
+
+    before_by_key = {key(n): n for n in before.nodes.values()}
+    after_by_key = {key(n): n for n in after.nodes.values()}
+    added_keys = set(after_by_key) - set(before_by_key)
+    removed_keys = set(before_by_key) - set(after_by_key)
+    changed_keys = {
+        k
+        for k in set(before_by_key) & set(after_by_key)
+        if before_by_key[k].state != after_by_key[k].state
+        or before_by_key[k].bbox != after_by_key[k].bbox
+    }
+    added = [after_by_key[k].index for k in added_keys]
+    removed = [before_by_key[k].index for k in removed_keys]
+    changed = [after_by_key[k].index for k in changed_keys]
+    return PageDiff(
+        added=sorted(added), removed=sorted(removed), changed=sorted(changed)
+    )
 
 
 def estimate_tokens(nodes: dict[int, AxNode]) -> int:
