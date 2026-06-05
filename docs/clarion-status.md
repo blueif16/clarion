@@ -1,7 +1,6 @@
 # Clarion — LIVE STATUS (read this first each session)
 
-_Last updated: 2026-06-04 · branch `feat/clarion-extension` · supersedes
-`docs/clarion-extension-handoff.md` (that said "voice is the open bug" — no longer true)._
+_Last updated: 2026-06-05 · branch `feat/clarion-extension`._
 
 This is the single source of truth for **where we are and what's left**. Keep it
 current: when you finish or change something, edit this file in the same commit.
@@ -10,17 +9,21 @@ current: when you finish or change something, edit this file in the same commit.
 
 ## TL;DR (the one paragraph)
 
-The **voice plane + perception + actuator + the kernel ENGINE are REAL and proven
-live** on a real tab. The thing that made it feel like a stub was the **planning
-layer**, hardcoded to "pay my electric bill" at 3 layers. A prior session shipped
-the **goal-formation on-ramp** (`read_screen`/ORIENT, goal from confirmed intent).
-**This session killed the GROUND fixture (Gap 1):** the kernel now grounds on the
-**real page** via `PageRetriever(actuator)` → `extract_text_facts` over the live AX
-tree — every fact sourced to a real AX `nodeId`, no `$84.32` constant. Proven on
-TWO real public sites (usa.gov, wikipedia): grounded facts carry real node ids and
-the fixture's `$84.32/Northwind` never leaks; honest absence when the page lacks a
-value. **Testing rule (locked):** real sites only — NOT the `web/demo-site` clone.
-**Still hardcoded (next phase):** the task PLAN (pay topology). 99 tests green.
+The **task plane is now DE-HARDCODED**. The "pay my electric bill" AUTH→…→CONFIRM
+topology is **deleted**: a generic LLM (`GeminiReasoner`, `thinking_budget=0`)
+plans the goal and decides each grounded step behind a **frozen `Reasoner` port**;
+the LangGraph kernel acts and **enforces the two invariants in code**. The four
+de-hardcoding systems shipped this wave — **Reasoner** (port + Gemini, Qwen/Nebius
+failover, post-decode guard) · **PairedFact** (geometric label↔value + membership +
+same-cycle pairing fences) · **dual-signal irreversibility gate** (escalate-only,
+UNKNOWN-gates-Fast, NegativeVerifier honest-decline) · **generic anchored done-check**
+(code-selected, not say-so). **Proven end-to-end on TWO real gov sites, ZERO
+site-specific code** (autonomous Playwright + live Gemini): usa.gov benefits
+(read-only, grounded values + real citations, anchor-certified) AND weather.gov (a
+benign form — filled, then the submit classified UNKNOWN → consent **hard-stop** →
+declined, never submitted). **178 tests green** + a goal-agnostic invariant spec with
+red-before-green proven by mutation. **Testing rule (locked):** real sites only —
+never the `web/demo-site` clone.
 
 ---
 
@@ -28,136 +31,142 @@ value. **Testing rule (locked):** real sites only — NOT the `web/demo-site` cl
 
 | Piece | State | Evidence / location |
 |---|---|---|
-| Voice: LiveKit dispatch · Deepgram STT · Gemini LLM · Gemini TTS | **REAL, live** | `app/voice_entry.py`; worker log shows greet + transcripts + tool calls |
-| Perception (CDP AXTree → numbered map) | **REAL** | `actuator/pipeline.py`, `actuator/*actuator.py` |
-| Actuator act (click/fill/navigate over CDP) | **REAL** | `Input.dispatchMouseEvent`, native-setter fills |
-| Kernel loop GROUND→…→CONFIRM | **REAL (calls real ports)** | `kernel/graph.py:141/339/359` |
-| **ORIENT `read_screen` (grounded page readout)** | **REAL, NEW, live-verified** | `read_screen` tool + `summarize_ax_tree`/`describe_page` |
+| Voice: LiveKit · Deepgram STT · Gemini LLM · Gemini TTS | **REAL, live** | `app/voice_entry.py` |
+| Perception (CDP AXTree → numbered map), lazy-stamp | **REAL, cheap** | `actuator/pipeline.py`, `actuator/*actuator.py` (perceive 0 stamp round-trips; `reperceive_node`) |
+| Actuator act (click/fill/navigate over CDP) + `filled` record | **REAL** | native-setter fills stamp `state["filled"]` by node_id |
+| Kernel loop GROUND→VERIFY→PROPOSE→⟨GATE⟩→CONSENT→ACT→CONFIRM | **REAL** | `kernel/graph.py` |
+| ORIENT `read_screen` (grounded page readout) | **REAL, live-verified** | `read_screen` + `summarize_ax_tree`/`describe_page` |
 | Goal source | **REAL (from confirmed user intent)** | `voice_entry.py` `set_goal`; no baked default |
-| **Task PLAN / stage topology** | **❌ HARDCODED to pay flow** | `stages/planner.py:90` (ignores goal), `stages/graph.py:171` |
-| **GROUND facts (page values)** | **✅ REAL (page-grounded)** | `app/page_retriever.py` `PageRetriever`; `actuator/pipeline.py` `extract_text_facts`; wired `app/runtime.py`. `HeroRetriever` kept only as a test double. |
+| **Task PLAN / topology** | **✅ REAL — LLM Reasoner, generic executor** | `Reasoner.plan_goal`→subgoals; `stages/graph.py` generic executor (no baked topology) |
+| **Next-step decision (PROPOSE)** | **✅ REAL — `Reasoner.decide_step` over top-K slice** | `kernel/graph.py`; off-page index/value rejected by `kernel/reasoner_guard.py` |
+| Reasoner adapter | **✅ REAL** | `adapters/gemini_reasoner.py` (default, `thinking_budget=0`, ~2s) · `adapters/openai_reasoner.py` (Qwen/Nebius failover) |
+| **GROUND facts (page values) + PairedFacts** | **✅ REAL (page-grounded)** | `app/page_retriever.py`; `actuator/pipeline.py` `extract_text_facts`/`extract_paired_facts` (geometric, both halves real node ids) |
+| **Epistemic fences** | **✅ REAL** | `kernel/policy.py` membership (`is_speakable_value`) + pairing (`pairing_backs`); `NegativeVerifier` hedge |
+| **Irreversibility gate** | **✅ REAL — dual-signal** | `kernel/irreversibility.py` (structural pre-screen escalate-only; UNKNOWN-on-no-undo gates Fast) |
+| **Done-check** | **✅ REAL — code-selected, anchored** | `stages/checks.py` 5 generic checks + URL anchor; hardcoded registry DELETED |
 | Retrieval (Moss/Gemini embeddings, KB) | **REAL** | `clarion-kb` index, `retrieval/` |
-| User profile/traits store | **port exists, unused** | `Memory`/`Profile` ports |
+| User profile/traits store | **port exists, unused** | `Memory`/`Profile` ports (knowledge layer — next) |
 
 ---
 
-## Done this session (commits on `feat/clarion-extension`)
+## Done this session — the Clarion-PE/G migration (commits on `feat/clarion-extension`)
 
-- **Latency migration Step 0 + 1 — `perceive()` made cheap (lazy stamping):**
-  measured the baseline on the REAL `usa.gov/benefits` tab over the live extension
-  transport (broker, 45 interactive nodes): the per-node stamp loop was confirmed
-  dominant — `perceive_ms` **~297ms cold / ~100ms warm** with **90 stamp
-  round-trips** (2 per node: `DOM.pushNodesByBackendIdsToFrontend` +
-  `DOM.setAttributeValue`); attribution showed the stamp loop at ~2–10ms/node vs a
-  ~32ms triple-fetch. **Step 1:** `perceive()` now stamps ZERO nodes — it records
-  `index -> backend_id` and stamps the single target node lazily on first
-  `act`/`read`/`read_value` (`_ensure_stamped`); added a target-node-only
-  `reperceive_node` (shared `_NODE_STATE_JS`). After: **~38ms cold / ~34ms warm,
-  0 stamp round-trips** → 90→0 stamp round-trips (total perceive round-trips 93→3,
-  ~31×), ~7.8× cold / 2.7× warm wall-clock. Applied to BOTH transports (parity
-  green); instrument facility = `instrument/timed.py::Timed`; `perceive_ms` lands
-  in `/tmp/clarion-worker.log` via a `[lat]` line. 100 tests green.
-- **Gap 1 — page-grounded GROUND (killed the fixture):** `extract_text_facts`
-  (pure harvest of grounded StaticText/heading over the live AX tree, real nodeids,
-  InlineTextBox/ignored filtered) in `actuator/pipeline.py`; `read_facts()` on both
-  actuators (Playwright + extension, shared); `PageRetriever` (Actuator→Retriever,
-  goal-ranked, value-bonus, honest absence) in `app/page_retriever.py`; wired
-  `runtime.py` to `TimedRetriever(PageRetriever(actuator))`. `HeroRetriever` kept as
-  a test double only. +5 tests (`app/tests/test_page_retriever.py`) → **99 green**.
-  Live-proven on real sites (usa.gov, wikipedia). Testing-target rule locked: real
-  sites only, never the demo clone.
+Strangler migration of `docs/clarion-architecture.md`; every step validated by
+behavior on a real site with `load_dotenv` keys, never an exit code.
 
-### From the prior session
-- `feat(voice): real grounded ORIENT (read_screen) + un-hardcode the goal` — `read_screen`
-  tool, `PageReadout`, pure `summarize_ax_tree`/`readout_from_selector_map`,
-  `describe_page()` on both actuators, goal from confirmed intent, honest terminal
-  line, ORIENT→confirm→ACT instructions.
-- `polish(orient): singular/plural counts + de-dup group-phrase logic`.
-- Live-verified: LLM called `{"function":"read_screen"}` on the real usa.gov tab via
-  the broker relay → `describe_page` ran `Accessibility.getFullAXTree` → grounded
-  readout (`tools execution completed`). Readout content proven correct on the demo
-  page + usa.gov via `PlaywrightActuator.describe_page` (every item grounded).
+- **`ec8a265`** S0/S1 latency + Gap-1: lazy-stamp `perceive()` (stamp round-trips
+  90→0 on usa.gov over the extension transport, cold ~297→38ms) + page-grounded
+  GROUND (kills the `$84.32` fixture).
+- **`721cb3e`** Wave A — contracts spine: `Fact.id`, `PairedFact`, `Subgoal`,
+  `StepProposal`, the frozen `Reasoner` ABC, `FakeReasoner`, the pure post-decode
+  `kernel/reasoner_guard.py`. Live spike on usa.gov (48 nodes, guard fails-closed).
+- **`f668de4`** Wave B — geometric `PairedFact` (aria-labelledby/`for`/dom-ancestry/
+  shared-row) + ranker→hint + `query_all` unfiltered fallback + value-fact harvest.
+  Proven on a real ssa.gov table.
+- **`3457c05`** Wave B — `GeminiReasoner` (the only LLM home): structured output,
+  enums over live indices/Fact ids, guard reused.
+- **`641f841`** Wave C — **de-hardcode the task plane**: PROPOSE via `decide_step`
+  over the top-K slice (name-matcher deleted); `plan_goal` via the Reasoner; generic
+  executor (no baked topology); VERIFY set-membership + pairing fence. RESCUE +
+  bounded replanner kept.
+- **`f9ebbc6`** latency: `gemini-3.5-flash` `thinking_budget=0` (decode 36–121s →
+  ~2s, the auto-thinking fix; config knob, not a model swap) + `OpenAIReasoner`
+  (Qwen/Nebius) failover. A/B: Gemini(thinking=0) ~2s + native enums beat Qwen ~5s.
+- **`7276a26`** Wave C — dual-signal irreversibility gate (escalate-only structural
+  pre-screen, UNKNOWN-gates-Fast) + `NegativeVerifier` honest-decline + Fast-cap.
+  No name-keyword list anywhere.
+- **`fff2148`** Wave C — generic anchored done-check (5 site-agnostic checks + URL
+  anchor); hardcoded `DONE_PREDICATES` registry deleted, `detect_rescue` kept.
+- **`e0c5f32`** Wave C — generic invariant spec replaces the 52+ topology assertions;
+  red-before-green proven by mutation.
+- **`90a8eef`** Wave D — actuator stamps `state["filled"]` (the AX tree drops the
+  typed value) so the generic done-check sees a real fill; no-op invariant preserved.
+- **`626c889`** Wave D — **the gov-proof driver**: `app/gov_proof.py` (generic,
+  autonomous, `ResilientReasoner` failover, consent policy: approve reversible /
+  reject irreversible-or-unknown). `app/hero_harness.py` retired to an import-clean
+  shim. **Proven on usa.gov + weather.gov.**
 
 ---
 
 ## REMAINING / leftover functionalities (the next-phase backlog, ordered)
 
-1. ~~**Page-grounded GROUND (kill the fixture).**~~ ✅ **DONE this session.**
-   `PageRetriever(actuator)` reads the real page (`extract_text_facts` over the live
-   AX tree, every fact sourced to a real `nodeId`); wired in `runtime.py`
-   (`TimedRetriever(PageRetriever(actuator))`). Proven on real sites (usa.gov,
-   wikipedia). ⏭ Open quality follow-on (belongs to Gap 2/3, not grounding):
-   the ranker surfaces long paragraphs / nav noise — PROPOSE needs label↔value
-   pairing + crisp value extraction for a clean spoken readback.
-2. **Real goal-conditioned planner.** `stages/planner.py:plan_goal(goal)` must stop
-   ignoring `goal` and emit a plan from goal + page (the documented LLM-planner seam).
-   `stages/graph.py:build_stage_graph` bakes the pay topology at line 171 — make the
-   plan/topology derive from the goal (per-goal rebuild, or a generic stage executor).
-   ⚠️ `stages/tests/test_stages.py` pins the hardcoded hero plan AS SPEC — that rewrite
-   must redo those tests.
-3. **Knowledge layer** (the user's vision): graphs + embedding DBs over
+1. **Step-6 latency layer — SpeculationController + DeliveryGate (for the <800ms
+   voice turn).** `decide_ms` is ~2s; the task plane is correct but the LIVE voice
+   loop has ~2s think-gaps. Pre-fire perceive+embed+speculative decide on partial
+   STT against an AXTree-hash snapshot; the DeliveryGate re-checks the target node
+   between "yes" and act (discard stale, never click). Behind a flag; lands last.
+   `actuator/reperceive_node` is already in place for it.
+2. **Live-voice / extension end-to-end run.** The autonomous proof is done; the
+   product-path proof (extension on a real tab, press shortcut, speak the goal) is
+   not yet re-run on the de-hardcoded stack. One human step = the shortcut.
+3. **Actuator AX enrichment for the gate.** The structural pre-screen over-gates to
+   UNKNOWN because `type=submit` / `<form>` membership / off-origin nav aren't on
+   `AxNode.state`. A small additive AX/DOM stamp would let it escalate a submit to
+   `irreversible` (not merely `unknown`) without a name match. TODO in
+   `kernel/irreversibility.py::_structural_prescreen`.
+4. **Knowledge layer** (the user's vision): graphs + embedding DBs over
    **(a) website functionalities** (seed = `PageReadout.affordances`),
-   **(b) task paths** (the LangGraph plans we run), **(c) user profile/traits**
+   **(b) task paths** (the subgoal plans we run), **(c) user profile/traits**
    (the `Memory`/`Profile` port). Categorize + persist + reuse across sites.
-4. **Data-model simplification pass.** Audit `ClarionState` + value objects; keep only
-   what we actually track in state (the user's standing instruction: no bloat).
+5. **Data-model simplification pass.** Audit `ClarionState`/`_PlanState` + value
+   objects; keep only what we track (no bloat).
 
 ---
 
-## Points to FIX / TEST before "works end-to-end"
+## Points to FIX / TEST
 
-- [x] **Gap 1 grounding proven on REAL sites** (usa.gov, wikipedia) via the real
-      `PlaywrightActuator` + `PageRetriever`: facts sourced to real AX nodeids,
-      fixture `$84.32/Northwind` never leaks, honest absence on value-less pages.
-- [ ] **Product-path proof (extension on the user's REAL tab):** worker restarted
-      with the Gap-1 code; point the extension Chrome at a real account/bill page,
-      press the shortcut, state a goal → confirm the worker log shows GROUND
-      grounding that page's real facts (no fixture). One human step = the shortcut.
-- [ ] **Hear the readout voiced** — gated only by Gemini **TTS 429** per-minute
-      limit (recoverable); the tool/GROUND path runs regardless of audio.
-- [ ] **Spoken-readback quality** (Gap 2/3): label↔value pairing + crisp value
-      extraction in PROPOSE so GROUND speaks "Amount due $84.32", not a paragraph.
-- [ ] Keep `pytest clarion -q` green (currently **99**, 6 deselected live-Moss).
+- [x] **De-hardcoding proven end-to-end on REAL gov sites** (usa.gov read-only +
+      weather.gov form), ZERO site-specific code, every invariant live.
+- [x] `pytest clarion -q` green (**178 passed, 10 deselected**) + goal-agnostic
+      invariant spec (red-before-green proven by mutation).
+- [ ] **Live-voice product-path proof** on the de-hardcoded stack (extension on a
+      real tab; hear the readback + the per-step consent + the irreversible hard-stop).
+- [ ] **Step-6 speculation** before the live voice demo (hide the ~2s decode).
+- [ ] **Qwen key rotation:** the `NEBIUS_API_KEY` was pasted in chat — rotate it.
 - [ ] `python scripts/copy_lint.py <file>` on any new copy (no "assistant/helper/assist").
 
-**Testing rule (LOCKED 2026-06-04):** never test on the `web/demo-site` clone —
-only ACTUAL real sites (the extension drives the user's real tab). Acceptance =
-grounded readback on a real page + honest decline; NOT a completed payment.
+**Testing rule (LOCKED):** never test on the `web/demo-site` clone — only ACTUAL
+real sites. Acceptance = grounded readback + per-step consent + honest decline on a
+real page; NOT a completed irreversible action (we drive to the gate and stop).
 
 ---
 
-## How to run + LOGS (better log maintenance)
+## How to run + LOGS
 
 ```bash
 scripts/clarion-up.sh                 # rotates logs → .prev, starts logsink+broker+worker, opens Chrome on usa.gov/benefits
-scripts/clarion-up.sh http://localhost:8770/account/pay   # … on the demo PAY tab (hero acceptance)
 scripts/clarion-status.sh             # ONE command: ports + procs + tail of every log (run this first to see state)
 scripts/clarion-down.sh               # stop everything (reaps the worker's whole job tree)
+
+# Autonomous de-hardcoded gov proof (no voice, real Gemini + Playwright):
+cd agent && .venv/bin/python -m clarion.app.gov_proof   # the generic TAS driver (app/gov_proof.py)
 ```
 
-**Logs** (rotated to `*.prev` on each `clarion-up`, so a session never reads stale lines):
-- `/tmp/clarion-worker.log` — agent worker; phases tagged `[loop]`, sim tagged `[SIM]`, tools `executing tool`.
-- `/tmp/clarion-broker.log` — always-on relay broker (8771 ext / 8773 agent); extension/agent connect + session.start cache/replay.
+**Logs** (rotated to `*.prev` on each `clarion-up`):
+- `/tmp/clarion-worker.log` — agent worker; phases tagged `[loop]`, latency `[lat]`, tools `executing tool`.
+- `/tmp/clarion-broker.log` — relay broker (8771 ext / 8773 agent); connect + session.start cache/replay.
 - `/tmp/clarion-ext.log` — browser SW + HUD via the sink (`scripts/clarion-logsink.py`).
 
-**Restarting ONLY the worker (to load worker-side code changes without touching Chrome/the extension):**
+**Restarting ONLY the worker (to load code changes without touching Chrome/the extension):**
 - Reap first: `pkill -if "clarion.app.voice_entry"; pkill -if "from multiprocessing.spawn"` (orphan job subprocs steal dispatches).
-- Start detached so it survives the shell (a bare `nohup &` from a tool call gets reaped):
-  `CLARION_ACTUATOR=extension nohup .venv/bin/python -m clarion.app.voice_entry dev >>/tmp/clarion-worker.log 2>&1 &` inside a `( … )` subshell, or the harness's background mode.
+- Start detached: `CLARION_ACTUATOR=extension nohup .venv/bin/python -m clarion.app.voice_entry dev >>/tmp/clarion-worker.log 2>&1 &` inside a `( … )` subshell.
 
 **Operational gotchas (cost real time before — see project memory):**
 - Same-profile Chrome relaunch does NOT reload the extension → prove fresh SW code by a NEW line in `/tmp/clarion-ext.log`.
-- Killing a job leaves the LiveKit room's agent slot occupied → no re-dispatch. **Delete the room** to force a clean dispatch:
-  `api.LiveKitAPI(...).room.delete_room(api.DeleteRoomRequest(room="clarion-hero"))` (creds from `agent/.env`).
-- Autonomous real-sim (no mic): arm worker `CLARION_SIM_UTTERANCES="what is on this page"`, then `scripts/clarion-sim.py 90` joins the room → dispatch. Text stands in for mic→STT.
-- Gemini AI-Studio TTS ~100 req/min → `429 RESOURCE_EXHAUSTED` under load; tool calls still run (verify from `executing tool`, not from audio).
+- `chrome.debugger` attach fails while DevTools is open on the tab.
+- Killing a job leaves the LiveKit room's agent slot occupied → **delete the room** to force a clean dispatch (`api.LiveKitAPI(...).room.delete_room(...)`, creds in `agent/.env`).
+- Gemini AI-Studio TTS ~100 req/min → `429` under load; tool calls still run. Reasoner decode (Gemini, thinking=0) ~2s; occasional `503 high-demand` → Qwen/Nebius failover (`ResilientReasoner`).
 
 ---
 
 ## Acceptance for "the whole thing works end-to-end"
 
-1. `clarion-up.sh` → press shortcut → `read_screen` reads back the real page (heard).
-2. State a goal → agent confirms it → drives the task with **per-step consent** and a
-   **hard-stop at the irreversible step**, reading **page-grounded** facts (not fixtures).
-3. On a page that doesn't afford the goal, it says so honestly (no fake "task complete").
-4. `pytest clarion -q` green.
+1. **[DONE — autonomous]** A generic driver states a goal-derived plan, reads
+   page-grounded facts with citations, gates every step, and **hard-stops at the
+   irreversible step** on a real gov site, ZERO site-specific code.
+2. **[DONE]** On a page that doesn't afford the goal, it declines honestly /
+   hedges an uncovered negative (no fake "task complete", no confident "no late fee").
+3. **[DONE]** `pytest clarion -q` green; invariant spec catches a silent weakening.
+4. **[OPEN]** Live-voice: `clarion-up.sh` → shortcut → hear the readback → speak a
+   goal → per-step consent + the irreversible hard-stop, heard end-to-end (needs the
+   Step-6 speculation to hide the ~2s decode).

@@ -5,6 +5,14 @@ research angles → 4 competing designs → 8 adversarial evals → synthesis). 
 **proposed** post-hardcoding architecture — the decision artifact, editable. Supersedes the
 hardcoded pay topology. Read with `docs/foundation.md` (product) + `docs/clarion-status.md`._
 
+> **STATUS (2026-06-05): SHIPPED.** All four de-hardcoding systems + the de-hardcoded
+> spine are implemented and committed on `feat/clarion-extension` (Steps 0–5 + 7), and
+> proven end-to-end on two real gov sites (usa.gov + weather.gov) with zero site-specific
+> code — see `docs/clarion-status.md`. Default Reasoner = `GeminiReasoner` (`thinking_budget=0`,
+> ~2s decode) with a Qwen/Nebius failover. **Deferred:** Step 6 (SpeculationController/
+> DeliveryGate — the <800ms voice-turn latency layer) and the actuator AX enrichment for the
+> structural gate. The residuals below stand as written.
+
 ## Thesis — **Clarion-PE/G** (Planner/Executor over a frozen Reasoner port)
 
 > One generic LLM **reasons** the plan and the next grounded action behind a frozen `Reasoner`
