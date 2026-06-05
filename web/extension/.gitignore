@@ -1,0 +1,3 @@
+# Local voice config — holds a real LiveKit participant token; NEVER commit it.
+# The committed template is config.example.js.
+config.js

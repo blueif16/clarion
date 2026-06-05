@@ -38,7 +38,7 @@ langgraph 1.2.2 facts (Context7 /websites/langchain_oss_python_langgraph):
 from __future__ import annotations
 
 import time
-from typing import Literal, Optional
+from typing import Literal, Optional, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -47,20 +47,30 @@ from langgraph.graph import StateGraph
 from langgraph.types import interrupt
 
 from clarion.contracts.events import ConsentDecision, ConsentRequest
-from clarion.contracts.ports import Actuator, Retriever
+from clarion.contracts.ports import Actuator, Reasoner, Retriever
 from clarion.contracts.state import (
     Action,
     ClarionState,
     Consent,
+    Fact,
+    PairedFact,
     Proposal,
+    SelectorMap,
+    StepProposal,
+    Subgoal,
     TraceEvent,
 )
+from clarion.kernel.irreversibility import classify
+from clarion.kernel.negative_verifier import verify_negative
 from clarion.kernel.policy import (
     assert_consented,
     assert_grounded,
     is_consented,
+    is_negative_claim,
+    is_speakable_value,
     speakable,
 )
+from clarion.kernel.reasoner_guard import resolve_value_ref, validate_step_proposal
 
 # ---------------------------------------------------------------------------
 # Checkpointer serde allowlist (execution §18.6 K1 action item; S1-validated).
@@ -80,9 +90,60 @@ _ALLOWED_MSGPACK_MODULES = [
     ("clarion.contracts.state", "Stage"),
     ("clarion.contracts.state", "Consent"),
     ("clarion.contracts.state", "TraceEvent"),
+    # Reasoner I/O + pairing now enter checkpointed state (the de-hardcoding
+    # migration): the pending StepProposal, the derived Subgoal plan, and the
+    # PairedFact pairing fence all round-trip through the checkpointer.
+    ("clarion.contracts.state", "StepProposal"),
+    ("clarion.contracts.state", "Subgoal"),
+    ("clarion.contracts.state", "PairedFact"),
 ]
 
 Mode = Literal["normal", "fast"]
+
+
+# The default top-K hint slice the Reasoner decides over (the latency trim — feed
+# the ranked top-K candidates, NOT all ~48 live ids, then re-measure decide_ms).
+_DEFAULT_TOPK = 12
+
+# Fast-mode cap: how many REVERSIBLE auto-acts the agent may chain before it MUST
+# surface a spoken progress beat / consent (architecture migration Step 5 — "cap
+# Fast to one reversible act before a spoken progress beat"). One. After one silent
+# reversible act the next consequential step is routed through CONSENT even if it
+# is reversible, so the blind user is never carried through a chain of silent
+# mutations without a checkpoint. A pure read-back never counts (no side-effect).
+_DEFAULT_FAST_ACT_CAP = 1
+
+
+class _PlanState(ClarionState, total=False):
+    """The SUPERSET schema the de-hardcoded kernel + generic executor walk:
+    every FROZEN ``ClarionState`` channel PLUS the additive plan/reasoner keys.
+
+    The frozen ``ClarionState`` stays minimal (contracts/ is frozen — architecture
+    Memory). These leading-underscore-free additive keys are NOT contract fields;
+    they live here on a ``total=False`` superset (the existing ``_StageState``
+    pattern) so a bare ``ClarionState`` seed is still valid input and LangGraph
+    (which DROPS keys absent from the schema) preserves them. Raw AXTree/HTML is
+    NEVER carried here — only node values, the lean pending StepProposal, the
+    Subgoal plan, the paired-fact fence, and the reasoner's selected check +
+    irreversibility classification.
+    """
+
+    # The Reasoner's pending next-step decision (validated, pre-Proposal).
+    pending_step: Optional[StepProposal]
+    # The geometric label↔value pairings harvested THIS perceive cycle (the
+    # pairing-correctness fence #3 supply). Last-value-wins (re-read each cycle).
+    paired_facts: list[PairedFact]
+    # The goal-derived generic plan (replaces the baked Stage topology).
+    subgoals: list[Subgoal]
+    # The reasoner-SELECTED success check for the current step (a SELECTION).
+    success_check: str
+    # The IrreversibilityGate's classification of the pending proposal.
+    irreversibility: str
+    # The Fast-mode reversible-auto-act counter (the Step-5 cap). Incremented by
+    # ACT each time it performs a reversible act that did NOT route through
+    # CONSENT; read by ``consent_gate`` to force a spoken progress beat after the
+    # cap. A last-value-wins channel (NOT a reducer): ACT writes the running count.
+    fast_acts: int
 
 
 def make_checkpointer() -> InMemorySaver:
@@ -113,18 +174,72 @@ def _already_acted(state: ClarionState, proposal_id: str) -> bool:
     )
 
 
+def _topk_slice(page: SelectorMap, facts: list[Fact], top_k: int) -> SelectorMap:
+    """Build the top-K hint SUB-map the Reasoner decides over — the latency trim.
+
+    The Reasoner must NOT be fed all ~48 live ids (the 4.7s full-map baseline); we
+    hand it the top-K most goal-relevant candidates as a real ``SelectorMap`` keyed
+    by the SAME live indices, so a returned ``target_index`` resolves straight back
+    into the live map (and ``reasoner_guard`` validates against the FULL live map
+    too — the slice is a HINT, never authoritative).
+
+    Ranking hint: an interactive control whose name token-overlaps a grounded fact
+    value floats up; otherwise insertion order. Pure + cheap (no provider, no I/O).
+    Always returns at least the first ``top_k`` interactive nodes so a click target
+    is never pruned away.
+    """
+    nodes = page.nodes
+    if len(nodes) <= top_k:
+        return page
+    fact_words: set[str] = set()
+    for f in facts:
+        fact_words.update(w for w in f.value.lower().split() if len(w) >= 3)
+
+    def _rank(idx: int) -> tuple[int, int]:
+        n = nodes[idx]
+        name_low = n.name.lower()
+        overlap = sum(1 for w in fact_words if w in name_low)
+        interactive = 1 if n.role in _INTERACTIVE_ROLES else 0
+        return (overlap, interactive)
+
+    chosen = sorted(nodes, key=_rank, reverse=True)[:top_k]
+    sub = {i: nodes[i] for i in sorted(chosen)}
+    return SelectorMap(nodes=sub, token_estimate=page.token_estimate)
+
+
+# Interactive roles that can be an action target (the slice prefers these).
+_INTERACTIVE_ROLES = {
+    "textbox", "searchbox", "combobox", "spinbutton", "textarea",
+    "button", "link", "checkbox", "radio", "switch", "menuitem", "tab",
+}
+
+
 def build_kernel(
+    reasoner: Reasoner,
     retriever: Retriever,
     actuator: Actuator,
     mode: Mode = "normal",
+    *,
+    top_k: int = _DEFAULT_TOPK,
+    fast_act_cap: int = _DEFAULT_FAST_ACT_CAP,
 ):
-    """Compile the GROUND→VERIFY→PROPOSE→⟨CONSENT⟩→ACT→CONFIRM kernel.
+    """Compile the GROUND→VERIFY→PROPOSE→IrreversibilityGate→⟨CONSENT⟩→ACT→CONFIRM
+    kernel — the de-hardcoded spine (architecture Thesis: the LLM decides, the
+    kernel acts + enforces).
 
-    ``mode`` is baked into the compiled graph's consent routing:
-      - ``normal``: every consequential step (any proposal carrying an action)
-        hits ⟨CONSENT⟩ and interrupts;
-      - ``fast``: reversible proposals auto-proceed straight to ACT, but an
-        ``irreversible`` proposal ALWAYS interrupts (the foundation §5 hard-stop).
+    PROPOSE is now Reasoner-driven: it asks ``reasoner.decide_step`` over the
+    top-K HINT slice (the latency trim), validates the returned ``StepProposal``
+    with ``reasoner_guard`` (off-page index / dangling value_ref → discard), forms
+    the grounded ``Proposal`` from a membership-fenced verbatim value, and carries
+    the model's irreversibility judgement into the gate. The old textbox/submit
+    name-matcher is DELETED — no site-specific keyword list anywhere.
+
+    ``mode`` is baked into the compiled graph's consent routing via the
+    IrreversibilityGate's classification:
+      - ``normal``: every consequential step hits ⟨CONSENT⟩ and interrupts;
+      - ``fast``: ``reversible`` auto-proceeds straight to ACT, but
+        ``irreversible`` OR ``unknown`` ALWAYS interrupts (the foundation §5
+        hard-stop, generalized to the dual-signal gate — killer-closer #2).
 
     Returns the compiled graph (checkpointer-backed). Drive it with a ``thread_id``
     config: first ``ainvoke(seed)`` runs to the consent interrupt (when armed);
@@ -136,12 +251,20 @@ def build_kernel(
     # ---- GROUND ----------------------------------------------------------
     async def ground(state: ClarionState) -> dict:
         """Retrieve goal-relevant fact(s) for this step via the Retriever port.
-        Timestamps query-fire → first-fact for the §8 latency meter."""
+        Timestamps query-fire → first-fact for the §8 latency meter.
+
+        Also RESETS the Step-5 Fast-cap counter: the silent reversible-act budget
+        is PER KERNEL PASS (one GROUND→ACT→CONFIRM drive). A fresh ``ainvoke`` runs
+        GROUND, so each driven turn / re-driven subgoal starts the budget clean —
+        the spoken progress beat that resets it IS the planner/executor re-entry
+        that re-grounds. (This also keeps the counter from leaking across the stage
+        executor's per-subgoal kernel re-drives — the budget is local to a pass.)"""
         t0 = time.time()
         facts = await retriever.query(state["goal"])
         retrieval_ms = (time.time() - t0) * 1000.0
         return {
             "grounded_facts": list(facts),
+            "fast_acts": 0,
             # Reducer channel: return ONLY the new event (operator.add concatenates).
             "trace": [
                 _trace("GROUND", "exit", n_facts=len(facts), retrieval_ms=retrieval_ms)
@@ -162,102 +285,223 @@ def build_kernel(
             "trace": [_trace("VERIFY", "exit", verified=n_verified, refused=n_refused)],
         }
 
-    # ---- PROPOSE ---------------------------------------------------------
-    def propose(state: ClarionState) -> dict:
-        """Form the next spoken action from the verified facts + the current step.
+    # ---- PROPOSE (Reasoner-driven) --------------------------------------
+    async def propose(state: _PlanState) -> dict:
+        """Ask the Reasoner for the next grounded step over the top-K HINT slice,
+        validate it (``reasoner_guard``), and form the grounded ``Proposal``.
 
-        Deterministic for the kernel layer (a model planner drops in here later,
-        per ST1): if there is a fillable textbox and a speakable fact, propose to
-        fill it; otherwise propose a read-back. ``irreversible`` is carried from
-        the chosen action so the mode gate and policy can read it.
+        The LLM decides (architecture Thesis); the kernel only ENFORCES. Pipeline:
+          1. Slice the live map to the top-K candidates (the latency trim) and
+             call ``reasoner.decide_step(goal, slice, facts, history)``.
+          2. Validate the ``StepProposal`` against the FULL live map + Fact ids
+             (``validate_step_proposal``). An off-page index / dangling value_ref
+             is discarded → a safe read-back, never acted on.
+          3. The spoken/filled value is the membership-fenced VERBATIM grounded
+             span (``resolve_value_ref`` → fence #2 ``is_speakable_value``); a
+             ``say`` that is not a live grounded member is dropped (never spoken).
+          4. Carry the model's irreversibility judgement + the SELECTED
+             success_check onto state for the IrreversibilityGate / executor.
+
+        NO site-specific keyword list — the textbox/submit name-matcher is gone.
         """
         page = state["page_index"]
-        sayable = speakable(state["grounded_facts"])
-        k, n = state["step"]
+        facts = list(state["grounded_facts"])
+        sayable = speakable(facts)
+        k, _n = state["step"]
         proposal_id = f"prop-{state['stage_idx']}-{k}"
+        history = list(state.get("pending_step") and [state["pending_step"]] or [])
 
-        # Pick the first interactive textbox to fill, if any.
-        target_idx: Optional[int] = None
-        for idx, node in page.nodes.items():
-            if node.role in ("textbox", "searchbox"):
-                target_idx = idx
-                break
+        # (1) Reasoner decides over the top-K hint slice.
+        hint = _topk_slice(page, sayable, top_k)
+        step: StepProposal = await reasoner.decide_step(
+            state["goal"], hint, sayable, history
+        )
 
-        # An irreversible control (submit / pay / confirm button) is the §5
-        # hard-stop trigger — naming-based detection at the kernel layer; ST1
-        # refines it with per-stage tool subsets.
-        submit_idx: Optional[int] = None
-        for idx, node in page.nodes.items():
-            if node.role == "button" and any(
-                w in node.name.lower() for w in ("pay", "submit", "confirm", "send")
-            ):
-                submit_idx = idx
-                break
-
-        if target_idx is not None and sayable:
-            fact = sayable[0]
-            node = page.nodes[target_idx]
-            action = Action(
-                kind="fill",
-                index=target_idx,
-                value=fact.value,
+        # (2) Code-side post-decode fence against the FULL live map + facts.
+        verdict = validate_step_proposal(step, page, sayable)
+        if not verdict.ok:
+            # Discard the off-page proposal → a safe grounded read-back. Never act.
+            facts_str = ", ".join(f.value for f in sayable) or "no grounded facts yet"
+            proposal = Proposal(
+                id=proposal_id,
+                utterance=f"Here is what I found: {facts_str}.",
+                action=Action(kind="read", index=None, irreversible=False),
                 irreversible=False,
             )
+            return {
+                "pending_proposal": proposal,
+                "pending_step": step,
+                "success_check": step.success_check,
+                "trace": [
+                    _trace(
+                        "PROPOSE", "info", rejected=verdict.reason, proposal_id=proposal_id
+                    ),
+                    _trace(
+                        "PROPOSE", "exit", proposal_id=proposal_id, irreversible=False
+                    ),
+                ],
+            }
+
+        # (3) Membership-fenced verbatim value (fence #2). resolve_value_ref returns
+        # the byte-identical grounded span the ref points at; a model say not in the
+        # live grounded set is never spoken.
+        resolved: Optional[Fact] = resolve_value_ref(step.value_ref, sayable)
+        value: Optional[str] = None
+        if resolved is not None and is_speakable_value(resolved.value, facts):
+            value = resolved.value
+
+        target_node = page.nodes.get(step.target_index) if step.target_index is not None else None
+        node_name = target_node.name if target_node is not None else ""
+
+        if step.action_kind == "fill" and target_node is not None and value is not None:
+            action = Action(kind="fill", index=step.target_index, value=value)
+            say = step.say if step.say else value
             utterance = (
-                f"I found the {node.name or 'field'}. I'll fill it with "
-                f"{fact.value}. Say yes to continue."
+                f"I found the {node_name or 'field'}. I'll fill it with {say}. "
+                f"Say yes to continue."
             )
-        elif submit_idx is not None:
-            # The irreversible step: click a submit/pay control. Always gated.
-            node = page.nodes[submit_idx]
-            action = Action(kind="click", index=submit_idx, irreversible=True)
-            utterance = (
-                f"I'm about to press {node.name}. This cannot be undone. "
-                f"Say yes to confirm."
-            )
+        elif step.action_kind in ("click", "navigate") and target_node is not None:
+            action = Action(kind=step.action_kind, index=step.target_index)
+            utterance = f"I'm about to use {node_name or 'this control'}. Say yes to continue."
         else:
-            # Nothing to fill or submit → a read-back proposal (reversible).
-            action = Action(kind="read", index=target_idx, irreversible=False)
-            facts_str = ", ".join(f.value for f in sayable) or "no grounded facts yet"
-            utterance = f"Here is what I found: {facts_str}."
+            # read (or a value-less step that resolved to nothing): a grounded
+            # read-back of the membership-fenced say / sayable facts.
+            say = step.say if (step.say and is_speakable_value(step.say, facts)) else ""
+            # --- honest-decline (NegativeVerifier, fence #5) ------------------
+            # A spoken NEGATIVE ("no late fee") is permitted ONLY from a
+            # closed-world search over grounded_facts finding no asserting node AND
+            # coverage evidence (a grounded `absent`-polarity fact read off the
+            # perceived region). Else DOWNGRADE TO A HEDGE — a charge rendered as an
+            # image (invisible to the AXTree) must NEVER become a confident "no late
+            # fee" (architecture migration Step 5 killer acceptance). The positive
+            # read-back path is already fenced by membership (#2); only an asserted
+            # negative routes through the verifier.
+            negative_topic = step.say if (step.say and is_negative_claim(step.say)) else ""
+            if negative_topic:
+                verdict = verify_negative(negative_topic, facts)
+                if not verdict.speak:
+                    # Cannot prove the negative → hedge, never a confident negative.
+                    proposal = Proposal(
+                        id=proposal_id,
+                        utterance=(
+                            "I couldn't confirm that either way from what I can read "
+                            "on this page, so I don't want to guess."
+                        ),
+                        action=Action(kind="read", index=None, irreversible=False),
+                        irreversible=False,
+                    )
+                    return {
+                        "pending_proposal": proposal,
+                        "pending_step": step,
+                        "success_check": step.success_check,
+                        "trace": [
+                            _trace(
+                                "PROPOSE",
+                                "info",
+                                hedged=verdict.reason,
+                                proposal_id=proposal_id,
+                            ),
+                            _trace(
+                                "PROPOSE", "exit", proposal_id=proposal_id, irreversible=False
+                            ),
+                        ],
+                    }
+                # Covered negative: speak the grounded `absent` fact verbatim, sourced.
+                say = negative_topic
+            if not say:
+                say = ", ".join(f.value for f in sayable) or "no grounded facts yet"
+            action = Action(kind="read", index=step.target_index)
+            utterance = f"Here is what I found: {say}."
 
         proposal = Proposal(
             id=proposal_id,
             utterance=utterance,
             action=action,
-            irreversible=action.irreversible,
+            # irreversible flag set authoritatively by the IrreversibilityGate next.
+            irreversible=False,
         )
         return {
             "pending_proposal": proposal,
+            "pending_step": step,
+            "success_check": step.success_check,
             "trace": [
                 _trace(
                     "PROPOSE",
                     "exit",
                     proposal_id=proposal.id,
-                    irreversible=proposal.irreversible,
+                    action_kind=action.kind,
+                    value_ref=step.value_ref,
+                    decide_ms=getattr(reasoner, "last_decide_ms", None),
+                )
+            ],
+        }
+
+    # ---- IrreversibilityGate (dual-signal) -------------------------------
+    def irreversibility_gate(state: _PlanState) -> dict:
+        """Classify the pending proposal's reversibility via the dual-signal
+        ``kernel.irreversibility.classify`` (killer-closer #2). The model's
+        judgement (carried on ``pending_step.irreversibility``) is combined with
+        the independent code structural pre-screen; the result sets the
+        ``Proposal.irreversible`` flag the consent routing reads.
+
+        ``unknown`` is treated as gating (it is NOT reversible), so it routes
+        through CONSENT even in Fast mode (the kernel-side half of the
+        UNKNOWN-gates-Fast invariant — AG-GATE hardens the classifier itself)."""
+        proposal = state["pending_proposal"]
+        step = state.get("pending_step")
+        if proposal is None:
+            return {"irreversibility": "reversible"}
+        model_judgment = step.irreversibility if step is not None else "unknown"
+        cls = classify(proposal, state["page_index"], model_judgment)  # type: ignore[arg-type]
+        gated = proposal.model_copy(update={"irreversible": cls != "reversible"})
+        return {
+            "pending_proposal": gated,
+            "irreversibility": cls,
+            "trace": [
+                _trace(
+                    "GATE",
+                    "exit",
+                    proposal_id=proposal.id,
+                    classification=cls,
+                    gates=cls != "reversible",
                 )
             ],
         }
 
     # ---- mode gate -------------------------------------------------------
     def consent_gate(
-        state: ClarionState,
+        state: _PlanState,
     ) -> Literal["consent", "act"]:
-        """The ``mode``-conditional edge (execution §2.3 / §3 / foundation §5).
+        """The ``mode``-conditional edge (foundation §5 / killer-closer #2 + the
+        Step-5 Fast-cap).
 
         Normal → always route through CONSENT (every consequential step interrupts).
-        Fast   → auto-proceed (skip straight to ACT) on a reversible proposal, but
-                 ALWAYS route through CONSENT when the proposal is irreversible.
+        Fast   → auto-proceed (skip straight to ACT) ONLY when the
+                 IrreversibilityGate classified the step ``reversible`` AND the
+                 reversible-auto-act cap has not been reached; an ``irreversible``
+                 OR ``unknown`` step ALWAYS routes through CONSENT, and a reversible
+                 step that would exceed ``fast_act_cap`` is ALSO routed through
+                 CONSENT (forcing a spoken progress beat so the blind user is never
+                 chained through silent mutations — architecture migration Step 5).
 
-        ``mode`` is closed over from ``build_kernel`` so the compiled graph's
-        behaviour is fixed; the proposal's own ``irreversible`` flag is the gate.
+        Reads the gate's flag off the proposal (set authoritatively by
+        ``irreversibility_gate``) and the running ``fast_acts`` counter; ``mode``
+        and ``fast_act_cap`` are closed over from ``build_kernel``. A degenerate
+        read-back (a ``read`` action) auto-proceeds — it has no side-effect to gate
+        and does not consume the cap.
         """
         proposal = state["pending_proposal"]
-        # No proposal (degenerate) → nothing to consent to; go act (a no-op).
         if proposal is None:
             return "act"
-        if mode == "fast" and not proposal.irreversible:
+        # A pure read-back never gates (no side-effect) and never consumes the cap.
+        if proposal.action is not None and proposal.action.kind == "read":
             return "act"
+        if mode == "fast" and not proposal.irreversible:
+            # The Step-5 cap: only auto-proceed if we are still under the budget of
+            # silent reversible acts; otherwise force a spoken progress beat / yes.
+            if state.get("fast_acts", 0) < fast_act_cap:
+                return "act"
+            return "consent"
         return "consent"
 
     # ---- ⟨CONSENT⟩ -------------------------------------------------------
@@ -337,7 +581,18 @@ def build_kernel(
         assert_consented(proposal, state["consent_log"])
 
         obs = await actuator.act(proposal.action)
-        return {
+
+        # Step-5 Fast-cap bookkeeping: a REVERSIBLE act that did NOT route through
+        # CONSENT is a silent auto-act — count it so the next consequential step is
+        # forced to a spoken progress beat. An approved (consented) act or a pure
+        # read does not consume the silent-act budget; a consented act resets it
+        # (the user just got a checkpoint). A ``read`` never reaches ACT's act()
+        # with a side-effect, but guard against it anyway.
+        is_read = proposal.action.kind == "read"
+        silent_auto_act = (
+            not went_through_consent and not proposal.irreversible and not is_read
+        )
+        out: dict = {
             "page_index": obs.selector_map,
             "trace": [
                 # The once-flag marker — its presence in the reducer-accumulated
@@ -351,6 +606,12 @@ def build_kernel(
                 _trace("ACT", "exit", success=obs.success),
             ],
         }
+        if silent_auto_act:
+            out["fast_acts"] = state.get("fast_acts", 0) + 1
+        elif went_through_consent:
+            # A consented checkpoint just happened → the spoken-beat budget resets.
+            out["fast_acts"] = 0
+        return out
 
     # ---- CONFIRM ---------------------------------------------------------
     async def confirm(state: ClarionState) -> dict:
@@ -362,10 +623,11 @@ def build_kernel(
             "trace": [_trace("CONFIRM", "exit", nodes=len(sm.nodes))],
         }
 
-    builder = StateGraph(ClarionState)
+    builder = StateGraph(_PlanState)
     builder.add_node("ground", ground)
     builder.add_node("verify", verify)
     builder.add_node("propose", propose)
+    builder.add_node("gate", irreversibility_gate)
     builder.add_node("consent", consent)
     builder.add_node("act", act)
     builder.add_node("confirm", confirm)
@@ -373,9 +635,10 @@ def build_kernel(
     builder.add_edge(START, "ground")
     builder.add_edge("ground", "verify")
     builder.add_edge("verify", "propose")
-    # The mode-conditional edge: Normal → consent; Fast → act (unless irreversible).
+    # PROPOSE → IrreversibilityGate (classify) → the mode-conditional consent edge.
+    builder.add_edge("propose", "gate")
     builder.add_conditional_edges(
-        "propose",
+        "gate",
         consent_gate,
         {"consent": "consent", "act": "act"},
     )
@@ -387,15 +650,15 @@ def build_kernel(
 
 
 def seed_state(
-    goal: str = "pay my electric bill",
+    goal: str = "",
     mode: Mode = "normal",
 ) -> ClarionState:
-    """A minimal valid ``ClarionState`` to start the kernel. ``page_index`` is
-    empty; GROUND populates facts and the caller seeds ``page_index`` (or PROPOSE
-    falls back to a read-back). The ``mode`` field mirrors the compiled graph's
-    mode for downstream consumers (the routing is baked at ``build_kernel``)."""
-    from clarion.contracts.state import SelectorMap
-
+    """A minimal valid ``ClarionState`` to start the kernel. ``goal`` is supplied
+    by the caller (the real user/restated goal — NOT a baked task). ``page_index``
+    is empty; GROUND populates facts and the caller seeds ``page_index`` (or
+    PROPOSE forms a grounded read-back). The ``mode`` field mirrors the compiled
+    graph's mode for downstream consumers (the routing is baked at
+    ``build_kernel``)."""
     return ClarionState(
         goal=goal,
         mode=mode,  # type: ignore[typeddict-item]
@@ -410,4 +673,4 @@ def seed_state(
     )
 
 
-__all__ = ["build_kernel", "seed_state", "make_checkpointer", "Mode"]
+__all__ = ["build_kernel", "seed_state", "make_checkpointer", "Mode", "_PlanState"]

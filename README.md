@@ -41,9 +41,9 @@ flowchart TB
         STT["Deepgram<br/>STT"] --> TURN["turn-detect<br/>· barge-in"] --> TTS["Minimax / Gemini<br/>TTS · filler"]
     end
 
-    subgraph TASK["🧠 Task Plane · LangGraph kernel — 6-node loop · idempotent ACT"]
+    subgraph TASK["🧠 Task Plane · LangGraph kernel — LLM decides, kernel enforces"]
         direction LR
-        G["GROUND"] --> V["VERIFY<br/>only grounded facts<br/>+ negatives"] --> P["PROPOSE"] --> C{{"CONSENT GATE<br/>interrupt() = 'yes?'"}} --> A["ACT"] --> CF["CONFIRM<br/>+ remember"]
+        G["GROUND"] --> V["VERIFY<br/>membership +<br/>pairing fence"] --> P["PROPOSE<br/>← LLM Reasoner"] --> IG{{"IRREVERSIBILITY GATE<br/>reversible · irreversible · UNKNOWN"}} --> C{{"CONSENT<br/>interrupt() = 'yes?'"}} --> A["ACT"] --> CF["CONFIRM<br/>code done-check"]
         CF -.->|"next sub-goal"| G
     end
 
@@ -54,12 +54,14 @@ flowchart TB
     end
 
     MOSS[("📚 Moss · ~3ms<br/>fact + source_node_id")]
+    REASONER[["🤖 Reasoner · Gemini<br/>plans goal + decides next<br/>step · frozen port"]]
 
     human ==>|"speech"| STT
     TTS ==>|"audio"| human
     TURN -->|"advance_task() · non-blocking"| G
-    C ==>|"surfaces 'yes?'"| TTS
+    IG ==>|"irreversible / UNKNOWN<br/>surfaces 'yes?'"| TTS
     MOSS -->|"grounded facts"| G
+    REASONER -->|"plan + next grounded step"| P
     P -->|"selector_map → act"| SM
     RP -->|"observation"| V
 
@@ -76,14 +78,26 @@ flowchart TB
 HUMAN ⇄ Voice Plane [LiveKit: Deepgram STT · turn-detect · barge-in · TTS]   (<800ms turn budget)
                 │ advance_task()                        ▲ CONSENT surfaces "yes?" via TTS
                 ▼  (non-blocking)                       │
-Task Plane [LangGraph]:  GROUND → VERIFY → PROPOSE → ⟨CONSENT⟩ → ACT → CONFIRM ──┐ next sub-goal
-   ▲ grounded facts          ▲ observation             │ selector_map → act      │
-   Moss (~3ms) ──────────────┘                         ▼                         │
+Task Plane [LangGraph]:  GROUND → VERIFY → PROPOSE → ⟨GATE⟩ → ⟨CONSENT⟩ → ACT → CONFIRM ──┐ next sub-goal
+   (LLM Reasoner plans the goal + decides each grounded step; the kernel enforces the invariants)
+   ▲ grounded facts          ▲ observation                  │ selector_map → act           │
+   Moss (~3ms) ──────────────┘                              ▼                              │
                               Actuator [Playwright/CDP]: AXTree → selector_map → act → re-perceive ⟲
 ```
 </details>
 
-**The six-node loop** (`kernel/graph.py`) is the heart. `GROUND` retrieves; `VERIFY` asserts only grounded facts (and confirmed absences); `PROPOSE` states the intended action and the facts behind it; the **`CONSENT` gate** (LangGraph `interrupt()`) blocks on an irreversible step until the human says yes; `ACT` is idempotent (re-executes from the top on resume, checks the consent-log once-flag before side-effecting); `CONFIRM` reads back the result and writes it to memory.
+**The loop** (`kernel/graph.py`) is the heart, and it is **de-hardcoded — the LLM decides, the kernel enforces.** `GROUND` retrieves; `VERIFY` asserts only grounded facts (and confirmed absences) and adds the **membership + pairing fences** (a value is speakable only if it is byte-identical to a live grounded `Fact`, and an "X is Y" claim needs a single geometric `PairedFact` backing both halves); `PROPOSE` is the LLM **`Reasoner`** choosing the next grounded action over a ranked slice — a pure post-decode guard rejects any off-page index or invented value; the **`IRREVERSIBILITY GATE`** is dual-signal (`reversible | irreversible | UNKNOWN`) — the model's judgment AND a code structural pre-screen, where **either can escalate and the model can never downgrade**, and `UNKNOWN` routes through `CONSENT` even in Fast mode; the **`CONSENT` gate** (LangGraph `interrupt()`) blocks until the human says yes; `ACT` is idempotent (checks the consent-log once-flag before side-effecting); `CONFIRM` advances only on a **code-selected, page-verified done-check** (the model never grades its own success).
+
+### 1.1 The de-hardcoded design (Clarion-PE/G) — SHIPPED
+
+The task plane carries **no per-site, per-goal logic.** One generic LLM plans the goal into sub-goals and decides each next grounded action **behind a frozen `Reasoner` port**; regex/parsing/selectors survive only as a *parallel hint layer the model can override*, never as the decider. The kernel keeps only the two invariants + consent. Four code-enforced closers make it safe for someone who can't see the page:
+
+- **`PairedFact`** — label↔value paired *geometrically* at extract time (`aria-labelledby` / `for` / shared-row bbox / DOM ancestry, never reading-order), so a clean citation can never land on the wrong number.
+- **Dual-signal irreversibility gate** — the closed `pay/submit/confirm/send` keyword list is **deleted**; structure + model judgment gate any consequential control on any site, fail-closed to `UNKNOWN`.
+- **Generic done-check** — the Reasoner *selects* a registered check (`field_nonempty` / `node_added` / `error_absent` / `navigated` / `confirmation_fact`); code evaluates it against the re-perceived tree + a semantic (URL) anchor.
+- **NegativeVerifier** — a spoken negative ("no late fee") comes only from a closed-world search with coverage evidence, else it **downgrades to an honest hedge.**
+
+**Proven end-to-end on two real government sites with zero site-specific code:** a usa.gov read-only lookup (grounded values + real citations, anchor-certified) and a real form (filled, then the submit classified `UNKNOWN` → consent **hard-stop** → declined, never submitted). The generality montage isn't a promise — it's the architecture.
 
 **Ports (the swap seams) — `contracts/ports.py`, FROZEN:**
 
@@ -91,6 +105,7 @@ Task Plane [LangGraph]:  GROUND → VERIFY → PROPOSE → ⟨CONSENT⟩ → ACT
 |---|---|---|
 | `VoiceTransport` | **LiveKit** (+ Deepgram STT) | audio in/out, turn detection, barge-in |
 | `Retriever` | **Moss** (Gemini `gemini-embedding-001` custom embeddings) | `query → grounded facts[] + source_node_id`, sub-10ms in-memory |
+| `Reasoner` | **Gemini** `gemini-3.5-flash` (`thinking_budget=0`, ~2s) · Qwen/Nebius failover | `plan_goal → sub-goals` · `decide_step → next grounded action`; the de-hardcoding boundary, the **only** LLM home |
 | `Synthesizer` | **Minimax** (Gemini TTS stands in behind the same ABC) | `text → audio` |
 | `Actuator` | **Playwright/CDP** | merged numbered AXTree → act → re-perceive |
 | `Ingest` | site / doc → KB | parse + index pages and policy docs |
@@ -100,22 +115,22 @@ Task Plane [LangGraph]:  GROUND → VERIFY → PROPOSE → ⟨CONSENT⟩ → ACT
 
 **Two modes** (`kernel/policy.py`, a 2-clause policy):
 - **Normal (default):** human-in-the-loop, per-step confirmation. The validated design.
-- **Fast (opt-in):** runs ahead through reversible steps (navigate, read, fill) but **hard-stops at any irreversible/financial step.** "Earns autonomy on the boring steps, never on the irreversible one."
+- **Fast (opt-in):** runs ahead through reversible steps (navigate, read, fill) but **hard-stops at any step the dual-signal gate marks `irreversible` _or_ `UNKNOWN`.** No keyword list — structure + model judgment, fail-closed. "Earns autonomy on the boring steps, never on the irreversible one."
 
 **Stack (locked):** Python 3.12+, `langgraph 1.2.2` (`interrupt`/`Command`, `InMemorySaver`), `pydantic 2.13.4`, `playwright`, `livekit-agents` · Next.js 16.2.2 + React 19 (Turbopack), `@livekit/components-react`. Providers split by extra: `.[test]` (no network), `.[spike]` (LiveKit+Playwright+genai), `.[retrieval]` (Moss+genai).
 
 **Repo layout** (directory ownership = collision-free):
 ```
-agent/clarion/contracts/   ports · state · events            ← FROZEN; pure pydantic/abc
-            /kernel/        graph (6-node loop) · policy (2 modes)
-            /actuator/      merged-AXTree perception + act + diff
-            /stages/        planner + per-stage nodes + RESCUE cross-cut
-            /adapters/      voice_livekit · tts (real providers live here)
+agent/clarion/contracts/   ports (incl. Reasoner) · state (Fact.id · PairedFact) · events  ← FROZEN
+            /kernel/        graph (loop + gate) · policy (fences) · reasoner_guard · irreversibility · negative_verifier
+            /actuator/      merged-AXTree perception (lazy-stamp) + act + diff + geometric PairedFacts
+            /stages/        generic executor + checks (code done-check) + RESCUE cross-cut
+            /adapters/      voice_livekit · tts · gemini_reasoner (default) · openai_reasoner (Qwen failover)
             /retrieval/     Moss + Gemini-embedding stack
             /instrument/    latency meter · cold-RAG baseline · to_panel_state
-            /app/           runtime · hero_harness · voice_entry · demo_mode
-web/demo-site/   (hero target)  ·  web/panel/ (six demo effects)  ·  web/spike-target/
-docs/foundation.md (why) · docs/execution.md (build) · docs/persona.md
+            /app/           runtime · gov_proof (autonomous TAS driver) · voice_entry · demo_mode
+web/demo-site/   ·  web/panel/ (six demo effects)  ·  web/spike-target/
+docs/foundation.md (why) · docs/execution.md (build) · docs/clarion-architecture.md (the de-hardcoded design) · docs/clarion-status.md (live status)
 ```
 
 ---
@@ -163,23 +178,21 @@ The hackathon thesis is "retrieval is the bottleneck." Clarion's invariant puts 
 
 ### How we're ready
 
-- **Deterministic regression gate:** `82 passed, 3 deselected`, fully offline (`.[test]` pulls no network).
+- **Deterministic regression gate:** `178 passed, 10 deselected`, fully offline (`.[test]` pulls no network) — including a goal-agnostic invariant spec whose guards are proven **red-before-green by mutation** (disable the structural net / the post-decode guard / the grounding check → the matching invariant test goes red).
 - **Providers live (event-day):** LiveKit · Deepgram STT · Gemini LLM+TTS (AI Studio) · **Moss retrieval live**, `clarion-kb` index built and persistent. Minimax swaps in at the `Synthesizer` seam.
 - **Judge-proof offline path:** `CLARION_DEMO_MODE=1` replays the hero run with no network, so a venue Wi-Fi failure can't kill the demo. Reliability is an engineering choice, not luck.
 - **Latency engineered, not hoped:** Moss is pre-warmed and the embed fires on partial-STT so the on-stage retrieval number is the in-memory **~3ms**, inside LiveKit's **<800ms** turn budget.
 
 ```bash
 # deterministic gate (no network)
-cd agent && pip install -e ".[test]" && python -m pytest clarion          # 82 passed, 3 deselected
+cd agent && pip install -e ".[test]" && python -m pytest clarion          # 178 passed, 10 deselected
 
-# the hero, fully live (Playwright + Moss + Gemini)
-cd web/demo-site && npm install && npm run dev -- --port 8770             # hero target (login pw: demo)
+# the de-hardcoded proof, fully live on REAL gov sites (Playwright + Gemini Reasoner)
 cd agent && pip install -e ".[spike]" && pip install -e ".[retrieval]"
 .venv/bin/playwright install chromium
-DEMO_SITE_URL=http://localhost:8770/ .venv/bin/python -m clarion.app.hero_harness
+.venv/bin/python -m clarion.app.gov_proof          # generic TAS driver: usa.gov + a real form, zero site-specific code
 
-# judge-proof offline replay  ·  live voice worker  ·  the six-effect panel
-CLARION_DEMO_MODE=1 .venv/bin/python -m clarion.app.hero_harness
+# live voice worker  ·  the six-effect panel
 .venv/bin/python -m clarion.app.voice_entry console
 cd web/panel && npm run dev
 ```

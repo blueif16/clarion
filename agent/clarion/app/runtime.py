@@ -36,7 +36,7 @@ import os
 import time
 from typing import Any, Callable, Literal, Optional
 
-from clarion.contracts.ports import Actuator, Retriever
+from clarion.contracts.ports import Actuator, Reasoner, Retriever
 from clarion.contracts.state import ClarionState, Fact
 from clarion.instrument.baseline import COLD_RAG_BASELINE_MS
 from clarion.instrument.publisher import to_panel_state
@@ -80,9 +80,14 @@ _HERO_FACTS: dict[str, list[Fact]] = {
 
 
 class HeroRetriever(Retriever):
-    """Deterministic, source-referenced facts for the hero goal. Stands in for
-    Moss (deferred). Matches a query against ``_HERO_FACTS`` substrings; falls back
-    to a single grounded echo fact so the grounding clause always has a source."""
+    """Deterministic, source-referenced facts for the hero goal.
+
+    NOTE (Gap 1): the LIVE runtime no longer grounds on this — it grounds on the
+    real page via ``clarion.app.page_retriever.PageRetriever``. This class is
+    RETAINED only as a deterministic test double (its ``source_node_id``s like
+    ``"acct::balance"`` are synthetic and match no real node, so it must never feed
+    a live run). Matches a query against ``_HERO_FACTS`` substrings; falls back to a
+    single grounded echo fact so the grounding clause always has a source."""
 
     def __init__(self, corpus: Optional[dict[str, list[Fact]]] = None) -> None:
         self.corpus = corpus if corpus is not None else _HERO_FACTS
@@ -277,8 +282,9 @@ class HeroRuntime:
 
     Two retrievers, because there are TWO kinds of grounded fact (kept distinct):
       - ``retriever`` (PAGE facts): the stage-graph GROUND source for the values
-        read off the page (amount/payee/due) — the deterministic ``HeroRetriever``
-        (these mirror the live AXTree values; the actuator grounds the page).
+        read off the page (amount/payee/due) — a ``PageRetriever`` over the
+        actuator that reads the REAL live AX tree, each fact sourced to a live
+        node (foundation §1 / Gap 1; replaced the ``HeroRetriever`` fixture).
       - ``kb_retriever`` (KB facts): the LIVE Moss retriever over the ingested
         Northwind policy (late-fee / autopay terms) — the §8 latency-meter +
         negative-verification beat. ``CLARION_DEMO_MODE=1`` swaps it for a
@@ -292,6 +298,7 @@ class HeroRuntime:
         retriever: TimedRetriever,
         publisher: PanelPublisher,
         mode: Literal["normal", "fast"],
+        reasoner: Reasoner,
         kb_retriever: Optional[Retriever] = None,
         kb_live: bool = True,
     ) -> None:
@@ -299,6 +306,9 @@ class HeroRuntime:
         self.retriever = retriever
         self.publisher = publisher
         self.mode = mode
+        # The de-hardcoding boundary: the LLM that reasons the plan + next step
+        # (GeminiReasoner live; FakeReasoner in tests). Injected into the executor.
+        self.reasoner = reasoner
         # The Moss-backed KB retriever (live) or the offline cached replay (demo).
         self.kb_retriever = kb_retriever
         self.kb_live = kb_live
@@ -314,11 +324,14 @@ class HeroRuntime:
         panel_sink: Optional[Callable[[Any, str], None]] = None,
         retriever: Optional[Retriever] = None,
         kb_retriever: Optional[Retriever] = None,
+        actuator: Optional[Actuator] = None,
+        reasoner: Optional[Reasoner] = None,
     ) -> "HeroRuntime":
         """Build the runtime over the live demo site.
 
-        - ``TimedRetriever(HeroRetriever)`` — the page-fact stage GROUND source
-          (amount/payee/due grounded off the page).
+        - ``TimedRetriever(PageRetriever(actuator))`` — the page-fact stage GROUND
+          source: reads the REAL live page off the actuator, every fact sourced to
+          a live AX node (Gap 1; an explicit ``retriever`` still overrides).
         - ``kb_retriever`` — the KB (Moss) retriever selected by
           ``select_kb_retriever``: LIVE ``TimedRetriever(MossRetriever)`` over the
           prebuilt ``clarion-kb`` index (ingested ONCE if missing, reused after),
@@ -329,29 +342,49 @@ class HeroRuntime:
           ``CachedActuator`` that REPLAYS the recorded fixture (no browser, no
           network) so the FULL hero run is judge-proof even with the site/network
           down (execution §9). Only PERCEPTION is cached; the K1 kernel + ST1
-          stage graph + consent gate + policy still execute for real.
+          stage graph + consent gate + policy still execute for real. An explicit
+          ``actuator`` (e.g. an ``ExtensionActuator`` over a started
+          ``WebSocketCdpRelay`` — the chrome.debugger / extension path) is injected
+          verbatim, so the SAME stage/perceive path drives the user's real tab.
         - ``PanelPublisher`` (live if ``room`` given, else recording sink).
         """
         from clarion.app.demo_mode import CachedActuator, demo_mode_enabled
+        from clarion.app.page_retriever import PageRetriever
 
         demo = demo_mode_enabled()
-        timed = TimedRetriever(retriever or HeroRetriever())
-        # The KB (Moss) retriever — live by default, cached + offline in demo mode.
-        kb = kb_retriever if kb_retriever is not None else await select_kb_retriever(
-            demo_mode=demo
-        )
-        if demo:
+        # Resolve the actuator FIRST — the page-fact retriever grounds on it.
+        if actuator is not None:
+            # Injected transport (the extension path) — used as-is; no browser spawn.
+            pass
+        elif demo:
             actuator = await CachedActuator.create(demo_site_url, headless=headless)
         else:
             from clarion.actuator.actuator import PlaywrightActuator
 
             actuator = await PlaywrightActuator.create(demo_site_url, headless=headless)
+        # The PAGE-fact retriever for the kernel's GROUND: read the REAL page off
+        # the actuator (every fact sourced to a live AX node), NOT the HeroRetriever
+        # fixture (foundation §1 / Gap 1). An explicit ``retriever`` still overrides
+        # (the tests inject their own); absent one we ground on the live page.
+        timed = TimedRetriever(retriever or PageRetriever(actuator))
+        # The KB (Moss) retriever — live by default, cached + offline in demo mode.
+        kb = kb_retriever if kb_retriever is not None else await select_kb_retriever(
+            demo_mode=demo
+        )
+        # The de-hardcoding boundary: the real GeminiReasoner (the LLM decider)
+        # unless one is injected (tests inject a FakeReasoner). Lazy client — no
+        # I/O at construct (load_dotenv resolves agent/.env keys on first call).
+        if reasoner is None:
+            from clarion.adapters.gemini_reasoner import GeminiReasoner
+
+            reasoner = GeminiReasoner()
         publisher = PanelPublisher(room=room, retriever=timed, sink=panel_sink)
         return cls(
             actuator=actuator,
             retriever=timed,
             publisher=publisher,
             mode=mode,
+            reasoner=reasoner,
             kb_retriever=kb,
             kb_live=not demo,
         )
@@ -373,12 +406,16 @@ class HeroRuntime:
         return MossKBBeat.from_cache(page_late_fee_present=page_late_fee_present)
 
     def build_stage_graph(self):
-        """Compile the ST1 stage graph wired with the timed retriever + the live
-        actuator + this runtime's mode. The graph is the top-level task graph (the
-        ST1 finding: drive CONSENT at the stage-graph level, not the bare kernel)."""
+        """Compile the generic executor graph wired with the injected Reasoner +
+        the timed retriever + the live actuator + this runtime's mode. The graph is
+        the top-level task graph (drive CONSENT at the executor level, not the bare
+        kernel). The Reasoner is the de-hardcoding boundary — the plan + every step
+        are LLM-derived, ZERO baked topology."""
         from clarion.stages.graph import build_stage_graph
 
-        return build_stage_graph(self.retriever, self.actuator, mode=self.mode)
+        return build_stage_graph(
+            self.reasoner, self.retriever, self.actuator, mode=self.mode
+        )
 
     async def close(self) -> None:
         await self.actuator.close()

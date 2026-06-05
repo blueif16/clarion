@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Clarion — microphone access</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        font:
+          16px/1.5 system-ui,
+          -apple-system,
+          sans-serif;
+        max-width: 34rem;
+        margin: 4rem auto;
+        padding: 0 1.25rem;
+      }
+      h1 {
+        font-size: 1.4rem;
+      }
+      #status {
+        margin-top: 1.5rem;
+        padding: 0.85rem 1rem;
+        border-radius: 0.5rem;
+        background: rgba(127, 127, 127, 0.12);
+      }
+      .ok {
+        color: #0a7d33;
+      }
+      .err {
+        color: #b00020;
+      }
+      button {
+        font: inherit;
+        margin-top: 1.25rem;
+        padding: 0.55rem 1.1rem;
+        border-radius: 0.45rem;
+        border: 1px solid currentColor;
+        background: transparent;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Clarion needs your microphone</h1>
+    <p>
+      Clarion is a voice co-pilot that drives your own browser tab while you stay
+      in command. To talk to it, your browser must grant microphone access. This
+      page asks once; the grant is then remembered for the voice session.
+    </p>
+    <p id="status" role="status" aria-live="polite">Requesting microphone…</p>
+    <button id="retry" hidden>Try again</button>
+
+    <script src="request-mic.js"></script>
+  </body>
+</html>

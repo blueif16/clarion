@@ -1,41 +1,21 @@
-"""ST1 — the stage graph (execution §3): specialized nodes over shared state.
+"""ST1 → the GENERIC EXECUTOR (architecture migration Step 3): the goal-derived
+plan + the kernel loop per subgoal, over the shared state.
 
-**Not agents-per-stage.** ONE agent / ONE context walks a stage graph; each stage
-is a *specialized node* (its own tool subset + system-prompt placeholder + the
-kernel loop scoped to its job). Transitions are ``Command(goto=next_stage)``; a
-``replanner`` path fires when a stage's done-predicate (machine check, never
-model say-so) fails. A **RESCUE** cross-cut detects "screen-reader-choked"
-widgets in the current ``SelectorMap`` and branches to a rescue sub-flow, then
-returns to the interrupted stage. Single context over the shared ``ClarionState``
-(execution §3 / §3.1).
+**Not a baked AUTH→…→CONFIRM topology.** The hardcoded 6-stage pay-plan is
+DELETED. The planner asks the injected ``Reasoner`` for a goal-derived
+``list[Subgoal]`` (from the goal + the ORIENT readout + the page affordances);
+the single generic ``executor`` node runs the K1 kernel loop scoped to the
+current subgoal over the SHARED ``ClarionState``, then advances on the GENERIC
+done-check — the reasoner-SELECTED ``success_check`` evaluated in CODE by
+``stages.checks.evaluate_success_check`` (killer-closer #3, never model say-so).
 
-Built ON K1 (imports the kernel + policy + predicates read-only; never edits
-them) and the FROZEN ``clarion.contracts``. The §18.7 reducer rule is honoured
-throughout: every node returns ONLY its NEW ``trace`` / ``consent_log`` entries —
-LangGraph's ``operator.add`` reducer concatenates (returning prior+new would
-double-count and break the §2.3 idempotency guard the kernel reads out of trace).
+KEPT verbatim: the RESCUE cross-cut (``detect_rescue`` — the most-validated
+trigger), the bounded ``replanner``, and the §18.7 content-keyed reducer dedup
+for the kernel sub-loop that re-executes across a consent interrupt.
 
-Private control-flow channels (rescue-return target, replan bookkeeping) are NOT
-added to the frozen ``ClarionState`` (execution §18.5 freeze rule). They live on a
-``_StageState`` TypedDict that *extends* ``ClarionState`` with leading-underscore
-keys, used ONLY as this graph's schema. Every value object remains a contract
-type; kernel/predicate calls still receive a valid ``ClarionState``. (LangGraph
-1.2.2 silently DROPS state keys absent from the schema — verified — so the private
-keys MUST be declared somewhere; declaring them on a superset schema keeps the
-contract pure.)
-
-langgraph 1.2.2 facts (Context7 /websites/langchain_oss_python_langgraph,
-verified 2026-05-31):
-  - ``Command(update={...}, goto="node")`` BOTH updates state AND routes — the
-    replacement for a conditional edge; control flow is data, not a fixed edge, so
-    a node may ``goto`` an earlier node (the replanner loop) or forward.
-  - ``Command(goto=END)`` ends the graph from inside a node.
-  - A state channel ``Annotated[list[X], operator.add]`` is append/reduce: node
-    returns are CONCATENATED, never overwritten (the §18.7 trace/consent_log rule).
-  - A node returning ``Command`` should carry a ``Command[Literal[...]]`` return
-    annotation listing its goto targets (graph rendering/validation); the stage
-    nodes are built in a closure, so we annotate ``-> Command`` and rely on the
-    runtime goto (validated by the tests).
+Built ON K1 (imports the kernel + policy read-only; never edits them) and the
+FROZEN ``clarion.contracts``. Private control-flow channels live on the
+``_PlanState`` superset (the kernel's, extended) so ``contracts/`` stays frozen.
 
 This module OWNS only ``clarion/stages/``; it imports kernel + contracts read-only.
 """
@@ -52,60 +32,58 @@ from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 from langgraph.types import Command, interrupt
 
+from clarion.actuator.pipeline import readout_from_selector_map
 from clarion.contracts.events import ConsentDecision
-
-from clarion.contracts.ports import Actuator, Retriever
+from clarion.contracts.ports import Actuator, Reasoner, Retriever
 from clarion.contracts.state import (
     ClarionState,
     Consent,
+    Fact,
+    PageReadout,
+    PairedFact,
     SelectorMap,
-    Stage,
+    Subgoal,
     TraceEvent,
 )
-from clarion.kernel.graph import _ALLOWED_MSGPACK_MODULES, build_kernel, seed_state
-from clarion.stages.planner import plan_goal, verbalize_plan
-from clarion.stages.predicates import (
-    detect_rescue,
-    needs_rescue,
-    stage_advances,
-)
+from clarion.kernel.graph import _ALLOWED_MSGPACK_MODULES, _PlanState, build_kernel, seed_state
+from clarion.stages.checks import evaluate_success_check, make_anchor
+from clarion.stages.planner import plan_goal, verbalize_subgoals
+from clarion.stages.predicates import detect_rescue, needs_rescue
 
 
 # ---------------------------------------------------------------------------
-# Private control-flow schema (superset of ClarionState — contracts stay frozen)
+# Private control-flow schema — the kernel's _PlanState superset, plus this
+# graph's leading-underscore control-flow channels (contracts stay frozen).
 # ---------------------------------------------------------------------------
 
 
-class _StageState(ClarionState, total=False):
-    """The stage graph's runtime schema: every FROZEN ``ClarionState`` channel
-    plus this graph's private, leading-underscore control-flow channels.
+class _StageState(_PlanState, total=False):
+    """The executor graph's runtime schema: the kernel ``_PlanState`` superset
+    (frozen ``ClarionState`` + the additive plan/reasoner keys) PLUS this graph's
+    private, leading-underscore control-flow channels (rescue-return target,
+    replan bookkeeping, the before-map anchor for the done-check). ``total=False``
+    so a bare ``ClarionState`` seed is still valid input."""
 
-    These are NOT contract fields (execution §18.5: contracts/ stays pure). They
-    are last-value-wins scratch the router uses to know where rescue returns and
-    which stage the replanner retries. ``total=False`` so they're optional — a
-    bare ``ClarionState`` seed is still valid input.
-    """
-
-    # The stage node to return to after the rescue sub-flow completes.
+    # The executor node to return to after the rescue sub-flow completes.
     _rescue_return: Optional[str]
-    # The stage node rescue last resolved for → that stage won't re-trigger rescue
-    # on the same tree (prevents a rescue⇄stage loop).
-    _rescue_done_for: Optional[str]
-    # The stage node whose done-predicate failed → the replanner retries it.
-    _failed_stage: Optional[str]
-    # How many replans we've spent (bounded by ``max_replans``).
+    # The subgoal index rescue last resolved for → won't re-trigger on same tree.
+    _rescue_done_for: Optional[int]
+    # How many replans we've spent on the current subgoal (bounded).
     _replan_attempts: int
-    # Per-stage inner-kernel thread ids (stage node name → kernel thread_id), so a
-    # consent interrupt surfaced through the parent can be resumed on the SAME
-    # inner-kernel thread after the parent resumes (the seam: the stage runs the
-    # kernel as a sub-loop; the kernel's interrupt re-surfaces through the parent).
+    # Per-subgoal inner-kernel thread ids (subgoal idx → kernel thread_id), so a
+    # consent interrupt surfaced through the parent resumes on the SAME inner
+    # thread after the parent resumes.
     _kernel_threads: dict[str, str]
+    # The SelectorMap BEFORE the current subgoal's kernel ran (the done-check diff
+    # baseline) and the URL/anchor at that point.
+    _before_map: Optional[SelectorMap]
+    _anchor: Optional[str]
 
 
-# Node names in the compiled graph.
 _PLANNER = "planner"
-_REPLANNER = "replanner"
+_EXECUTOR = "executor"
 _RESCUE = "rescue"
+_REPLANNER = "replanner"
 
 
 def _trace(node: str, event: str = "info", **data: object) -> TraceEvent:
@@ -114,140 +92,162 @@ def _trace(node: str, event: str = "info", **data: object) -> TraceEvent:
 
 def _trace_key(e: TraceEvent) -> tuple:
     """Content identity of a trace event, for idempotent forwarding (a re-executed
-    stage node must not re-append an event the parent channel already holds). The
-    kernel's ``at=time.time()`` makes each genuine event unique."""
+    node must not re-append an event the parent channel already holds)."""
     return (e.node, e.event, e.at, repr(sorted(e.data.items())))
 
 
 def _consent_key(c: Consent) -> tuple:
-    """Content identity of a consent record, for idempotent forwarding."""
     return (c.proposal_id, c.decision, c.value, c.at)
 
 
-def _stage_node_name(stage_id: str) -> str:
-    return f"stage_{stage_id.lower()}"
-
-
 def make_stage_checkpointer() -> InMemorySaver:
-    """Same contract-model allowlist as the kernel (execution §18.6) so the stage
-    graph's checkpointed state round-trips warning-free."""
+    """Same contract-model allowlist as the kernel (execution §18.6) so the
+    executor graph's checkpointed state round-trips warning-free."""
     return InMemorySaver(
         serde=JsonPlusSerializer(allowed_msgpack_modules=_ALLOWED_MSGPACK_MODULES)
     )
 
 
+# ---------------------------------------------------------------------------
+# ORIENT helpers — gather the readout + affordances + pairings the planner /
+# kernel need, degrading gracefully on an actuator without the extra reads.
+# ---------------------------------------------------------------------------
+
+
+async def _orient(actuator: Actuator, sm: SelectorMap) -> PageReadout:
+    """The ORIENT readout for the planner. Prefers the actuator's full-AXTree
+    ``describe_page``; falls back to the interactive ``SelectorMap`` so a fake /
+    cached transport still yields a grounded (if thinner) readout."""
+    describe = getattr(actuator, "describe_page", None)
+    if describe is not None:
+        return await describe()
+    return readout_from_selector_map(sm)
+
+
+async def _paired_facts(actuator: Actuator) -> list[PairedFact]:
+    """The geometric label↔value pairings THIS cycle (fence #3 supply). Empty for
+    an actuator without ``read_paired_facts`` (the fakes) — the pairing fence then
+    simply has nothing to back an "X is Y" claim, which is the safe default."""
+    read = getattr(actuator, "read_paired_facts", None)
+    if read is None:
+        return []
+    return await read()
+
+
+async def _current_url(actuator: Actuator) -> Optional[str]:
+    """The live page URL — the SEMANTIC ANCHOR substrate for the ``navigated``
+    done-check. Both real actuators surface it on their ``describe_page`` readout
+    (``PageReadout.url``: Playwright's ``page.url`` / the extension's
+    ``location.href``); a fake/replay transport without ``describe_page`` yields
+    ``None``, so ``navigated`` cleanly falls back to a structural delta. Best-effort
+    — never lets a URL read break the done-check (a blocked ``location.href`` just
+    degrades the anchor)."""
+    describe = getattr(actuator, "describe_page", None)
+    if describe is None:
+        return None
+    try:
+        readout = await describe()
+    except Exception:  # noqa: BLE001 - the anchor is best-effort; degrade, don't crash.
+        return None
+    url = (readout.url or "").strip()
+    return url or None
+
+
 def build_stage_graph(
+    reasoner: Reasoner,
     retriever: Retriever,
     actuator: Actuator,
     *,
     mode: Literal["normal", "fast"] = "normal",
     max_replans: int = 2,
 ):
-    """Compile the stage graph for the hero plan.
+    """Compile the GENERIC EXECUTOR graph.
 
     Topology::
 
-        START → planner → stage_auth → stage_locate → stage_fill
-              → stage_review → stage_pay → stage_confirm → END
+        START → planner → executor ⇄ (replanner) → END
+                            │
+                            └→ rescue → back to executor
 
-    with two cross-cut nodes any stage can route to:
-      - ``rescue``    — entered when ``detect_rescue`` flags a choked widget in the
-                        current tree; runs the rescue sub-flow then returns to the
-                        stage that branched (``_rescue_return``).
-      - ``replanner`` — entered when a stage's done-predicate (machine check) fails;
-                        re-runs that stage's kernel loop (bounded by
-                        ``max_replans``) before giving up to END.
+    - ``planner``  — asks the ``Reasoner`` for a goal-derived ``list[Subgoal]``
+                     (from goal + ORIENT readout + affordances), speaks the plan
+                     (legibility), routes to the executor at subgoal 0.
+    - ``executor`` — runs the K1 kernel loop scoped to the CURRENT subgoal over the
+                     shared state (re-surfacing any consent interrupt through the
+                     parent), then advances on the GENERIC done-check
+                     (``evaluate_success_check`` against the re-perceived tree).
+                     Advances subgoal idx on success; → replanner on failure.
+    - ``rescue``   — KEPT: a choked-widget cross-cut (``detect_rescue``).
+    - ``replanner``— KEPT: bounded retry of the current subgoal, then gives up.
 
-    Each stage node runs the K1 kernel loop scoped to its job over the SHARED
-    state (single context, no per-stage agent — execution §3), then evaluates its
-    done-predicate against the freshly re-perceived tree. ``mode`` is threaded into
-    the per-stage kernel so the consent gate behaves per foundation §5.
+    ``mode`` is threaded into the per-subgoal kernel so the dual-signal gate
+    behaves per foundation §5. NO baked stage names anywhere — the plan is whatever
+    the reasoner derives from the goal.
     """
 
-    # One kernel, reused across stages (the loop is stateless across invocations —
-    # state lives in ClarionState, which we pass in each time).
-    kernel = build_kernel(retriever, actuator, mode=mode)
-
-    plan = plan_goal("pay my electric bill")
-    ordered_ids = [s.id for s in plan]
-    # node name → the next stage's node name (or END for the last).
-    next_node: dict[str, str] = {}
-    for i, sid in enumerate(ordered_ids):
-        nxt = _stage_node_name(ordered_ids[i + 1]) if i + 1 < len(ordered_ids) else END
-        next_node[_stage_node_name(sid)] = nxt
+    # One kernel, reused across subgoals (state lives in ClarionState).
+    kernel = build_kernel(reasoner, retriever, actuator, mode=mode)
 
     # ---- planner ---------------------------------------------------------
-    def planner(state: _StageState) -> Command:
-        """Emit the explicit plan (read aloud verbatim → legibility) and route to
-        the first stage. Deterministic for the hero goal; the model-planner seam
-        lives in ``planner.plan_goal``."""
+    async def planner(state: _StageState) -> Command:
+        """Derive the goal-derived plan and route to the executor at subgoal 0."""
+        sm = state["page_index"]
+        orient = await _orient(actuator, sm)
+        subgoals = await plan_goal(
+            reasoner, state["goal"], orient, list(orient.affordances)
+        )
         return Command(
             update={
-                "plan": plan,
+                "subgoals": subgoals,
                 "stage_idx": 0,
                 "trace": [
                     _trace(
                         "PLANNER",
                         "exit",
-                        n_stages=len(plan),
-                        plan=list(ordered_ids),
-                        utterance=verbalize_plan(plan),
+                        n_subgoals=len(subgoals),
+                        plan=[s.description for s in subgoals],
+                        utterance=verbalize_subgoals(subgoals),
                     )
                 ],
             },
-            goto=_stage_node_name(ordered_ids[0]),
+            goto=_EXECUTOR,
         )
 
-    async def _drive_kernel(state: _StageState, stage: Stage, my_node: str) -> dict:
-        """Run the K1 kernel loop for one stage over the SHARED state, returning
-        the merged kernel result — driving it to completion even across a consent
-        interrupt.
-
-        The kernel is a separately-compiled graph (we build ON it, never edit it),
-        so its ``interrupt()`` does NOT auto-propagate to this parent graph: its
-        ``ainvoke`` returns a result carrying ``__interrupt__`` instead of pausing
-        us (verified, langgraph 1.2.2). The seam therefore RE-SURFACES that
-        consent through the parent's own ``interrupt()`` — so the voice plane /
-        panel see the identical ``ConsentRequest`` — then resumes the inner kernel
-        on its OWN thread with the decision. The inner thread id is persisted in
-        ``_kernel_threads`` so a parent resume reaches the same checkpoint.
-
-        We seed the kernel with the FROZEN ClarionState channels (scoped to this
-        stage's sub-goal); the caller forwards only the kernel's NEW trace/consent
-        delta (the §18.7 reducer rule)."""
+    async def _drive_kernel(state: _StageState, subgoal: Subgoal, idx: int) -> dict:
+        """Run the K1 kernel loop for ONE subgoal over the shared state, driving it
+        to completion even across a consent interrupt (re-surfaced through the
+        parent's own ``interrupt()`` so the voice plane / panel see the identical
+        ``ConsentRequest``). The inner thread id persists in ``_kernel_threads`` so
+        a parent resume reaches the same checkpoint."""
         threads = dict(state.get("_kernel_threads") or {})
-        thread_id = threads.get(my_node) or f"kernel-{stage.id}-{uuid.uuid4()}"
-        threads[my_node] = thread_id
+        key = str(idx)
+        thread_id = threads.get(key) or f"kernel-{idx}-{uuid.uuid4()}"
+        threads[key] = thread_id
         kernel_cfg = {"configurable": {"thread_id": thread_id}}
 
-        # Pass only the FROZEN ClarionState channels (strip our private keys — the
-        # kernel's schema is the contract, which would drop them anyway).
-        seed: ClarionState = {
-            "goal": stage.goal,  # scope the kernel to THIS stage's sub-goal
+        # Seed the kernel with the frozen + additive plan channels scoped to THIS
+        # subgoal's sub-goal. Pass the live paired_facts (the fence #3 supply).
+        seed: _PlanState = {
+            "goal": subgoal.description or state["goal"],
             "mode": state["mode"],
-            "plan": state["plan"],
-            "stage_idx": state["stage_idx"],
+            "plan": state.get("plan", []),
+            "stage_idx": idx,
             "step": state["step"],
             "page_index": state["page_index"],
             "grounded_facts": state["grounded_facts"],
             "pending_proposal": state["pending_proposal"],
             "consent_log": list(state["consent_log"]),
             "trace": list(state["trace"]),
+            "pending_step": state.get("pending_step"),
+            "paired_facts": state.get("paired_facts", []),
         }  # type: ignore[assignment]
 
         result = await kernel.ainvoke(seed, kernel_cfg)
-        # Drive across any number of inner consent interrupts (bounded for safety).
         for _ in range(8):
             if "__interrupt__" not in result:
                 break
-            # Re-surface the kernel's consent through the PARENT interrupt so the
-            # voice plane / panel pause on the same ConsentRequest. On parent
-            # resume this stage node re-executes from the top, _drive_kernel runs
-            # again, re-seeds the kernel (which is already parked at CONSENT on its
-            # own thread), and resumes it with the decision below.
             (parent_intr,) = result["__interrupt__"]
             decision_payload = interrupt(parent_intr.value)
-            # Normalize to the ConsentDecision shape the kernel's CONSENT expects.
             decision = ConsentDecision.model_validate(decision_payload)
             result = await kernel.ainvoke(
                 Command(resume=decision.model_dump()), kernel_cfg
@@ -255,134 +255,145 @@ def build_stage_graph(
         result["_kernel_threads"] = threads  # type: ignore[index]
         return result
 
-    def _make_stage_node(stage: Stage):
-        """Build the specialized node for one stage, closing over its machine
-        'done' gate (done-predicate + negative checks) and its plan position."""
-        my_node = _stage_node_name(stage.id)
-        forward = next_node[my_node]
-        stage_pos = ordered_ids.index(stage.id)
+    # ---- executor --------------------------------------------------------
+    async def executor(state: _StageState) -> Command:
+        idx = int(state.get("stage_idx", 0) or 0)
+        subgoals: list[Subgoal] = state.get("subgoals", []) or []
+        if idx >= len(subgoals):
+            return Command(goto=END)  # plan exhausted.
+        subgoal = subgoals[idx]
 
-        async def stage_node(state: _StageState) -> Command:
-            # (1) RESCUE cross-cut FIRST: if the tree we're about to act on chokes
-            #     the screen reader, branch to rescue and come back here (execution
-            #     §3 note). Don't re-trigger if rescue just resolved for us.
-            sm: SelectorMap = state["page_index"]
-            if needs_rescue(sm) and state.get("_rescue_done_for") != my_node:
-                choked = detect_rescue(sm)
-                return Command(
-                    update={
-                        "_rescue_return": my_node,
-                        "trace": [
-                            _trace(
-                                stage.id,
-                                "info",
-                                rescue_triggered=True,
-                                choked_indices=[n.index for n in choked],
-                            )
-                        ],
-                    },
-                    goto=_RESCUE,
-                )
-
-            # (2) Run the kernel loop scoped to this stage over the shared state,
-            #     driving it across any consent interrupt (re-surfaced through the
-            #     parent so the voice plane / panel pause on the same request).
-            merged = await _drive_kernel(state, stage, my_node)
-
-            # The kernel re-perceived in CONFIRM → evaluate the stage's machine
-            # 'done' gate against that fresh tree (execution §3.3 — never say-so).
-            fresh: SelectorMap = merged["page_index"]
-            advanced = stage_advances(
-                merged, fresh, stage.done_predicate, stage.negative_checks
+        # (1) RESCUE cross-cut FIRST (KEPT): a choked widget in the tree we're
+        #     about to act on → branch to rescue, come back here. Don't re-trigger
+        #     if rescue just resolved for this subgoal.
+        sm: SelectorMap = state["page_index"]
+        if needs_rescue(sm) and state.get("_rescue_done_for") != idx:
+            choked = detect_rescue(sm)
+            return Command(
+                update={
+                    "_rescue_return": _EXECUTOR,
+                    "_rescue_done_for": idx,
+                    "trace": [
+                        _trace(
+                            "EXECUTOR",
+                            "info",
+                            subgoal=idx,
+                            rescue_triggered=True,
+                            choked_indices=[n.index for n in choked],
+                        )
+                    ],
+                },
+                goto=_RESCUE,
             )
 
-            # Forward ONLY the kernel's genuinely-NEW reducer-channel entries
-            # (§18.7) — and do it IDEMPOTENTLY. A consent interrupt re-surfaced
-            # through the parent makes THIS stage node re-execute from the top on
-            # every parent resume; LangGraph then re-applies our reducer-delta each
-            # time. A naive positional slice would re-forward the same kernel
-            # entries on each re-run → the exact double-count §18.7 warns about.
-            # So we diff by CONTENT against the parent's already-accumulated channel
-            # (the kernel's ``at=time.time()`` stamps make each real event unique),
-            # guaranteeing a re-execution can only ever add what is truly new.
-            prior_trace_keys = {_trace_key(e) for e in state["trace"]}
-            prior_consent_keys = {_consent_key(c) for c in state["consent_log"]}
-            kernel_new_trace = [
-                e for e in merged["trace"] if _trace_key(e) not in prior_trace_keys
-            ]
-            kernel_new_consent = [
-                c
-                for c in merged["consent_log"]
-                if _consent_key(c) not in prior_consent_keys
-            ]
+        # Capture the before-map + the before-URL (the SEMANTIC ANCHOR baseline)
+        # + harvest the live pairings for THIS cycle (the done-check diff baseline
+        # + the fence #3 supply).
+        before_map = sm
+        before_url = await _current_url(actuator)
+        paired = await _paired_facts(actuator)
 
-            update: dict = {
-                "page_index": merged["page_index"],
-                "grounded_facts": merged["grounded_facts"],
-                "pending_proposal": merged["pending_proposal"],
-                "_kernel_threads": merged.get("_kernel_threads", {}),
-                "trace": kernel_new_trace
-                + [
-                    _trace(
-                        stage.id,
-                        "exit",
-                        done=advanced,
-                        done_predicate=stage.done_predicate,
-                    )
-                ],
-            }
-            if kernel_new_consent:
-                update["consent_log"] = kernel_new_consent
+        # (2) Run the kernel loop scoped to this subgoal over the shared state.
+        merged = await _drive_kernel(
+            {**state, "paired_facts": paired},  # type: ignore[arg-type]
+            subgoal,
+            idx,
+        )
 
-            if advanced:
-                update["stage_idx"] = stage_pos + 1
-                return Command(update=update, goto=forward)
+        # (3) GENERIC done-check (killer-closer #3): the reasoner-SELECTED
+        #     success_check, evaluated in CODE against the re-perceived tree + the
+        #     SEMANTIC ANCHOR (the URL before/after the act). The anchor lets
+        #     ``navigated`` certify a real page move (URL changed) instead of a
+        #     bare structural delta a benign SPA re-render also produces.
+        fresh: SelectorMap = merged["page_index"]
+        check_name = merged.get("success_check") or subgoal.done_check or ""
+        after_url = await _current_url(actuator)
+        anchor = make_anchor(before_url, after_url)
+        advanced = evaluate_success_check(
+            check_name, merged, before_map, fresh, anchor  # type: ignore[arg-type]
+        )
 
-            # Done-predicate failed → the replanner path (execution §3.1).
-            update["_failed_stage"] = my_node
-            return Command(update=update, goto=_REPLANNER)
+        # Forward ONLY the kernel's genuinely-NEW reducer-channel entries (§18.7),
+        # content-keyed so a consent re-execution can't double-count.
+        prior_trace_keys = {_trace_key(e) for e in state["trace"]}
+        prior_consent_keys = {_consent_key(c) for c in state["consent_log"]}
+        kernel_new_trace = [
+            e for e in merged["trace"] if _trace_key(e) not in prior_trace_keys
+        ]
+        kernel_new_consent = [
+            c
+            for c in merged["consent_log"]
+            if _consent_key(c) not in prior_consent_keys
+        ]
 
-        return stage_node
+        update: dict = {
+            "page_index": merged["page_index"],
+            "grounded_facts": merged["grounded_facts"],
+            "pending_proposal": merged["pending_proposal"],
+            "pending_step": merged.get("pending_step"),
+            "success_check": merged.get("success_check", ""),
+            "paired_facts": paired,
+            "_kernel_threads": merged.get("_kernel_threads", {}),
+            "_before_map": before_map,
+            "_anchor": anchor,
+            "trace": kernel_new_trace
+            + [
+                _trace(
+                    "EXECUTOR",
+                    "exit",
+                    subgoal=idx,
+                    done=advanced,
+                    success_check=check_name,
+                    url_before=before_url or "",
+                    url_after=after_url or "",
+                )
+            ],
+        }
+        if kernel_new_consent:
+            update["consent_log"] = kernel_new_consent
 
-    # ---- RESCUE sub-flow -------------------------------------------------
+        if advanced:
+            update["stage_idx"] = idx + 1
+            update["_replan_attempts"] = 0
+            update["_rescue_done_for"] = None
+            # Next subgoal (or END if this was the last).
+            goto = _EXECUTOR if idx + 1 < len(subgoals) else END
+            return Command(update=update, goto=goto)
+
+        # Done-check failed → the replanner (bounded retry).
+        return Command(update=update, goto=_REPLANNER)
+
+    # ---- RESCUE sub-flow (KEPT verbatim) ---------------------------------
     async def rescue(state: _StageState) -> Command:
-        """The cross-cut rescue sub-flow (execution §3 note, foundation §4 — the
-        most-validated trigger, Aira 62%). A choked widget (interactive role with
-        an empty accessible name / focus-trap) was detected; we model the rescue
-        as a re-perceive (a real impl relabels via the vision fallback / heuristics
-        — execution §4.2) and return to the stage that branched.
-
-        We mark ``_rescue_done_for`` so the returned-to stage does NOT immediately
-        re-trigger rescue on the same tree (avoids a rescue⇄stage loop)."""
-        return_to = state.get("_rescue_return") or _stage_node_name(ordered_ids[0])
+        """The choked-widget cross-cut (foundation §4 — the most-validated trigger).
+        Re-perceive (a real impl relabels via the vision fallback) and return to the
+        executor. ``_rescue_done_for`` stops an immediate re-trigger on the same
+        tree."""
         fresh = await actuator.perceive()
         still_choked = detect_rescue(fresh)
         return Command(
             update={
                 "page_index": fresh,
-                "_rescue_done_for": return_to,
                 "_rescue_return": None,
                 "trace": [
                     _trace(
                         "RESCUE",
                         "exit",
-                        returned_to=return_to,
+                        returned_to=_EXECUTOR,
                         resolved=not still_choked,
                         remaining_choked=[n.index for n in still_choked],
                     )
                 ],
             },
-            goto=return_to,
+            goto=_EXECUTOR,
         )
 
-    # ---- replanner -------------------------------------------------------
+    # ---- replanner (KEPT) ------------------------------------------------
     async def replanner(state: _StageState) -> Command:
-        """Revise when a stage's done-predicate fails or the page surprises us
-        (execution §3.1). Bounded retry: re-run the failed stage up to
-        ``max_replans`` times (re-perceiving first), then give up to END so a
-        wedged page cannot loop forever."""
+        """Bounded retry of the CURRENT subgoal: re-perceive and re-run it up to
+        ``max_replans`` times, then give up to END so a wedged page can't loop."""
         attempts = int(state.get("_replan_attempts", 0) or 0) + 1
-        failed = state.get("_failed_stage") or _stage_node_name(ordered_ids[0])
+        idx = int(state.get("stage_idx", 0) or 0)
         if attempts > max_replans:
             return Command(
                 update={
@@ -391,7 +402,7 @@ def build_stage_graph(
                             "REPLANNER",
                             "exit",
                             gave_up=True,
-                            failed_stage=failed,
+                            subgoal=idx,
                             attempts=attempts,
                         )
                     ]
@@ -403,36 +414,35 @@ def build_stage_graph(
             update={
                 "page_index": fresh,
                 "_replan_attempts": attempts,
-                "_failed_stage": None,
                 "trace": [
-                    _trace("REPLANNER", "exit", retrying=failed, attempts=attempts)
+                    _trace("REPLANNER", "exit", retrying=idx, attempts=attempts)
                 ],
             },
-            goto=failed,
+            goto=_EXECUTOR,
         )
 
     # ---- assemble --------------------------------------------------------
     builder = StateGraph(_StageState)
     builder.add_node(_PLANNER, planner)
+    builder.add_node(_EXECUTOR, executor)
     builder.add_node(_RESCUE, rescue)
     builder.add_node(_REPLANNER, replanner)
-    for stage in plan:
-        builder.add_node(_stage_node_name(stage.id), _make_stage_node(stage))
 
     builder.add_edge(START, _PLANNER)
-    # All routing out of planner / stages / rescue / replanner is via Command(goto).
+    # All routing out of planner / executor / rescue / replanner is via Command(goto).
 
     return builder.compile(checkpointer=make_stage_checkpointer())
 
 
 def seed_stage_state(
-    goal: str = "pay my electric bill",
+    goal: str = "",
     mode: Literal["normal", "fast"] = "normal",
     page_index: Optional[SelectorMap] = None,
 ) -> ClarionState:
-    """A minimal valid ``ClarionState`` to start the stage graph. Reuses the
+    """A minimal valid ``ClarionState`` to start the executor graph. Reuses the
     kernel's ``seed_state`` (single source of truth for the state shape) and lets
-    the caller seed the initial ``page_index`` (the freshly perceived tree)."""
+    the caller seed the initial ``page_index`` (the freshly perceived tree). The
+    ``goal`` is the real (restated) user goal — never a baked task."""
     state = seed_state(goal=goal, mode=mode)
     if page_index is not None:
         state["page_index"] = page_index

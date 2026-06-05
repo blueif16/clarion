@@ -12,10 +12,11 @@ so it survives an ``interrupt()`` round-trip (execution §2.1).
 
 from __future__ import annotations
 
+import hashlib
 import operator
 from typing import Annotated, Literal, Optional, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 # ---------------------------------------------------------------------------
 # Perception value objects (the merged, numbered a11y tree — execution §4)
@@ -72,6 +73,96 @@ class Fact(BaseModel):
     # Unix epoch seconds at retrieval — drives the live latency meter (§8).
     retrieved_at: float = 0.0
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def id(self) -> str:
+        """A stable, deterministic content id — ``<polarity>:<source_node_id>:<value>``
+        hashed (sha1, 16 hex chars). It is the handle a ``StepProposal.value_ref``
+        points at: an *enum over real Fact ids*, NOT a free-text value the model
+        can fabricate (architecture Components / killer-closer #1).
+
+        - Deterministic: equal ``(value, source_node_id, polarity)`` → equal ``id``
+          (no timestamp / object identity in the digest, so ``retrieved_at`` and
+          ``verified`` don't perturb it — the same page value re-read still resolves).
+        - Computed (not a stored field), so every existing ``Fact(...)`` call is
+          unchanged and the 100 frozen tests stay green. It DOES serialize (pydantic
+          ``computed_field``) so ``value_ref`` resolution survives a checkpoint
+          round-trip; deserialization ignores the extra key (it recomputes).
+        """
+        digest = hashlib.sha1(
+            f"{self.polarity}\x00{self.source_node_id or ''}\x00{self.value}".encode()
+        ).hexdigest()
+        return f"fact-{digest[:16]}"
+
+
+class PairedFact(BaseModel):
+    """A first-class grounded label↔value pairing (architecture killer-closer #1).
+
+    The worst epistemic failure is a *clean citation on the wrong number* — reading
+    the past-due row's ``$142.10`` as the amount due. A bare pair of ``Fact``s does
+    not protect against that: two facts can be true yet mis-associated. A
+    ``PairedFact`` makes the *association itself* grounded: the label half and the
+    value half EACH carry their real AX ``source_node_id``, and ``method`` records
+    HOW the pairing was geometrically established — **never reading-order**.
+
+    The geometric EXTRACTION that builds these from a live page is a LATER agent's
+    job (the ContextRanker / PairedFact extractor). This contract only fixes the
+    SHAPE + the membership helper VERIFY uses: an "X is Y" sentence is speakable
+    iff a single ``PairedFact`` backs both halves (``backs(label, value)``).
+    """
+
+    label: Fact
+    value: Fact
+    # HOW the label↔value association was established — a structural/geometric
+    # signal, NOT 8px reading-order proximity (the thing that mis-pairs).
+    method: Literal["aria-labelledby", "for", "shared-row", "dom-ancestry"]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def id(self) -> str:
+        """Stable id over the two real Fact ids + the pairing method."""
+        digest = hashlib.sha1(
+            f"{self.label.id}\x00{self.value.id}\x00{self.method}".encode()
+        ).hexdigest()
+        return f"pair-{digest[:16]}"
+
+    def backs(self, label_text: str, value_text: str) -> bool:
+        """Does THIS single pairing ground both halves of an "X is Y" claim?
+
+        VERIFY's pairing-correctness fence (architecture invariant fence #3): an
+        "X is Y" claim is speakable ONLY if one ``PairedFact`` has ``label.value ==
+        X`` AND ``value.value == Y`` — byte-identical (extract-don't-generate), both
+        halves sourced. Two separate true facts that no single pairing joins return
+        ``False`` (the mis-pairing is ungroundable → refused)."""
+        return (
+            self.label.value == label_text
+            and self.value.value == value_text
+            and self.label.source_node_id is not None
+            and self.value.source_node_id is not None
+        )
+
+
+class PageReadout(BaseModel):
+    """ORIENT — a grounded, spoken-ready description of the current page.
+
+    This is the screen-reader baseline the co-pilot reads back BEFORE any goal is
+    set (the goal-formation on-ramp): what the page IS and what the user can DO on
+    it. The invariant holds here too (foundation §1): every ``Fact`` in
+    ``headings`` / ``affordances`` carries the real AX ``source_node_id`` it was
+    read from — nothing in a readout is ungrounded.
+
+    ``affordances`` is the recommend step (the controls the page actually offers);
+    ``summary`` is the single readback string the voice plane speaks, ending on an
+    open prompt so the user states their goal (which is then confirmed — never
+    assumed).
+    """
+
+    title: str = ""
+    url: str = ""
+    headings: list[Fact] = Field(default_factory=list)
+    affordances: list[Fact] = Field(default_factory=list)
+    summary: str = ""
+
 
 class Passage(BaseModel):
     """A chunk produced by Ingest (Unsiloed) and consumed by the Retriever.
@@ -122,6 +213,61 @@ class Proposal(BaseModel):
     utterance: str
     action: Optional[Action] = None
     irreversible: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Reasoner I/O value objects (the de-hardcoding boundary — architecture
+# Components: the `Reasoner` port outputs; the `GeminiReasoner` adapter emits
+# these via structured output. Pure models; ZERO SDK.)
+# ---------------------------------------------------------------------------
+
+
+class Subgoal(BaseModel):
+    """One generic step in the plan the ``Reasoner.plan_goal`` derives from the
+    goal + the ORIENT readout + the page affordances — the replacement for the
+    hardcoded ``_hero_plan`` stage topology (architecture migration Step 3).
+
+    Generic and site-agnostic: no AUTH→…→CONFIRM names baked in. ``done_check``
+    names a *registered* generic success check (a SELECTION, never model say-so —
+    killer-closer #3); CODE evaluates it against the re-perceived tree.
+    """
+
+    # A short, generic, human-readable intent ("find the amount due").
+    description: str
+    # The registered generic check that certifies this subgoal is done (a
+    # SELECTION — e.g. "field-now-nonempty" / "navigated" / "status-fact-appeared").
+    done_check: str = ""
+
+
+class StepProposal(BaseModel):
+    """The ``Reasoner.decide_step`` output — the next single grounded action, with
+    every field the ``GeminiReasoner`` structured-output schema must carry
+    (architecture Components / GeminiReasoner).
+
+    Structured output is NOT a logit mask: the model can still emit an off-page
+    ``target_index`` or a dangling ``value_ref``. ``kernel.reasoner_guard`` is the
+    code-side post-decode fence that rejects those before they can act.
+    """
+
+    # Drafted FIRST (the model reasons before it points) — never spoken; audit only.
+    scratch_reasoning: str = ""
+    action_kind: Literal["click", "fill", "navigate", "read"]
+    # Integer index into the LIVE SelectorMap (validated vs the live map by the guard).
+    target_index: Optional[int] = None
+    # A reference to a REAL ``Fact.id`` (the value to fill/speak), or None when the
+    # action carries no value (a click). Validated vs live Fact ids by the guard.
+    value_ref: Optional[str] = None
+    # The model's grounded judgement, paired with the independent code structural
+    # pre-screen at the gate (killer-closer #2). The model can ESCALATE, never
+    # downgrade past the structural net; UNKNOWN routes through CONSENT in Fast mode.
+    irreversibility: Literal["reversible", "irreversible", "unknown"] = "unknown"
+    irreversibility_rationale: str = ""
+    # A SELECTION: the name of a registered generic success check CODE evaluates
+    # against the re-perceived tree (killer-closer #3 — never the model self-grading).
+    success_check: str = ""
+    # The verbatim grounded string the voice plane speaks — extracted from grounded
+    # spans, never generated. Empty for a silent step.
+    say: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -235,10 +381,14 @@ __all__ = [
     "AxNode",
     "SelectorMap",
     "Fact",
+    "PairedFact",
+    "PageReadout",
     "Passage",
     "Profile",
     "Action",
     "Proposal",
+    "Subgoal",
+    "StepProposal",
     "Observation",
     "PageDiff",
     "Stage",

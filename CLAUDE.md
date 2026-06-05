@@ -6,6 +6,7 @@ it *can't* find something instead of guessing), and keeps the human in command a
 consequential step. Built for the YC Conversational AI Hackathon (June 6–7 2026).
 
 Full spec: `docs/foundation.md` (product, LOCKED) · `docs/execution.md` (build spec + Part III status).
+**▶ READ FIRST each session: `docs/clarion-status.md`** — LIVE progress: what's real vs hardcoded, what's left, what to fix/test. Keep it current (edit it in the same commit as the change). Next-session kickoff prompt: `docs/clarion-handoff-prompt.md`.
 
 ## The invariant (this is the kernel — do not erode it)
 > **No fact without a source. No action without a yes.**

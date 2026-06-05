@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Clarion voice (offscreen)</title>
+  </head>
+  <body>
+    <!--
+      Offscreen document: the long-lived home for Clarion's browser-side voice.
+
+      MV3 service workers are evicted at ~30s idle, which would silently drop a
+      WebRTC connection. An offscreen document is exempt from that lifecycle, so
+      the LiveKit room connection (mic publish + agent audio playback) lives
+      HERE, not in the worker. The worker only posts it the room config and a
+      disconnect signal.
+
+      The vendored LiveKit SDK is loaded as a LOCAL classic script (MV3 forbids
+      remote code); it assigns globalThis.LivekitClient. offscreen.js then runs
+      as a module and reads that global.
+    -->
+    <script src="vendor/livekit-client.umd.js"></script>
+    <script type="module" src="offscreen.js"></script>
+
+    <!-- The agent's incoming audio track is attached here so the user hears it. -->
+    <audio id="agent-audio" autoplay></audio>
+  </body>
+</html>

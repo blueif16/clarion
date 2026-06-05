@@ -12,6 +12,7 @@ from clarion.contracts.ports import (
     Actuator,
     Ingest,
     Memory,
+    Reasoner,
     Retriever,
     Synthesizer,
     VoiceTransport,
@@ -22,9 +23,12 @@ from clarion.contracts.state import (
     Fact,
     Observation,
     PageDiff,
+    PageReadout,
     Passage,
     Profile,
     SelectorMap,
+    StepProposal,
+    Subgoal,
 )
 
 
@@ -203,6 +207,71 @@ class FakeActuator(Actuator):
         return PageDiff(added=added, removed=removed, changed=changed)
 
 
+class FakeReasoner(Reasoner):
+    """Deterministic, scriptable ``Reasoner`` — unblocks network-free CI for the
+    kernel rewire (it stands in for the real ``GeminiReasoner`` exactly as the
+    other fakes stand in for their providers).
+
+    Two scripting modes:
+      - SEEDED: pass ``subgoals`` and/or ``steps`` (a list of ``StepProposal``);
+        ``plan_goal`` returns the seeded subgoals, ``decide_step`` returns the
+        seeded steps in order (then repeats the last).
+      - DEFAULT (no seed): ``decide_step`` deterministically points at the FIRST
+        node in the ``ranked_slice`` and, if any grounded fact is present, sets
+        ``value_ref`` to the first fact's REAL id — so a guard-validated step is
+        produced from whatever live map/facts it is handed (the spike relies on
+        this to exercise real usa.gov indices + Fact ids with no network)."""
+
+    def __init__(
+        self,
+        *,
+        subgoals: list[Subgoal] | None = None,
+        steps: list[StepProposal] | None = None,
+    ) -> None:
+        self._subgoals = subgoals
+        self._steps = list(steps) if steps else None
+        # Observability parity with the other fakes (tests assert what was asked).
+        self.plan_calls: list[str] = []
+        self.decide_calls: list[str] = []
+
+    async def plan_goal(
+        self,
+        goal: str,
+        orient: PageReadout,  # noqa: ARG002 - part of the port surface
+        affordances: list[Fact],
+    ) -> list[Subgoal]:
+        self.plan_calls.append(goal)
+        if self._subgoals is not None:
+            return list(self._subgoals)
+        # Default: one generic subgoal naming the goal + a generic done check.
+        return [Subgoal(description=f"accomplish: {goal}", done_check="navigated")]
+
+    async def decide_step(
+        self,
+        goal: str,
+        ranked_slice: SelectorMap,
+        facts: list[Fact],
+        history: list[StepProposal],  # noqa: ARG002 - part of the port surface
+    ) -> StepProposal:
+        self.decide_calls.append(goal)
+        if self._steps:
+            # Return the seeded steps in order; repeat the last once exhausted.
+            idx = min(len(self.decide_calls) - 1, len(self._steps) - 1)
+            return self._steps[idx]
+        # Default: point at the first live index; reference the first grounded fact.
+        target = next(iter(sorted(ranked_slice.nodes)), None)
+        value_ref = facts[0].id if facts else None
+        return StepProposal(
+            scratch_reasoning=f"first candidate for: {goal}",
+            action_kind="read",
+            target_index=target,
+            value_ref=value_ref,
+            irreversibility="reversible",
+            success_check="status-fact-appeared",
+            say=facts[0].value if facts else "",
+        )
+
+
 class FakeIngest(Ingest):
     """doc → passages: deterministically splits text on blank lines (or decodes
     bytes first), one citable Passage per chunk."""
@@ -243,6 +312,7 @@ __all__ = [
     "FakeVoiceTransport",
     "FakeRetriever",
     "FakeSynthesizer",
+    "FakeReasoner",
     "FakeActuator",
     "FakeIngest",
     "FakeMemory",

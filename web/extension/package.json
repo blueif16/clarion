@@ -1,0 +1,14 @@
+{
+  "name": "clarion-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Clarion MV3 extension — relays the live tab's CDP to the local Python relay.",
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "interop": "node relay-interop.mjs"
+  },
+  "devDependencies": {
+    "ws": "^8.21.0"
+  }
+}
