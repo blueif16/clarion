@@ -440,6 +440,14 @@ class GeminiReasoner(Reasoner):
                     response_schema=schema,
                     # Keep it tight + deterministic for a decision, not prose.
                     temperature=0.0,
+                    # THINKING OFF — a config knob on the FIXED model, NOT a swap.
+                    # gemini-3.5-flash runs automatic thinking by default; the
+                    # thinking-tokens dominated decode latency (36–121s observed).
+                    # budget 0 = DISABLED (Context7 /googleapis/python-genai). The
+                    # decision is a structured selection over a fenced enum, not a
+                    # free chain-of-thought task — the audit-only scratch_reasoning
+                    # field carries the "reason first" requirement instead.
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             )
             return resp.text
