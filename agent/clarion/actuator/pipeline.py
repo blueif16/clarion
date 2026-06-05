@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from clarion.contracts.state import AxNode, PageDiff, SelectorMap
+from clarion.contracts.state import AxNode, Fact, PageDiff, PageReadout, SelectorMap
 
 # AX roles we treat as "interactive" for the numbered map (execution §4.1.5).
 # Anything outside this set is structural and never gets an index — only things
@@ -47,6 +47,23 @@ _INTERACTIVE_ROLES = {
     "spinbutton",
     "textarea",
 }
+
+# ORIENT (the screen-reader readout) reads STRUCTURE the numbered map omits: the
+# interactive map is action-only, but "what's on this page" also needs the page's
+# headings. Heading roles carry a level in their AX properties.
+_HEADING_ROLES = {"heading"}
+
+# Group the interactive roles into human-spoken affordance buckets for the ORIENT
+# readback ("3 fields you can fill: …"). Order = the order they're read aloud.
+_AFFORDANCE_GROUPS: tuple[tuple[str, frozenset[str]], ...] = (
+    (
+        "fields you can fill",
+        frozenset({"textbox", "searchbox", "textarea", "combobox", "spinbutton", "slider"}),
+    ),
+    ("buttons", frozenset({"button", "switch"})),
+    ("links", frozenset({"link", "menuitem", "tab"})),
+    ("choices", frozenset({"checkbox", "radio", "option", "listbox"})),
+)
 
 # ~4 chars/token is the common rough heuristic; the SelectorMap serialized to the
 # LLM is "[idx] role 'name'" per node, so we estimate from that line length.
@@ -383,3 +400,126 @@ def estimate_tokens(nodes: dict[int, AxNode]) -> int:
     for n in nodes.values():
         chars += len(f"[{n.index}] {n.role} '{n.name}'\n")
     return int(chars / _CHARS_PER_TOKEN)
+
+
+# ---------------------------------------------------------------------------
+# ORIENT — the grounded screen-reader readout (foundation §1, §3 on-ramp)
+# ---------------------------------------------------------------------------
+
+
+def _ax_name(ax: dict) -> str:
+    """The accessible name a screen reader would announce, trimmed."""
+    return ((ax.get("name") or {}).get("value", "") or "").strip()
+
+
+def _readout_summary(
+    title: str, headings: list[Fact], group_phrases: list[str]
+) -> str:
+    """Compose the single spoken readback from grounded parts. Ends on an open
+    prompt so the user states a goal (the goal is then confirmed, never assumed —
+    foundation §1 agentic clause applied to goal-setting)."""
+    parts: list[str] = []
+    where = title.strip()
+    if where:
+        parts.append(f"This is {where}.")
+    if headings:
+        parts.append("The main sections are: " + "; ".join(h.value for h in headings) + ".")
+    if group_phrases:
+        parts.append("On this page I can see " + "; ".join(group_phrases) + ".")
+    if not headings and not group_phrases:
+        parts.append(
+            "I can't find any labeled headings or controls on this page to read back."
+        )
+    parts.append("What would you like to do?")
+    return " ".join(parts)
+
+
+def summarize_ax_tree(
+    ax_tree: dict,
+    *,
+    title: str = "",
+    url: str = "",
+    max_headings: int = 6,
+    max_per_group: int = 8,
+) -> PageReadout:
+    """Turn a raw ``Accessibility.getFullAXTree`` response into a grounded
+    ``PageReadout`` — the ORIENT readback (headings + grouped affordances).
+
+    Every surfaced item carries the real AX ``nodeId`` as its ``source_node_id``
+    (foundation §1: no fact without a source). Pure over the AX dict — no provider
+    import, no geometry: we use the AX ``ignored`` flag to skip hidden nodes (this
+    reads the whole page's STRUCTURE, unlike ``build_candidates`` which keeps only
+    the interactive, on-screen subset for acting). Shared verbatim by both actuator
+    transports (Playwright + extension)."""
+    headings: list[Fact] = []
+    by_role: dict[str, list[Fact]] = {}
+    for ax in ax_tree.get("nodes", []) or []:
+        if ax.get("ignored"):
+            continue
+        name = _ax_name(ax)
+        if not name:
+            continue
+        node_id = str(ax.get("nodeId", ""))
+        if not node_id:
+            continue
+        role = (ax.get("role") or {}).get("value", "") or ""
+        fact = Fact(value=name, source_node_id=node_id, verified=True)
+        if role in _HEADING_ROLES:
+            headings.append(fact)
+        elif role in _INTERACTIVE_ROLES:
+            by_role.setdefault(role, []).append(fact)
+
+    affordances: list[Fact] = []
+    group_phrases: list[str] = []
+    for label, roles in _AFFORDANCE_GROUPS:
+        items: list[Fact] = []
+        for role in roles:
+            items.extend(by_role.get(role, []))
+        if not items:
+            continue
+        affordances.extend(items)
+        names = [f.value for f in items[:max_per_group]]
+        more = "" if len(items) <= max_per_group else f" (+{len(items) - max_per_group} more)"
+        group_phrases.append(f"{len(items)} {label}: {', '.join(names)}{more}")
+
+    summary = _readout_summary(title, headings[:max_headings], group_phrases)
+    return PageReadout(
+        title=title,
+        url=url,
+        headings=headings,
+        affordances=affordances,
+        summary=summary,
+    )
+
+
+def readout_from_selector_map(
+    sm: SelectorMap, *, title: str = "", url: str = "", max_per_group: int = 8
+) -> PageReadout:
+    """Fallback ORIENT readout built from the interactive ``SelectorMap`` alone
+    (actuators without ``describe_page`` — e.g. the cached/replay transport). Still
+    fully grounded (each node carries its ``node_id``); just no page headings,
+    since the numbered map is action-only."""
+    by_role: dict[str, list[Fact]] = {}
+    for node in sm.nodes.values():
+        name = (node.name or "").strip()
+        if not name or not node.node_id:
+            continue
+        by_role.setdefault(node.role, []).append(
+            Fact(value=name, source_node_id=node.node_id, verified=True)
+        )
+
+    affordances: list[Fact] = []
+    group_phrases: list[str] = []
+    for label, roles in _AFFORDANCE_GROUPS:
+        items: list[Fact] = []
+        for role in roles:
+            items.extend(by_role.get(role, []))
+        if not items:
+            continue
+        affordances.extend(items)
+        names = [f.value for f in items[:max_per_group]]
+        more = "" if len(items) <= max_per_group else f" (+{len(items) - max_per_group} more)"
+        group_phrases.append(f"{len(items)} {label}: {', '.join(names)}{more}")
+
+    summary = _readout_summary(title, [], group_phrases)
+    return PageReadout(title=title, url=url, affordances=affordances, summary=summary)
