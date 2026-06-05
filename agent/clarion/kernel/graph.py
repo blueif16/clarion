@@ -61,10 +61,12 @@ from clarion.contracts.state import (
     TraceEvent,
 )
 from clarion.kernel.irreversibility import classify
+from clarion.kernel.negative_verifier import verify_negative
 from clarion.kernel.policy import (
     assert_consented,
     assert_grounded,
     is_consented,
+    is_negative_claim,
     is_speakable_value,
     speakable,
 )
@@ -103,6 +105,14 @@ Mode = Literal["normal", "fast"]
 # the ranked top-K candidates, NOT all ~48 live ids, then re-measure decide_ms).
 _DEFAULT_TOPK = 12
 
+# Fast-mode cap: how many REVERSIBLE auto-acts the agent may chain before it MUST
+# surface a spoken progress beat / consent (architecture migration Step 5 — "cap
+# Fast to one reversible act before a spoken progress beat"). One. After one silent
+# reversible act the next consequential step is routed through CONSENT even if it
+# is reversible, so the blind user is never carried through a chain of silent
+# mutations without a checkpoint. A pure read-back never counts (no side-effect).
+_DEFAULT_FAST_ACT_CAP = 1
+
 
 class _PlanState(ClarionState, total=False):
     """The SUPERSET schema the de-hardcoded kernel + generic executor walk:
@@ -129,6 +139,11 @@ class _PlanState(ClarionState, total=False):
     success_check: str
     # The IrreversibilityGate's classification of the pending proposal.
     irreversibility: str
+    # The Fast-mode reversible-auto-act counter (the Step-5 cap). Incremented by
+    # ACT each time it performs a reversible act that did NOT route through
+    # CONSENT; read by ``consent_gate`` to force a spoken progress beat after the
+    # cap. A last-value-wins channel (NOT a reducer): ACT writes the running count.
+    fast_acts: int
 
 
 def make_checkpointer() -> InMemorySaver:
@@ -206,6 +221,7 @@ def build_kernel(
     mode: Mode = "normal",
     *,
     top_k: int = _DEFAULT_TOPK,
+    fast_act_cap: int = _DEFAULT_FAST_ACT_CAP,
 ):
     """Compile the GROUND→VERIFY→PROPOSE→IrreversibilityGate→⟨CONSENT⟩→ACT→CONFIRM
     kernel — the de-hardcoded spine (architecture Thesis: the LLM decides, the
@@ -235,12 +251,20 @@ def build_kernel(
     # ---- GROUND ----------------------------------------------------------
     async def ground(state: ClarionState) -> dict:
         """Retrieve goal-relevant fact(s) for this step via the Retriever port.
-        Timestamps query-fire → first-fact for the §8 latency meter."""
+        Timestamps query-fire → first-fact for the §8 latency meter.
+
+        Also RESETS the Step-5 Fast-cap counter: the silent reversible-act budget
+        is PER KERNEL PASS (one GROUND→ACT→CONFIRM drive). A fresh ``ainvoke`` runs
+        GROUND, so each driven turn / re-driven subgoal starts the budget clean —
+        the spoken progress beat that resets it IS the planner/executor re-entry
+        that re-grounds. (This also keeps the counter from leaking across the stage
+        executor's per-subgoal kernel re-drives — the budget is local to a pass.)"""
         t0 = time.time()
         facts = await retriever.query(state["goal"])
         retrieval_ms = (time.time() - t0) * 1000.0
         return {
             "grounded_facts": list(facts),
+            "fast_acts": 0,
             # Reducer channel: return ONLY the new event (operator.add concatenates).
             "trace": [
                 _trace("GROUND", "exit", n_facts=len(facts), retrieval_ms=retrieval_ms)
@@ -343,6 +367,47 @@ def build_kernel(
             # read (or a value-less step that resolved to nothing): a grounded
             # read-back of the membership-fenced say / sayable facts.
             say = step.say if (step.say and is_speakable_value(step.say, facts)) else ""
+            # --- honest-decline (NegativeVerifier, fence #5) ------------------
+            # A spoken NEGATIVE ("no late fee") is permitted ONLY from a
+            # closed-world search over grounded_facts finding no asserting node AND
+            # coverage evidence (a grounded `absent`-polarity fact read off the
+            # perceived region). Else DOWNGRADE TO A HEDGE — a charge rendered as an
+            # image (invisible to the AXTree) must NEVER become a confident "no late
+            # fee" (architecture migration Step 5 killer acceptance). The positive
+            # read-back path is already fenced by membership (#2); only an asserted
+            # negative routes through the verifier.
+            negative_topic = step.say if (step.say and is_negative_claim(step.say)) else ""
+            if negative_topic:
+                verdict = verify_negative(negative_topic, facts)
+                if not verdict.speak:
+                    # Cannot prove the negative → hedge, never a confident negative.
+                    proposal = Proposal(
+                        id=proposal_id,
+                        utterance=(
+                            "I couldn't confirm that either way from what I can read "
+                            "on this page, so I don't want to guess."
+                        ),
+                        action=Action(kind="read", index=None, irreversible=False),
+                        irreversible=False,
+                    )
+                    return {
+                        "pending_proposal": proposal,
+                        "pending_step": step,
+                        "success_check": step.success_check,
+                        "trace": [
+                            _trace(
+                                "PROPOSE",
+                                "info",
+                                hedged=verdict.reason,
+                                proposal_id=proposal_id,
+                            ),
+                            _trace(
+                                "PROPOSE", "exit", proposal_id=proposal_id, irreversible=False
+                            ),
+                        ],
+                    }
+                # Covered negative: speak the grounded `absent` fact verbatim, sourced.
+                say = negative_topic
             if not say:
                 say = ", ".join(f.value for f in sayable) or "no grounded facts yet"
             action = Action(kind="read", index=step.target_index)
@@ -407,26 +472,36 @@ def build_kernel(
     def consent_gate(
         state: _PlanState,
     ) -> Literal["consent", "act"]:
-        """The ``mode``-conditional edge (foundation §5 / killer-closer #2).
+        """The ``mode``-conditional edge (foundation §5 / killer-closer #2 + the
+        Step-5 Fast-cap).
 
         Normal → always route through CONSENT (every consequential step interrupts).
         Fast   → auto-proceed (skip straight to ACT) ONLY when the
-                 IrreversibilityGate classified the step ``reversible``; an
-                 ``irreversible`` OR ``unknown`` step ALWAYS routes through CONSENT.
+                 IrreversibilityGate classified the step ``reversible`` AND the
+                 reversible-auto-act cap has not been reached; an ``irreversible``
+                 OR ``unknown`` step ALWAYS routes through CONSENT, and a reversible
+                 step that would exceed ``fast_act_cap`` is ALSO routed through
+                 CONSENT (forcing a spoken progress beat so the blind user is never
+                 chained through silent mutations — architecture migration Step 5).
 
         Reads the gate's flag off the proposal (set authoritatively by
-        ``irreversibility_gate``); ``mode`` is closed over from ``build_kernel``.
-        A degenerate read-back (a ``read`` action) auto-proceeds — it has no
-        side-effect to gate.
+        ``irreversibility_gate``) and the running ``fast_acts`` counter; ``mode``
+        and ``fast_act_cap`` are closed over from ``build_kernel``. A degenerate
+        read-back (a ``read`` action) auto-proceeds — it has no side-effect to gate
+        and does not consume the cap.
         """
         proposal = state["pending_proposal"]
         if proposal is None:
             return "act"
-        # A pure read-back never gates (no side-effect).
+        # A pure read-back never gates (no side-effect) and never consumes the cap.
         if proposal.action is not None and proposal.action.kind == "read":
             return "act"
         if mode == "fast" and not proposal.irreversible:
-            return "act"
+            # The Step-5 cap: only auto-proceed if we are still under the budget of
+            # silent reversible acts; otherwise force a spoken progress beat / yes.
+            if state.get("fast_acts", 0) < fast_act_cap:
+                return "act"
+            return "consent"
         return "consent"
 
     # ---- ⟨CONSENT⟩ -------------------------------------------------------
@@ -506,7 +581,18 @@ def build_kernel(
         assert_consented(proposal, state["consent_log"])
 
         obs = await actuator.act(proposal.action)
-        return {
+
+        # Step-5 Fast-cap bookkeeping: a REVERSIBLE act that did NOT route through
+        # CONSENT is a silent auto-act — count it so the next consequential step is
+        # forced to a spoken progress beat. An approved (consented) act or a pure
+        # read does not consume the silent-act budget; a consented act resets it
+        # (the user just got a checkpoint). A ``read`` never reaches ACT's act()
+        # with a side-effect, but guard against it anyway.
+        is_read = proposal.action.kind == "read"
+        silent_auto_act = (
+            not went_through_consent and not proposal.irreversible and not is_read
+        )
+        out: dict = {
             "page_index": obs.selector_map,
             "trace": [
                 # The once-flag marker — its presence in the reducer-accumulated
@@ -520,6 +606,12 @@ def build_kernel(
                 _trace("ACT", "exit", success=obs.success),
             ],
         }
+        if silent_auto_act:
+            out["fast_acts"] = state.get("fast_acts", 0) + 1
+        elif went_through_consent:
+            # A consented checkpoint just happened → the spoken-beat budget resets.
+            out["fast_acts"] = 0
+        return out
 
     # ---- CONFIRM ---------------------------------------------------------
     async def confirm(state: ClarionState) -> dict:
