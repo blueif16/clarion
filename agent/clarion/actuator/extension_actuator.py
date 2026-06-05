@@ -90,8 +90,14 @@ class ExtensionActuator(Actuator):
         self._index_to_backend_id: dict[int, int] = {}
         # index -> bbox [x,y,w,h] for coordinate clicks.
         self._index_to_bbox: dict[int, list[float]] = {}
+        # index -> stable node_id (so a fill can record WHICH node it filled).
+        self._index_to_node_id: dict[int, str] = {}
         self._clarion_counter = 0
         self._domains_enabled = False
+        # node_id of every input we have SUCCESSFULLY filled — re-stamped as
+        # ``state["filled"]=True`` in later perceive maps (the AX tree drops the
+        # typed value). Parity with the Playwright transport's same tracker.
+        self._filled_node_ids: set[str] = set()
 
     # --- lifecycle ----------------------------------------------------------
 
@@ -149,18 +155,26 @@ class ExtensionActuator(Actuator):
         self._index_to_clarion_id = {}
         self._index_to_backend_id = {}
         self._index_to_bbox = {}
+        self._index_to_node_id = {}
         order_reading(kept)
         for index, c in enumerate(kept):
+            state = dict(c["state"])
+            # Re-stamp the actuator-known `filled` flag (the AX tree drops the typed
+            # value; restore the signal the generic done-check needs). Parity with
+            # the Playwright transport.
+            if c["node_id"] in self._filled_node_ids:
+                state["filled"] = True
             nodes[index] = AxNode(
                 index=index,
                 role=c["role"],
                 name=c["name"],
-                state=c["state"],
+                state=state,
                 bbox=c["bbox"],
                 node_id=c["node_id"],
             )
             self._index_to_backend_id[index] = c["backend_id"]
             self._index_to_bbox[index] = c["bbox"]
+            self._index_to_node_id[index] = c["node_id"]
 
         sm = SelectorMap(nodes=nodes, token_estimate=estimate_tokens(nodes))
         perceive_ms = (time.perf_counter() - t0) * 1000.0
@@ -282,6 +296,12 @@ class ExtensionActuator(Actuator):
         )
         value = (res.get("result") or {}).get("value") or {}
         ok = bool(value.get("ok"))
+        if ok:
+            # Record the filled node by stable node_id BEFORE re-perceiving, so the
+            # fresh map stamps ``state["filled"]=True`` (parity with Playwright).
+            filled_node_id = self._index_to_node_id.get(action.index)
+            if filled_node_id:
+                self._filled_node_ids.add(filled_node_id)
         after = await self.perceive()
         return Observation(
             selector_map=after,

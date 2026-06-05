@@ -167,17 +167,33 @@ def _is_filled(node: AxNode) -> bool:
 def _field_nonempty(before: SelectorMap, after: SelectorMap) -> bool:
     """A FILL worked: some fillable field that was blank before now carries a
     value (keyed by node_id so a re-numbered index doesn't fool us). Vacuously
-    False if there were no fillable fields to fill."""
+    False if there were no fillable fields to fill.
+
+    Two independent newly-filled signals (either certifies):
+      1. The authoritative ``filled`` flag transitioned False→True. The actuator
+         stamps ``state["filled"]`` on a node it just successfully filled (the AX
+         tree drops the typed value, so the LABEL name never changes — a
+         name-based heuristic alone can never see a real text fill into a *labeled*
+         field). This is the real-world path.
+      2. The accessible-name transitioned blank→non-blank (the field surfaces its
+         value AS its name, e.g. a value-echoing control). The original heuristic,
+         kept for those controls + the synthetic test model.
+    A field already filled before the step does NOT count (a no-op would else pass)."""
     after_fillable = [n for n in after.nodes.values() if n.role in _FILLABLE_ROLES]
     if not after_fillable:
         return False
     before_by_id = {n.node_id: n for n in before.nodes.values()}
     for n in after_fillable:
         was = before_by_id.get(n.node_id)
-        # newly-filled (blank→value): the field is now non-empty AND it either
-        # did not exist before or was blank before. A field that was already
-        # filled does NOT count (no-op step would otherwise pass).
-        if _is_filled(n) and (was is None or not _is_filled(was)):
+        # (1) the explicit filled-flag transition (authoritative, labeled fields).
+        now_flagged = n.state.get("filled") is True
+        was_flagged = was is not None and was.state.get("filled") is True
+        if now_flagged and not was_flagged:
+            return True
+        # (2) the accessible-name transition blank→value (value-echoing controls).
+        now_named = bool(n.name.strip())
+        was_named = was is not None and bool(was.name.strip())
+        if now_named and (was is None or not was_named) and not now_flagged:
             return True
     return False
 
