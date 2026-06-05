@@ -22,13 +22,17 @@ and cannot be silently bypassed by a node that "forgot" to check.
 
 from __future__ import annotations
 
-from clarion.contracts.state import Consent, Fact, Proposal
+from clarion.contracts.state import Consent, Fact, PairedFact, Proposal
 
 __all__ = [
     "assert_grounded",
     "is_grounded",
+    "is_member",
+    "is_speakable_value",
+    "pairing_backs",
     "is_consented",
     "assert_consented",
+    "speakable",
     "PolicyViolation",
 ]
 
@@ -75,6 +79,53 @@ def assert_grounded(facts: list[Fact]) -> list[Fact]:
 def speakable(facts: list[Fact]) -> list[Fact]:
     """The facts the agent is allowed to say out loud: grounded AND verified."""
     return [f for f in facts if is_grounded(f) and f.verified]
+
+
+# ---------------------------------------------------------------------------
+# VERIFY set-membership + pairing fence (architecture invariant fences #2/#3)
+#
+# Upgrades the hollow ``source_node_id != None`` check: a value is speakable only
+# if it is byte-identical to a Fact CURRENTLY in ``grounded_facts`` (membership,
+# fence #2) AND — for an "X is Y" claim — a single ``PairedFact`` backs both
+# halves from the SAME perceive cycle (pairing-correctness, fence #3). AG-PAIR's
+# warning: AX nodeIds renumber across loads, so a stale pairing must not back a
+# claim on a freshly-perceived page — callers pass the live ``paired_facts``.
+#
+# Pure: no I/O, no SDK. The kernel calls these AT VERIFY before forming the say.
+# ---------------------------------------------------------------------------
+
+
+def is_member(value: str, grounded_facts: list[Fact]) -> bool:
+    """Fence #2 (set-membership). True iff ``value`` is byte-identical to the
+    value of a Fact CURRENTLY in ``grounded_facts`` — replacing the hollow
+    ``source_node_id != None`` check. A restated / paraphrased / fabricated span
+    is not a member, so it can never be spoken. (Membership over the LIVE set, not
+    a stale snapshot: a value read off the page last cycle but gone this cycle is
+    no longer a member.)"""
+    return any(f.value == value for f in grounded_facts)
+
+
+def is_speakable_value(value: str, grounded_facts: list[Fact]) -> bool:
+    """A scalar value is speakable iff it is a member of the live grounded set
+    (fence #2) AND that member is itself ``speakable`` (grounded + verified —
+    fences #1/#4). The single membership gate the kernel calls before speaking a
+    standalone value (no pairing claim)."""
+    return any(
+        f.value == value and is_grounded(f) and f.verified for f in grounded_facts
+    )
+
+
+def pairing_backs(
+    label_text: str, value_text: str, paired_facts: list[PairedFact]
+) -> bool:
+    """Fence #3 (pairing-correctness). True iff a SINGLE ``PairedFact`` from the
+    current perceive cycle backs both halves of an "X is Y" claim byte-identically
+    (``PairedFact.backs``). Two separate true facts that no single geometric
+    pairing joins return False — the mis-pairing (the past-due row's ``$142.10``
+    read as the amount due) is ungroundable and refused. The caller passes the
+    facts harvested THIS cycle so a renumbered/stale pairing cannot back a claim
+    on a fresh page (AG-PAIR's nodeId-renumber warning)."""
+    return any(p.backs(label_text, value_text) for p in paired_facts)
 
 
 # ---------------------------------------------------------------------------

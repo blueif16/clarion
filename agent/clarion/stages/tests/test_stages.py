@@ -1,29 +1,38 @@
-"""ST1 — stage-graph acceptance tests (execution §15 ST1 / §3).
+"""ST1 — LEGACY stage-graph acceptance tests — QUARANTINED (Wave-C de-hardcoding).
 
-The five required conditions, each isolated:
-  (1) planner emits the six named stages in order, each with a registered
-      done_predicate + a negative_checks list (execution §3.2).
-  (2) a SelectorMap with a BLANK required field → FILL done-predicate returns
-      False (the stage cannot advance) (ST1 accept #2 / §3.2 FILL negative).
-  (3) a SelectorMap containing a textbox with a role but an EMPTY accessible name
-      → RESCUE detection fires (ST1 accept #3 / §3 note).
-  (4) a happy-path SelectorMap → FILL done-predicate True, advances.
-  (5) the stage/planner nodes return ONLY-NEW trace entries — no double-count
-      under the operator.add reducer (§18.7).
+These 12 tests pin the DELETED hardcoded pay topology (AUTH→LOCATE→FILL→REVIEW→
+⟨PAY⟩→CONFIRM, the §3.2 done-predicate/negative-check table, the per-stage node
+advance). The Wave-C migration (architecture Step 3) replaced that baked topology
+with the GENERIC EXECUTOR (a Reasoner-derived ``list[Subgoal]`` + the kernel loop
+per subgoal + the generic ``evaluate_success_check``), so every assertion here is
+red-by-design.
 
-Pure: uses the FakeRetriever/FakeActuator from clarion.fakes (+ tiny scripted
-actuators); imports zero provider SDKs (foundation §6).
+Per the migration plan they are NOT deleted — they are QUARANTINED so the rest of
+the suite stays green; AG-GREEN rewrites them as the generic spec in Wave D
+(invariant tests: ungrounded/mispaired/uncovered → refused; model-reversible
+submit still can't reach ACT in Fast; no-op doesn't advance).
+
+Module-level skip (the topology symbols this module imported — ``HERO_STAGE_IDS``,
+``plan_goal('pay my electric bill')``, the DONE_PREDICATES registry — no longer
+exist, so collection itself must not crash: we guard the imports and skip).
 """
 
 from __future__ import annotations
 
 import uuid
 
-from langgraph.types import Command
+import pytest
 
-from clarion.contracts.events import ConsentDecision
-from clarion.contracts.ports import Actuator, Retriever
-from clarion.contracts.state import (
+pytestmark = pytest.mark.skip(
+    reason="legacy pay-topology (AUTH→…→CONFIRM); AG-GREEN rewrites as the generic "
+    "spec (Wave D). Quarantined by AG-KERNEL during the Reasoner de-hardcoding."
+)
+
+from langgraph.types import Command  # noqa: E402
+
+from clarion.contracts.events import ConsentDecision  # noqa: E402
+from clarion.contracts.ports import Actuator, Retriever  # noqa: E402
+from clarion.contracts.state import (  # noqa: E402
     Action,
     AxNode,
     Fact,
@@ -31,21 +40,26 @@ from clarion.contracts.state import (
     PageDiff,
     SelectorMap,
 )
-from clarion.fakes import FakeActuator, FakeRetriever
-from clarion.stages.graph import build_stage_graph, seed_stage_state
-from clarion.stages.planner import HERO_STAGE_IDS, plan_goal, verbalize_plan
-from clarion.stages.predicates import (
-    DONE_PREDICATES,
-    NEGATIVE_CHECKS,
-    detect_rescue,
-    fill_done,
-    is_choked_widget,
-    needs_rescue,
-    no_required_field_blank,
-    resolve_done_predicate,
-    resolve_negative_check,
-)
-from clarion.kernel.graph import seed_state
+from clarion.fakes import FakeActuator, FakeRetriever  # noqa: E402
+from clarion.kernel.graph import seed_state  # noqa: E402
+
+# The deleted pay-topology symbols this legacy module referenced. Stubbed to None
+# so module import (collection) succeeds; every test is skipped above, so the
+# NameErrors they would raise are never reached. AG-GREEN deletes these.
+HERO_STAGE_IDS = ()
+plan_goal = None  # type: ignore[assignment]
+verbalize_plan = None  # type: ignore[assignment]
+build_stage_graph = None  # type: ignore[assignment]
+seed_stage_state = None  # type: ignore[assignment]
+DONE_PREDICATES: dict = {}
+NEGATIVE_CHECKS: dict = {}
+detect_rescue = None  # type: ignore[assignment]
+fill_done = None  # type: ignore[assignment]
+is_choked_widget = None  # type: ignore[assignment]
+needs_rescue = None  # type: ignore[assignment]
+no_required_field_blank = None  # type: ignore[assignment]
+resolve_done_predicate = None  # type: ignore[assignment]
+resolve_negative_check = None  # type: ignore[assignment]
 
 
 def _cfg() -> dict:
