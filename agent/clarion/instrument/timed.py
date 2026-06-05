@@ -22,9 +22,65 @@ This module is **pure**: stdlib only + the frozen contracts. No provider SDKs.
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
+from typing import Iterator
 
 from clarion.contracts.ports import Retriever
 from clarion.contracts.state import Fact
+
+
+class Timed:
+    """A tiny reusable wall-clock stopwatch for the migration latency budget.
+
+    The migration (``docs/clarion-architecture.md`` step 0) needs per-phase
+    millisecond numbers — ``perceive_ms`` / ``decide_ms`` / ``stale_check_ms`` /
+    ``turn_ms`` — read straight out of a log file on a REAL page. ``Timed`` is the
+    one shared facility: a named context manager that records the elapsed ms of
+    the most recent block as ``last_ms`` and (optionally) reports it via a sink.
+
+    Pure stdlib + frozen contracts; no provider SDK, no logging framework — the
+    sink is just a ``callable(name, ms)`` the caller supplies (``print`` in the
+    worker so the number lands in ``/tmp/clarion-worker.log``).
+
+    Usage::
+
+        meter = Timed("perceive_ms", sink=lambda n, ms: print(f"[lat] {n}={ms:.1f}"))
+        with meter:
+            sm = await actuator.perceive()
+        # meter.last_ms holds the elapsed ms (also reported via the sink)
+
+    The same instance can be reused across calls; ``last_ms`` always reflects the
+    most recent block (``None`` before the first).
+    """
+
+    def __init__(self, name: str, *, sink=None) -> None:
+        self.name = name
+        self._sink = sink
+        self.last_ms: float | None = None
+        self._t0: float | None = None
+
+    def __enter__(self) -> "Timed":
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._t0 is not None:
+            self.last_ms = (time.perf_counter() - self._t0) * 1000.0
+            self._t0 = None
+            if self._sink is not None:
+                self._sink(self.name, self.last_ms)
+        # Do not suppress exceptions.
+        return None
+
+
+@contextmanager
+def timed(name: str, *, sink=None) -> Iterator[Timed]:
+    """One-shot stopwatch: ``with timed("perceive_ms", sink=print) as t: ...`` then
+    read ``t.last_ms``. A thin wrapper over ``Timed`` for callers that don't want
+    to hold the instance (the worker reuses a ``Timed`` instead)."""
+    m = Timed(name, sink=sink)
+    with m:
+        yield m
 
 
 class TimedRetriever(Retriever):
@@ -81,4 +137,4 @@ class TimedRetriever(Retriever):
         return stamped
 
 
-__all__ = ["TimedRetriever"]
+__all__ = ["TimedRetriever", "Timed", "timed"]

@@ -53,6 +53,14 @@ _INTERACTIVE_ROLES = {
 # headings. Heading roles carry a level in their AX properties.
 _HEADING_ROLES = {"heading"}
 
+# GROUND reads the page's readable TEXT CONTENT — where a task's actual VALUES live
+# ("$84.32", "June 15, 2026", an account number). These are exactly the nodes the
+# numbered interactive map and the ORIENT readout both DROP (they keep affordances
+# + headings, not body text). ``extract_text_facts`` harvests them, each grounded
+# to its real AX nodeId, as the page-grounded GROUND source — replacing any
+# fixture constant (foundation §1: no fact without a source; absence stays absent).
+_TEXT_CONTENT_ROLES = {"StaticText", "heading", "paragraph"}
+
 # Group the interactive roles into human-spoken affordance buckets for the ORIENT
 # readback ("3 fields you can fill: …"). Each entry is (singular, plural, roles);
 # the readback picks singular/plural by count so "1 field" reads right. Order = the
@@ -107,6 +115,27 @@ _READ_JS = """
   if (!el) return null;
   if ('value' in el && el.value !== undefined) return el.value;
   return (el.textContent || '').trim();
+}
+"""
+
+# Target-node-only incremental re-perceive (migration step 1): read ONE already-
+# stamped node's live geometry + accessible name in a single in-page pass, so a
+# freshness re-check (e.g. the DeliveryGate's "is this index still here/where I
+# think?" between a "yes" and the act) costs one round-trip instead of a full
+# perceive. Returns null if the node is gone (detached/removed). bbox is
+# [x,y,w,h] in CSS px, matching the SelectorMap's bbox convention. Shared by both
+# transports (Playwright via page.evaluate, extension via Runtime.evaluate).
+_NODE_STATE_JS = """
+(clarionId) => {
+  const el = document.querySelector('[data-clarion-id="' + clarionId + '"]');
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return {
+    bbox: [r.x, r.y, r.width, r.height],
+    name: (el.getAttribute('aria-label')
+           || el.textContent || el.value || '').trim(),
+    disabled: !!el.disabled,
+  };
 }
 """
 
@@ -524,3 +553,55 @@ def readout_from_selector_map(
     affordances, group_phrases = _group_affordances(by_role, max_per_group=max_per_group)
     summary = _readout_summary(title, [], group_phrases)
     return PageReadout(title=title, url=url, affordances=affordances, summary=summary)
+
+
+# ---------------------------------------------------------------------------
+# GROUND — the page-grounded fact source (foundation §1, kills the fixture)
+# ---------------------------------------------------------------------------
+
+
+def extract_text_facts(ax_tree: dict, *, max_facts: int = 60) -> list[Fact]:
+    """Harvest the page's readable TEXT as grounded ``Fact``s — the page-grounded
+    GROUND source that replaces the ``HeroRetriever`` fixture.
+
+    Unlike ``summarize_ax_tree`` (headings + interactive affordances, for the
+    ORIENT readback), this keeps the StaticText/heading CONTENT nodes — where the
+    actual values a task needs live ("$84.32", "June 15, 2026", an account number).
+    Those are precisely the nodes the numbered map and the ORIENT readout drop.
+
+    Every ``Fact`` carries the real AX ``nodeId`` it was read from, so the
+    epistemic clause (``policy.assert_grounded``) lets it be spoken. A page that
+    does NOT contain a value simply yields no Fact for it — honest absence, so the
+    kernel grounds nothing and declines rather than ever speaking a fixture
+    constant the real page never showed (foundation §1).
+
+    Pure over the raw ``Accessibility.getFullAXTree`` dict (no provider import, no
+    geometry). Shared verbatim by both actuator transports (Playwright + extension).
+
+    Dedup is by case-folded text (the AX tree repeats a string across a node and
+    its ``InlineTextBox`` leaves); the synthetic leaves carry NEGATIVE nodeIds and
+    are filtered so every surfaced fact points at a real, resolvable node."""
+    facts: list[Fact] = []
+    seen: set[str] = set()
+    for ax in ax_tree.get("nodes", []) or []:
+        if ax.get("ignored"):
+            continue
+        role = (ax.get("role") or {}).get("value", "") or ""
+        if role not in _TEXT_CONTENT_ROLES:
+            continue
+        name = _ax_name(ax)
+        if not name:
+            continue
+        node_id = str(ax.get("nodeId", ""))
+        # A real, positive AX nodeId only (InlineTextBox leaves carry synthetic
+        # negative ids and merely duplicate their StaticText parent's text).
+        if not node_id or node_id.startswith("-"):
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append(Fact(value=name, source_node_id=node_id, verified=True))
+        if len(facts) >= max_facts:
+            break
+    return facts

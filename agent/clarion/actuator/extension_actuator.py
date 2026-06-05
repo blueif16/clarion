@@ -34,16 +34,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from typing import Optional
 
 from clarion.actuator.pipeline import (
     PaintOrderRemover,
     _NATIVE_SETTER_JS,
+    _NODE_STATE_JS,
     _READ_JS,
     build_candidates,
     containment_filter,
     diff_maps,
     estimate_tokens,
+    extract_text_facts,
     order_reading,
     parse_snapshot,
     summarize_ax_tree,
@@ -53,6 +56,7 @@ from clarion.contracts.ports import Actuator
 from clarion.contracts.state import (
     Action,
     AxNode,
+    Fact,
     Observation,
     PageDiff,
     PageReadout,
@@ -76,7 +80,11 @@ class ExtensionActuator(Actuator):
     def __init__(self, relay: CdpRelay) -> None:
         self._relay = relay
         # index -> the clarion id we stamp on the real element for exact resolve.
+        # Filled LAZILY: empty after perceive; an entry appears only once an index
+        # is actually acted/read (``_ensure_stamped``).
         self._index_to_clarion_id: dict[int, str] = {}
+        # index -> backend node id (in hand from perceive; the input to lazy stamp).
+        self._index_to_backend_id: dict[int, int] = {}
         # index -> bbox [x,y,w,h] for coordinate clicks.
         self._index_to_bbox: dict[int, list[float]] = {}
         self._clarion_counter = 0
@@ -96,7 +104,18 @@ class ExtensionActuator(Actuator):
     # --- Actuator port ------------------------------------------------------
 
     async def perceive(self) -> SelectorMap:
-        """Run the §4.1 pipeline over the relay and return the numbered map."""
+        """Run the §4.1 pipeline over the relay and return the numbered map.
+
+        **Lazy stamping (migration step 1):** perceive stamps ZERO nodes. It runs
+        the 3-call triple-fetch + the pure pipeline, then records only
+        ``index -> backend_id`` (already in hand). The ``data-clarion-id`` for an
+        index is written on the FIRST act/read/read_value on it (``_ensure_stamped``
+        — one push + one setAttribute). This collapses the old ~2-round-trip-per-
+        node loop (90 round-trips on a 45-node page) to 0 in perceive and ~2 only at
+        act time. Parity with the Playwright transport is preserved: the returned
+        SelectorMap's ``(index, role, name, bbox)`` are produced identically — only
+        WHEN the id is stamped moved (perceive → first resolve)."""
+        t0 = time.perf_counter()
         await self._enable_domains()
 
         # 1. Parallel CDP triple-fetch — the exact same three calls (and params)
@@ -120,14 +139,15 @@ class ExtensionActuator(Actuator):
         candidates = build_candidates(ax_tree, layout_by_backend, remover)
         kept = containment_filter(candidates)
 
-        # 5. Sequential indices → SelectorMap, stamping each kept node via the
-        #    relay so act/read resolve it exactly.
+        # 5. Sequential indices → SelectorMap. LAZY: record index -> backend_id and
+        #    leave the clarion-id unstamped; the first act/read on an index stamps
+        #    only that one node. NO per-node relay round-trip here.
         nodes: dict[int, AxNode] = {}
         self._index_to_clarion_id = {}
+        self._index_to_backend_id = {}
         self._index_to_bbox = {}
         order_reading(kept)
         for index, c in enumerate(kept):
-            clarion_id = await self._stamp(c["backend_id"])
             nodes[index] = AxNode(
                 index=index,
                 role=c["role"],
@@ -136,10 +156,19 @@ class ExtensionActuator(Actuator):
                 bbox=c["bbox"],
                 node_id=c["node_id"],
             )
-            self._index_to_clarion_id[index] = clarion_id
+            self._index_to_backend_id[index] = c["backend_id"]
             self._index_to_bbox[index] = c["bbox"]
 
-        return SelectorMap(nodes=nodes, token_estimate=estimate_tokens(nodes))
+        sm = SelectorMap(nodes=nodes, token_estimate=estimate_tokens(nodes))
+        perceive_ms = (time.perf_counter() - t0) * 1000.0
+        # Emit the migration latency number so it lands in /tmp/clarion-worker.log.
+        # Lazy stamping: 3 fetch round-trips, 0 stamp round-trips in perceive.
+        print(
+            f"  [lat] perceive_ms={perceive_ms:.1f} nodes={len(nodes)} "
+            f"stamp_round_trips=0 (lazy)",
+            flush=True,
+        )
+        return sm
 
     async def describe_page(self) -> PageReadout:
         """ORIENT readout over the relay transport — the SAME shared summarizer as
@@ -151,6 +180,16 @@ class ExtensionActuator(Actuator):
         title = await self._eval_string("document.title")
         url = await self._eval_string("location.href")
         return summarize_ax_tree(ax_tree, title=title, url=url)
+
+    async def read_facts(self) -> list[Fact]:
+        """GROUND source over the relay transport — the SAME shared pure
+        ``extract_text_facts`` as the Playwright path. Harvests the live tab's
+        readable text as grounded ``Fact``s (each sourced to a real AX ``nodeId``)
+        so the kernel's GROUND reads the user's REAL page, never a fixture
+        (foundation §1). The ``PageRetriever`` calls this."""
+        await self._enable_domains()
+        ax_tree = await self._relay.send("Accessibility.getFullAXTree")
+        return extract_text_facts(ax_tree)
 
     async def _eval_string(self, expression: str) -> str:
         """Evaluate a string-returning JS expression over the relay (title/url for
@@ -200,7 +239,7 @@ class ExtensionActuator(Actuator):
                 success=False,
                 detail="fill requires index and value",
             )
-        clarion_id = self._index_to_clarion_id.get(action.index)
+        clarion_id = await self._ensure_stamped(action.index)
         if clarion_id is None:
             return Observation(
                 selector_map=await self.perceive(),
@@ -268,7 +307,7 @@ class ExtensionActuator(Actuator):
                 success=False,
                 detail="read requires index",
             )
-        clarion_id = self._index_to_clarion_id.get(action.index)
+        clarion_id = await self._ensure_stamped(action.index)
         if clarion_id is None:
             return Observation(
                 selector_map=await self.perceive(),
@@ -288,7 +327,7 @@ class ExtensionActuator(Actuator):
         Not part of the ``Actuator`` port — the honest way to prove a field was
         actually filled (vs merely that we *called* fill). Mirrors the Playwright
         transport's read-back utility."""
-        clarion_id = self._index_to_clarion_id.get(index)
+        clarion_id = await self._ensure_stamped(index)
         if clarion_id is None:
             return None
         value = await self._read_clarion(clarion_id)
@@ -304,10 +343,60 @@ class ExtensionActuator(Actuator):
         )
         return (res.get("result") or {}).get("value")
 
+    async def reperceive_node(self, index: int) -> Optional[AxNode]:
+        """Target-node-only incremental re-perceive (migration step 1).
+
+        Re-read ONE node's live geometry + name in a single round-trip (after
+        lazy-stamping it once), without rebuilding the whole map — the cheap
+        freshness re-check the DeliveryGate will use between a "yes" and the act so
+        a stale index is caught instead of clicked. Returns a fresh ``AxNode`` for
+        the index, or ``None`` if the node is gone or the index isn't mapped. The
+        role is carried over from the last full perceive (it doesn't change for a
+        stable element); bbox/name/disabled come live from the page."""
+        clarion_id = await self._ensure_stamped(index)
+        if clarion_id is None:
+            return None
+        arg = json.dumps(clarion_id)
+        expr = f"({_NODE_STATE_JS})({arg})"
+        res = await self._relay.send(
+            "Runtime.evaluate",
+            {"expression": expr, "returnByValue": True},
+        )
+        state = (res.get("result") or {}).get("value")
+        if not state:
+            return None
+        prev = self._index_to_bbox.get(index)
+        bbox = state.get("bbox") or prev or [0.0, 0.0, 0.0, 0.0]
+        self._index_to_bbox[index] = bbox
+        return AxNode(
+            index=index,
+            role="",  # not re-read; the caller already knows it from perceive
+            name=state.get("name") or "",
+            state={"disabled": bool(state.get("disabled"))},
+            bbox=bbox,
+            node_id="",
+        )
+
     # --- perception internals (transport-specific) -------------------------
     # The pure §4 pipeline lives in clarion.actuator.pipeline and is shared
     # verbatim with PlaywrightActuator. Only the CDP transport + the id stamp
     # differ per actuator.
+
+    async def _ensure_stamped(self, index: int) -> Optional[str]:
+        """Lazy-resolve an index to its ``data-clarion-id``, stamping the single
+        node on first use (migration step 1). Returns the clarion id (stamping it
+        via ``_stamp`` if not yet stamped) or ``None`` if the index isn't in the
+        current map. This is the ~2-round-trip cost the eager perceive loop used to
+        pay for EVERY node — now paid once, only for the node actually acted on."""
+        cached = self._index_to_clarion_id.get(index)
+        if cached is not None:
+            return cached
+        backend_id = self._index_to_backend_id.get(index)
+        if backend_id is None:
+            return None
+        clarion_id = await self._stamp(backend_id)
+        self._index_to_clarion_id[index] = clarion_id
+        return clarion_id
 
     async def _stamp(self, backend_id: int) -> str:
         """Stamp a stable ``data-clarion-id`` on the real element so act/read can

@@ -80,9 +80,14 @@ _HERO_FACTS: dict[str, list[Fact]] = {
 
 
 class HeroRetriever(Retriever):
-    """Deterministic, source-referenced facts for the hero goal. Stands in for
-    Moss (deferred). Matches a query against ``_HERO_FACTS`` substrings; falls back
-    to a single grounded echo fact so the grounding clause always has a source."""
+    """Deterministic, source-referenced facts for the hero goal.
+
+    NOTE (Gap 1): the LIVE runtime no longer grounds on this — it grounds on the
+    real page via ``clarion.app.page_retriever.PageRetriever``. This class is
+    RETAINED only as a deterministic test double (its ``source_node_id``s like
+    ``"acct::balance"`` are synthetic and match no real node, so it must never feed
+    a live run). Matches a query against ``_HERO_FACTS`` substrings; falls back to a
+    single grounded echo fact so the grounding clause always has a source."""
 
     def __init__(self, corpus: Optional[dict[str, list[Fact]]] = None) -> None:
         self.corpus = corpus if corpus is not None else _HERO_FACTS
@@ -277,8 +282,9 @@ class HeroRuntime:
 
     Two retrievers, because there are TWO kinds of grounded fact (kept distinct):
       - ``retriever`` (PAGE facts): the stage-graph GROUND source for the values
-        read off the page (amount/payee/due) — the deterministic ``HeroRetriever``
-        (these mirror the live AXTree values; the actuator grounds the page).
+        read off the page (amount/payee/due) — a ``PageRetriever`` over the
+        actuator that reads the REAL live AX tree, each fact sourced to a live
+        node (foundation §1 / Gap 1; replaced the ``HeroRetriever`` fixture).
       - ``kb_retriever`` (KB facts): the LIVE Moss retriever over the ingested
         Northwind policy (late-fee / autopay terms) — the §8 latency-meter +
         negative-verification beat. ``CLARION_DEMO_MODE=1`` swaps it for a
@@ -318,8 +324,9 @@ class HeroRuntime:
     ) -> "HeroRuntime":
         """Build the runtime over the live demo site.
 
-        - ``TimedRetriever(HeroRetriever)`` — the page-fact stage GROUND source
-          (amount/payee/due grounded off the page).
+        - ``TimedRetriever(PageRetriever(actuator))`` — the page-fact stage GROUND
+          source: reads the REAL live page off the actuator, every fact sourced to
+          a live AX node (Gap 1; an explicit ``retriever`` still overrides).
         - ``kb_retriever`` — the KB (Moss) retriever selected by
           ``select_kb_retriever``: LIVE ``TimedRetriever(MossRetriever)`` over the
           prebuilt ``clarion-kb`` index (ingested ONCE if missing, reused after),
@@ -337,13 +344,10 @@ class HeroRuntime:
         - ``PanelPublisher`` (live if ``room`` given, else recording sink).
         """
         from clarion.app.demo_mode import CachedActuator, demo_mode_enabled
+        from clarion.app.page_retriever import PageRetriever
 
         demo = demo_mode_enabled()
-        timed = TimedRetriever(retriever or HeroRetriever())
-        # The KB (Moss) retriever — live by default, cached + offline in demo mode.
-        kb = kb_retriever if kb_retriever is not None else await select_kb_retriever(
-            demo_mode=demo
-        )
+        # Resolve the actuator FIRST — the page-fact retriever grounds on it.
         if actuator is not None:
             # Injected transport (the extension path) — used as-is; no browser spawn.
             pass
@@ -353,6 +357,15 @@ class HeroRuntime:
             from clarion.actuator.actuator import PlaywrightActuator
 
             actuator = await PlaywrightActuator.create(demo_site_url, headless=headless)
+        # The PAGE-fact retriever for the kernel's GROUND: read the REAL page off
+        # the actuator (every fact sourced to a live AX node), NOT the HeroRetriever
+        # fixture (foundation §1 / Gap 1). An explicit ``retriever`` still overrides
+        # (the tests inject their own); absent one we ground on the live page.
+        timed = TimedRetriever(retriever or PageRetriever(actuator))
+        # The KB (Moss) retriever — live by default, cached + offline in demo mode.
+        kb = kb_retriever if kb_retriever is not None else await select_kb_retriever(
+            demo_mode=demo
+        )
         publisher = PanelPublisher(room=room, retriever=timed, sink=panel_sink)
         return cls(
             actuator=actuator,
