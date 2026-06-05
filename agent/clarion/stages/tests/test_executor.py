@@ -36,7 +36,7 @@ from clarion.contracts.state import (
     Subgoal,
 )
 from clarion.fakes import FakeActuator, FakeReasoner, FakeRetriever
-from clarion.stages.checks import evaluate_success_check
+from clarion.stages.checks import evaluate_success_check, make_anchor
 from clarion.stages.graph import build_stage_graph, seed_stage_state
 from clarion.stages.planner import plan_goal, verbalize_subgoals
 
@@ -335,3 +335,125 @@ def test_evaluate_success_check_unknown_name_fails_closed() -> None:
     # An unregistered / empty check NEVER advances (no silent always-pass).
     assert evaluate_success_check("bogus_check", state, sm, sm) is False
     assert evaluate_success_check("", state, sm, sm) is False
+
+
+# ---------------------------------------------------------------------------
+# (6) AG-DONE hardening — the SEMANTIC ANCHOR + SPA-settling + no-op-not-advanced
+# ---------------------------------------------------------------------------
+
+
+def _btn_map(name: str = "Go", node_id: str = "b") -> SelectorMap:
+    return SelectorMap(nodes={0: AxNode(index=0, role="button", name=name, node_id=node_id)})
+
+
+def test_navigated_certifies_on_real_url_change() -> None:
+    """The semantic anchor: a genuine URL change certifies ``navigated`` even when
+    the structural tree is byte-identical (an SPA route swap that re-paints the
+    same controls). The URL is the page-state truth, not the DOM delta."""
+    state = seed_stage_state(goal="go")
+    same_tree = _btn_map()
+    anchor = make_anchor("https://example.gov/start", "https://example.gov/result")
+    assert evaluate_success_check("navigated", state, same_tree, same_tree, anchor) is True
+
+
+def test_navigated_refuses_same_url_spa_rerender() -> None:
+    """SPA-settling: a same-URL re-render (a benign poll that re-keys nodes but
+    does NOT navigate) must NOT false-positive ``navigated``. The anchor URL did
+    not move → no navigation, even though a node was added."""
+    state = seed_stage_state(goal="go")
+    before = _btn_map()
+    after = SelectorMap(
+        nodes={
+            0: AxNode(index=0, role="button", name="Go", node_id="b"),
+            1: AxNode(index=1, role="status", name="Updated 12:01", node_id="poll"),
+        }
+    )
+    anchor = make_anchor("https://example.gov/x", "https://example.gov/x")  # unchanged
+    assert evaluate_success_check("navigated", state, before, after, anchor) is False
+
+
+def test_navigated_falls_back_to_structural_delta_without_url() -> None:
+    """No URL pair (a fake/replay transport that can't report a URL) → ``navigated``
+    falls back to a SUBSTANTIAL structural delta: a contentful add/remove. A pure
+    same-tree no-op is refused; a real added node certifies."""
+    state = seed_stage_state(goal="go")
+    before = _btn_map()
+    after_added = SelectorMap(
+        nodes={
+            0: AxNode(index=0, role="button", name="Go", node_id="b"),
+            1: AxNode(index=1, role="heading", name="Results", node_id="h"),
+        }
+    )
+    # make_anchor(None, None) -> None -> structural fallback.
+    assert make_anchor(None, None) is None
+    assert evaluate_success_check("navigated", state, before, after_added, None) is True
+    # A no-op (identical tree, no URL) does NOT certify navigation.
+    assert evaluate_success_check("navigated", state, before, before, None) is False
+
+
+def test_node_added_is_settling_aware_ignores_bare_rerender_churn() -> None:
+    """SPA-settling: ``node_added`` counts only a CONTENTFUL add (a named node or a
+    result/live-region role). A benign re-render that re-keys a BLANK, non-result
+    container (empty name, generic role) is churn — it does NOT certify done."""
+    state = seed_stage_state(goal="go")
+    before = _btn_map()
+    # A churn artifact: a freshly-keyed but EMPTY, non-result node.
+    churn = SelectorMap(
+        nodes={
+            0: AxNode(index=0, role="button", name="Go", node_id="b"),
+            1: AxNode(index=1, role="generic", name="", node_id="reflow"),
+        }
+    )
+    assert evaluate_success_check("node_added", state, before, churn) is False
+    # A real result: a named status node surfaced.
+    real = SelectorMap(
+        nodes={
+            0: AxNode(index=0, role="button", name="Go", node_id="b"),
+            1: AxNode(index=1, role="status", name="Application submitted", node_id="s"),
+        }
+    )
+    assert evaluate_success_check("node_added", state, before, real) is True
+
+
+def test_noop_step_is_failed_not_advanced_across_every_check() -> None:
+    """The Step-4 acceptance core: a NO-OP step (the page did not change) is detected
+    as NOT advanced by every generic check. before == after, same (unchanged) URL,
+    no grounded confirmation fact → no check certifies → the step fails-not-advances."""
+    state = seed_stage_state(goal="do the thing")
+    sm = SelectorMap(
+        nodes={
+            0: AxNode(index=0, role="textbox", name="", state={"required": True}, node_id="f"),
+            1: AxNode(index=1, role="button", name="Submit", node_id="b"),
+        }
+    )
+    noop_anchor = make_anchor("https://gov.example/form", "https://gov.example/form")
+    for check in ("field_nonempty", "node_added", "navigated", "confirmation_fact"):
+        assert (
+            evaluate_success_check(check, state, sm, sm, noop_anchor) is False
+        ), f"{check} false-positived on a no-op step"
+
+
+def test_confirmation_fact_certifies_on_grounded_fact() -> None:
+    """A read-only lookup that grounded a confirmation/status Fact certifies via the
+    grounded fact (the strong signal) — even with no page marker in the tree."""
+    state = seed_stage_state(goal="check status")
+    state["grounded_facts"] = [
+        Fact(value="Your application is confirmed", source_node_id="n-1", verified=True)
+    ]
+    bare = _btn_map(name="Home")  # no confirmation marker in the tree itself
+    assert evaluate_success_check("confirmation_fact", state, bare, bare) is True
+    # Ungrounded (no source_node_id) does NOT certify — the epistemic gate holds.
+    state["grounded_facts"] = [Fact(value="confirmed", source_node_id=None)]
+    assert evaluate_success_check("confirmation_fact", state, bare, bare) is False
+
+
+def test_make_anchor_wire_format_and_legacy_single_url() -> None:
+    """The anchor wire format + the legacy-single-URL guard: a single URL with no
+    separator carries no before/after pair, so ``navigated`` ignores it and falls
+    back to the structural signal (no regression on an old anchor)."""
+    state = seed_stage_state(goal="go")
+    assert make_anchor(None, None) is None
+    assert make_anchor("a", "b") == "a\x00b"
+    # A legacy single-URL anchor (no NUL) → treated as no pair → structural fallback.
+    before, after = _btn_map(), _btn_map()  # identical, no delta
+    assert evaluate_success_check("navigated", state, before, after, "https://x/only") is False
