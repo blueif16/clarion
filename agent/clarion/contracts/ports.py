@@ -16,9 +16,12 @@ from clarion.contracts.state import (
     Fact,
     Observation,
     PageDiff,
+    PageReadout,
     Passage,
     Profile,
     SelectorMap,
+    StepProposal,
+    Subgoal,
 )
 
 
@@ -85,6 +88,56 @@ class Synthesizer(ABC):
     async def synthesize(self, text: str) -> AsyncIterator[bytes]: ...
 
 
+class Reasoner(ABC):
+    """The de-hardcoding boundary (architecture Components, the NEW frozen ABC).
+
+    One generic LLM reasons the plan and the next grounded action behind THIS
+    port; the deterministic kernel acts and enforces the invariants. The real
+    ``GeminiReasoner`` adapter (a LATER agent) is the ONLY new LLM home — it lives
+    in ``adapters/``, never here. Like every other port this keeps ``kernel/`` and
+    ``contracts/`` SDK-free and lets a ``FakeReasoner`` drive network-free CI.
+
+    Contract types (all pure ``clarion.contracts.state`` value objects):
+      - ``orient``        : ``PageReadout`` — the ORIENT screen-reader readback.
+      - ``affordances``   : ``list[Fact]`` — the controls the page offers (grounded).
+      - ``ranked_slice``  : ``SelectorMap`` — a SUB-map (the top-K label-paired
+                            candidate slice the ContextRanker pre-ranked); a real
+                            ``SelectorMap`` keyed by the SAME live indices, so a
+                            returned ``target_index`` resolves straight back into
+                            the live map. A HINT, never the decider.
+      - ``facts``         : ``list[Fact]`` — the live grounded facts; a
+                            ``StepProposal.value_ref`` must resolve to one's ``id``.
+      - ``history``       : ``list[StepProposal]`` — the prior decided steps (the
+                            light history; no AXTree/HTML, keeps the checkpoint lean).
+    """
+
+    @abstractmethod
+    async def plan_goal(
+        self,
+        goal: str,
+        orient: PageReadout,
+        affordances: list[Fact],
+    ) -> list[Subgoal]:
+        """Derive a generic, site-agnostic plan (a list of ``Subgoal``) from the
+        goal + the ORIENT readout + the page affordances. Replaces ``_hero_plan``
+        (architecture migration Step 3)."""
+        ...
+
+    @abstractmethod
+    async def decide_step(
+        self,
+        goal: str,
+        ranked_slice: SelectorMap,
+        facts: list[Fact],
+        history: list[StepProposal],
+    ) -> StepProposal:
+        """Decide the single next grounded action as a ``StepProposal``. The
+        returned ``target_index`` / ``value_ref`` are then code-side validated by
+        ``kernel.reasoner_guard`` against the live map + Fact ids (structured
+        output is not a logit mask)."""
+        ...
+
+
 class Actuator(ABC):
     """The a11y-tree actuator (Playwright/CDP). The kernel sees only
     ``action -> observation`` (foundation §6, execution §4)."""
@@ -129,6 +182,7 @@ __all__ = [
     "VoiceTransport",
     "Retriever",
     "Synthesizer",
+    "Reasoner",
     "Actuator",
     "Ingest",
     "Memory",
