@@ -27,6 +27,23 @@ Classification = Literal["reversible", "irreversible", "unknown"]
 
 __all__ = ["classify", "Classification"]
 
+# Roles that can be a consequential ACTION target (a click/navigate on one of
+# these mutates the page / submits / leaves the origin). NOT a keyword list of
+# names — a STRUCTURAL role set (the deleted thing was matching button *names*
+# like "pay"/"submit"; this matches the a11y ROLE, which is structural).
+_CONSEQUENTIAL_ROLES = {"button", "link", "menuitem", "tab", "switch"}
+
+# State flags whose presence on the target makes the act consequential / opaque
+# enough that structure can't prove it reversible. Conservative + escalate-only.
+_ESCALATING_STATE_FLAGS = ("disabled", "haspopup", "expanded")
+
+# Roles/names that read as a grounded UNDO/CANCEL affordance on the SAME page — a
+# structural reversibility witness. Still NOT a keyword decider for the ACTION
+# (we never match the action target's name); this only scans the page for an
+# escape hatch that, if present, lets the structural net stay neutral. Absent →
+# fail-closed to unknown (the UNKNOWN-on-no-grounded-undo rule).
+_UNDO_NAME_TOKENS = ("cancel", "undo", "go back", "back", "previous", "edit", "discard")
+
 
 def classify(
     proposal: Proposal,
@@ -55,16 +72,8 @@ def classify(
     )
 
     # --- the independent code structural pre-screen (the "net") --------------
-    # TODO(AG-GATE): implement the real structural pre-screen here. It must be
-    # able to ESCALATE the model's judgement but NEVER downgrade it:
-    #   - role=="button" AND (type==submit | inside a <form>)        → escalate
-    #   - off-origin navigation target                                → escalate
-    #   - an empty accessible name on a consequential control         → escalate
-    #   - no grounded "undo"/"cancel" affordance present              → → unknown
-    # Pair with NegativeVerifier (kernel/negative_verifier.py) for the
-    # coverage-aware "no undo afforded" signal. Until then this is a no-op so the
-    # routing runs on the reasoner's signal alone.
-    structural = _structural_prescreen(proposal, page)  # currently always None
+    # The dual-signal half the model can never downgrade past. Escalate-only.
+    structural = _structural_prescreen(proposal, page)
 
     # Either signal can ESCALATE; the model can never downgrade past the net.
     return _escalate(judgment, structural)
@@ -73,13 +82,95 @@ def classify(
 def _structural_prescreen(
     proposal: Proposal, page: SelectorMap
 ) -> Optional[Classification]:
-    """The independent code-side signal. AG-KERNEL stub: returns ``None`` (no
-    structural opinion) so today's routing rides on the reasoner's judgement.
-    AG-GATE fills this in (see the TODO in ``classify``). Kept a separate pure fn
-    so AG-GATE's edit is localized and the escalation lattice (`_escalate`) is
-    already in place."""
-    _ = (proposal, page)
+    """The independent code-side signal — structural, NOT a name-keyword list.
+
+    The deleted ``pay/submit/confirm/send`` matcher keyed off the action target's
+    *name*; this keys off the a11y STRUCTURE the page actually exposes. Returns a
+    classification to ESCALATE to (``_escalate`` only ever pushes UP the lattice —
+    a structural signal can never relax the model), or ``None`` for "no structural
+    opinion" (the model's judgement stands).
+
+    Signals available on today's ``AxNode`` (``role`` / ``name`` / ``state``):
+      - a NON-consequential action (``read``, or a ``fill`` into a textbox) carries
+        no irreversible side-effect by itself → no opinion (``None``);
+      - a consequential action (click/navigate on a button/link/…) with an EMPTY
+        accessible name → escalate to ``unknown`` (a nameless consequential control
+        is unidentifiable — the benignly-named "Continue" that submits, taken to
+        its limit: a control with NO name at all);
+      - an escalating ``state`` flag (haspopup / expanded / disabled) on the target
+        → escalate to ``unknown`` (opaque / popup / unexpectedly-disabled control);
+      - the FAIL-CLOSED rule the architecture endorses (Open risk #1): a
+        consequential action where structure can't prove reversibility AND there is
+        **no grounded undo/cancel affordance** anywhere on the page → escalate to
+        ``unknown`` (UNKNOWN-on-no-grounded-undo). This over-gates — the safe
+        residual — turning a confidently-wrong "reversible" into a consent prompt.
+
+    TODO(actuator AX enrichment, later pass — do NOT reach into ``actuator/`` from
+    ``kernel/`` this wave): the architecture also names ``type=="submit"`` /
+    inside a ``<form>`` / off-origin navigation as strong structural escalators.
+    Those signals AREN'T on ``AxNode.state`` today; a small AX enrichment in the
+    actuator (stamp ``state["submit"]`` / ``state["in_form"]`` / a target origin)
+    would let this pre-screen escalate a submit-like control to ``irreversible``
+    (not merely ``unknown``) without a name match. Until then the
+    UNKNOWN-on-no-grounded-undo net catches it (over-gating, fail-closed).
+    """
+    action = proposal.action
+    if action is None:
+        return None
+
+    # A pure read has no side-effect; a fill into a field is reversible (you can
+    # re-type). Only click/navigate are structurally consequential here.
+    if action.kind not in ("click", "navigate"):
+        return None
+
+    target = _target_node(action.index, page)
+
+    # A consequential action whose target role isn't even an actionable control is
+    # structurally unidentifiable → unknown (fail-closed).
+    if target is None or target.role not in _CONSEQUENTIAL_ROLES:
+        return "unknown"
+
+    # An empty accessible name on a consequential control: unidentifiable — we
+    # cannot tell the user what they are about to press. Escalate.
+    if not target.name.strip():
+        return "unknown"
+
+    # Opaque / popup / disabled state on the target → escalate.
+    if any(target.state.get(flag) for flag in _ESCALATING_STATE_FLAGS):
+        return "unknown"
+
+    # The fail-closed net: a consequential click/navigate with NO grounded
+    # undo/cancel escape hatch on the page can't be proven reversible by structure
+    # → unknown (over-gates; the single worst residual, architecture Open risk #1).
+    if not _has_grounded_undo(page):
+        return "unknown"
+
+    # Structure found a consequential control that IS named, not flagged opaque,
+    # and sits on a page with a visible undo path — no escalation opinion; the
+    # model's judgement stands (but it still can't *downgrade* anyone else's).
     return None
+
+
+def _target_node(index: Optional[int], page: SelectorMap) -> Optional[AxNode]:
+    """Resolve the action's target node in the live map (``None`` if no/unknown
+    index)."""
+    if index is None:
+        return None
+    return page.nodes.get(index)
+
+
+def _has_grounded_undo(page: SelectorMap) -> bool:
+    """Is there a structural undo/cancel/back affordance on the page? An actionable
+    control (button/link/…) whose accessible name reads as an escape hatch. This is
+    a structural reversibility WITNESS (its presence lets the net stay neutral); it
+    is NOT a decider on the action target — we never match the target's own name."""
+    for node in page.nodes.values():
+        if node.role not in _CONSEQUENTIAL_ROLES:
+            continue
+        name = node.name.lower()
+        if any(tok in name for tok in _UNDO_NAME_TOKENS):
+            return True
+    return False
 
 
 # The escalation lattice: how strongly each label gates (higher = more gating).
