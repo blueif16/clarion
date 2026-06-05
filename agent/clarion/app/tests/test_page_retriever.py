@@ -197,14 +197,43 @@ class _PageActuator:
         return PageDiff()
 
 
+class _FillTopRankedReasoner:
+    """A deterministic Reasoner that fills the first interactive index with the
+    TOP-RANKED grounded fact (facts[0] — PageRetriever has already ranked the
+    value '$84.32' above its label). Stands in for GeminiReasoner; proves the
+    kernel forms the grounded fill from whatever value the ranker floated up."""
+
+    def __init__(self) -> None:
+        self.last_decide_ms = None
+
+    async def plan_goal(self, goal, orient, affordances):  # noqa: ANN001, ARG002
+        from clarion.contracts.state import Subgoal
+        return [Subgoal(description=goal, done_check="field_nonempty")]
+
+    async def decide_step(self, goal, ranked_slice, facts, history):  # noqa: ANN001, ARG002
+        from clarion.contracts.state import StepProposal
+        target = next(iter(sorted(ranked_slice.nodes)), None)
+        return StepProposal(
+            scratch_reasoning="fill with the top-ranked value",
+            action_kind="fill",
+            target_index=target,
+            value_ref=facts[0].id if facts else None,
+            irreversibility="reversible",
+            success_check="field_nonempty",
+            say=facts[0].value if facts else "",
+        )
+
+
 async def test_propose_fills_with_the_value_not_the_label() -> None:
     """End-to-end through the kernel: GROUND grounds the page via PageRetriever,
-    VERIFY marks it speakable, PROPOSE forms the fill — and the value it fills /
-    speaks is the real amount '$84.32', NOT the label 'Amount due'."""
+    VERIFY marks it speakable, the Reasoner-driven PROPOSE forms the fill — and the
+    value it fills / speaks is the real amount '$84.32' (the top-ranked grounded
+    fact), NOT the label 'Amount due'. (The ranker floats the value up; the kernel
+    fences the fill to the membership-verified verbatim span.)"""
     from clarion.kernel.graph import build_kernel, seed_state
 
     act = _PageActuator()
-    kernel = build_kernel(PageRetriever(act), act, mode="fast")
+    kernel = build_kernel(_FillTopRankedReasoner(), PageRetriever(act), act, mode="fast")
     st = seed_state(goal="Find the payment amount due", mode="fast")
     st["page_index"] = await act.perceive()
     result = await kernel.ainvoke(st, {"configurable": {"thread_id": "prop-value"}})

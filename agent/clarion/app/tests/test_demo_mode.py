@@ -86,20 +86,35 @@ async def test_cached_pay_consent_hard_stop_is_real():
     await act.act(Action(kind="click", index=dismiss))
 
     from clarion.app.runtime import HeroRetriever
+    from clarion.contracts.state import SelectorMap, StepProposal
+    from clarion.fakes import FakeReasoner
 
-    # The retriever is exercised by GROUND but the PAY proposal is the irreversible
-    # submit click (no fillable textbox in the scoped page_index) — so the kernel
-    # forms the hard-stop regardless of the grounded facts.
-    kernel = build_kernel(HeroRetriever(), act, mode="fast")
-    cfg = {"configurable": {"thread_id": "test-pay"}}
-    seed = seed_state(goal="Submit the payment", mode="fast")
     sm = await act.perceive()
     submit_idx, submit_node = next(
         (i, n) for i, n in sm.nodes.items() if n.role == "button"
         and "submit payment" in n.name.lower()
     )
-    from clarion.contracts.state import SelectorMap
 
+    # The Reasoner is scripted to click the submit button and judge it IRREVERSIBLE
+    # — the dual-signal gate then routes it through CONSENT even in Fast mode. The
+    # consent gate is NOT faked: the REAL kernel hard-stops. (This is the honest
+    # core — the model points at a real live index; the kernel enforces the yes.)
+    reasoner = FakeReasoner(
+        steps=[
+            StepProposal(
+                scratch_reasoning="press submit payment — this pays the bill",
+                action_kind="click",
+                target_index=submit_idx,
+                value_ref=None,
+                irreversibility="irreversible",
+                success_check="confirmation_fact",
+                say="",
+            )
+        ]
+    )
+    kernel = build_kernel(reasoner, HeroRetriever(), act, mode="fast")
+    cfg = {"configurable": {"thread_id": "test-pay"}}
+    seed = seed_state(goal="Submit the payment", mode="fast")
     seed["page_index"] = SelectorMap(nodes={submit_idx: submit_node}, token_estimate=10)
 
     # First invoke → the kernel must INTERRUPT at the irreversible step (hard-stop).

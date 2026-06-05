@@ -36,7 +36,7 @@ import os
 import time
 from typing import Any, Callable, Literal, Optional
 
-from clarion.contracts.ports import Actuator, Retriever
+from clarion.contracts.ports import Actuator, Reasoner, Retriever
 from clarion.contracts.state import ClarionState, Fact
 from clarion.instrument.baseline import COLD_RAG_BASELINE_MS
 from clarion.instrument.publisher import to_panel_state
@@ -298,6 +298,7 @@ class HeroRuntime:
         retriever: TimedRetriever,
         publisher: PanelPublisher,
         mode: Literal["normal", "fast"],
+        reasoner: Reasoner,
         kb_retriever: Optional[Retriever] = None,
         kb_live: bool = True,
     ) -> None:
@@ -305,6 +306,9 @@ class HeroRuntime:
         self.retriever = retriever
         self.publisher = publisher
         self.mode = mode
+        # The de-hardcoding boundary: the LLM that reasons the plan + next step
+        # (GeminiReasoner live; FakeReasoner in tests). Injected into the executor.
+        self.reasoner = reasoner
         # The Moss-backed KB retriever (live) or the offline cached replay (demo).
         self.kb_retriever = kb_retriever
         self.kb_live = kb_live
@@ -321,6 +325,7 @@ class HeroRuntime:
         retriever: Optional[Retriever] = None,
         kb_retriever: Optional[Retriever] = None,
         actuator: Optional[Actuator] = None,
+        reasoner: Optional[Reasoner] = None,
     ) -> "HeroRuntime":
         """Build the runtime over the live demo site.
 
@@ -366,12 +371,20 @@ class HeroRuntime:
         kb = kb_retriever if kb_retriever is not None else await select_kb_retriever(
             demo_mode=demo
         )
+        # The de-hardcoding boundary: the real GeminiReasoner (the LLM decider)
+        # unless one is injected (tests inject a FakeReasoner). Lazy client — no
+        # I/O at construct (load_dotenv resolves agent/.env keys on first call).
+        if reasoner is None:
+            from clarion.adapters.gemini_reasoner import GeminiReasoner
+
+            reasoner = GeminiReasoner()
         publisher = PanelPublisher(room=room, retriever=timed, sink=panel_sink)
         return cls(
             actuator=actuator,
             retriever=timed,
             publisher=publisher,
             mode=mode,
+            reasoner=reasoner,
             kb_retriever=kb,
             kb_live=not demo,
         )
@@ -393,12 +406,16 @@ class HeroRuntime:
         return MossKBBeat.from_cache(page_late_fee_present=page_late_fee_present)
 
     def build_stage_graph(self):
-        """Compile the ST1 stage graph wired with the timed retriever + the live
-        actuator + this runtime's mode. The graph is the top-level task graph (the
-        ST1 finding: drive CONSENT at the stage-graph level, not the bare kernel)."""
+        """Compile the generic executor graph wired with the injected Reasoner +
+        the timed retriever + the live actuator + this runtime's mode. The graph is
+        the top-level task graph (drive CONSENT at the executor level, not the bare
+        kernel). The Reasoner is the de-hardcoding boundary — the plan + every step
+        are LLM-derived, ZERO baked topology."""
         from clarion.stages.graph import build_stage_graph
 
-        return build_stage_graph(self.retriever, self.actuator, mode=self.mode)
+        return build_stage_graph(
+            self.reasoner, self.retriever, self.actuator, mode=self.mode
+        )
 
     async def close(self) -> None:
         await self.actuator.close()

@@ -61,7 +61,6 @@ from clarion.contracts.state import (  # noqa: E402
     SelectorMap,
 )
 from clarion.kernel.graph import build_kernel, seed_state  # noqa: E402
-from clarion.stages.planner import plan_goal, verbalize_plan  # noqa: E402
 from clarion.stages.predicates import (  # noqa: E402
     auth_done,
     confirm_done,
@@ -111,10 +110,17 @@ class HeroHarness:
         self.actuator = runtime.actuator
         self.retriever = runtime.retriever
         self.publisher = runtime.publisher
-        # The durable goal-state we thread through the run + publish from. Seeded
-        # with the real hero plan so the panel shows the stage/step legibly.
+        # The durable goal-state we thread through the run + publish from. This is
+        # a hand-driven beat-by-beat demo script (NOT the generic executor — that
+        # lives in stages.graph, now Reasoner-driven). The plan is a static spoken
+        # line for the legibility beat; the spine derives the real plan from the
+        # goal via the injected Reasoner.
         self.state: ClarionState = seed_state(goal="pay my electric bill", mode=runtime.mode)
-        self.state["plan"] = plan_goal("pay my electric bill")
+        self.state["plan"] = []
+        self._spoken_plan = (
+            "Here's my plan: first log in, then find the amount, payee and due "
+            "date, then fill the payment, review it, pay, and confirm."
+        )
         self.results: dict[str, bool] = {}
 
     async def _publish(
@@ -147,7 +153,7 @@ class HeroHarness:
     async def auth(self) -> bool:
         _hr("AUTH — demo login + the unlabeled-input RESCUE trigger")
         log = _log("AUTH")
-        log(f"plan (read aloud verbatim): {verbalize_plan(self.state['plan'])!r}")
+        log(f"plan (read aloud verbatim): {self._spoken_plan!r}")
         await asyncio.sleep(1.0)  # let the React login page hydrate
         sm = await self.actuator.perceive()
         log(f"perceived login tree: {len(sm.nodes)} interactive nodes")
@@ -417,7 +423,9 @@ class HeroHarness:
         # forms the IRREVERSIBLE submit click; the consent_gate + policy do the rest.
         # (A page-aware model planner scopes the kernel's view per-stage; the seam
         # is real — this is that scoping for the PAY stage.)
-        kernel = build_kernel(self.retriever, self.actuator, mode="fast")
+        kernel = build_kernel(
+            self.rt.reasoner, self.retriever, self.actuator, mode="fast"
+        )
         cfg = {"configurable": {"thread_id": "hero-pay"}}
         kseed = seed_state(goal="Submit the payment", mode="fast")
         kseed["page_index"] = SelectorMap(

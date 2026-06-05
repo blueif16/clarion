@@ -1,111 +1,54 @@
-"""ST1 — the planner (execution §3.1 / §3.2).
+"""The planner — Reasoner-driven, goal-derived (architecture migration Step 3).
 
-The ``planner`` emits the explicit ``plan: list[Stage]`` — the thing the agent
-reads aloud verbatim for instant legibility (execution §3.1). For the hero goal
-("pay my electric bill") it is **deterministic**: the six §3.2 stages
+The hardcoded ``_hero_plan`` (the baked AUTH→…→CONFIRM "pay my electric bill"
+topology) is DELETED. The plan is now derived by the frozen ``Reasoner`` port from
+the goal + the ORIENT screen-reader readout + the page affordances:
 
-    AUTH → LOCATE → FILL → REVIEW → ⟨PAY⟩ → CONFIRM
+    plan_goal(reasoner, goal, orient, affordances) -> [Subgoal]
 
-each carrying a registered ``done_predicate`` name + a ``negative_checks`` list
-(per the §3.2 table). A model planner drops in later — ``plan_goal`` is the seam:
-swap its body for an LLM call that emits the same ``list[Stage]`` shape and every
-downstream consumer (the stage graph, the predicates registry) is unchanged.
+Each ``Subgoal`` is generic and site-agnostic (no stage names, no "pay electric
+bill"); its ``done_check`` names a registered generic success check (a SELECTION,
+evaluated in CODE by ``stages.checks`` — never model say-so). The generic
+executor (``stages.graph``) runs the kernel loop per subgoal.
 
-Pure: ``clarion.contracts`` only. NO provider SDKs, NO langgraph.
-
-Each ``Stage`` (execution §18.3) carries:
-  - ``id`` / ``goal``      — the verbalizable name + sub-goal,
-  - ``tools``              — the per-stage tool subset (execution §3.2 col 2),
-  - ``done_predicate``     — a NAME into ``predicates.DONE_PREDICATES`` (never a
-                             model say-so — §3.3),
-  - ``negative_checks``    — NAMES into ``predicates.NEGATIVE_CHECKS``.
+Pure: ``clarion.contracts`` only. NO provider SDKs, NO langgraph (the Gemini SDK
+lives in the injected ``Reasoner`` adapter, never here).
 """
 
 from __future__ import annotations
 
-from clarion.contracts.state import Stage
+from clarion.contracts.ports import Reasoner
+from clarion.contracts.state import Fact, PageReadout, Subgoal
 
-# The hero task's stage order (execution §3.2). ⟨PAY⟩ is the consent gate; the
-# bracket in the doc is the "this is the irreversible step" marker.
-HERO_STAGE_IDS: tuple[str, ...] = (
-    "AUTH",
-    "LOCATE",
-    "FILL",
-    "REVIEW",
-    "PAY",
-    "CONFIRM",
-)
+__all__ = ["plan_goal", "verbalize_subgoals"]
 
 
-def _hero_plan() -> list[Stage]:
-    """The deterministic §3.2 plan for "pay my electric bill". Every stage maps
-    1:1 to a row of the §3.2 table: tool subset, done-predicate name, and the
-    negative-verification list."""
-    return [
-        Stage(
-            id="AUTH",
-            goal="Log in to the utility account",
-            tools=["navigate", "read", "fill"],
-            done_predicate="auth_done",
-            negative_checks=["no_error_banner"],
-        ),
-        Stage(
-            id="LOCATE",
-            goal="Find the amount, payee, and due date — all grounded",
-            tools=["navigate", "read", "retrieve"],
-            done_predicate="locate_done",
-            negative_checks=["no_autopay_scheduled"],
-        ),
-        Stage(
-            id="FILL",
-            goal="Populate every required payment field",
-            tools=["read", "fill"],
-            done_predicate="fill_done",
-            negative_checks=["no_required_field_blank", "no_silent_validation_error"],
-        ),
-        Stage(
-            id="REVIEW",
-            goal="Cross-check the amount and payee before paying",
-            tools=["read", "retrieve"],
-            done_predicate="review_done",
-            negative_checks=["no_surprise_fee"],
-        ),
-        Stage(
-            id="PAY",
-            goal="Submit the payment (the consented, irreversible step)",
-            tools=["submit"],
-            done_predicate="pay_done",
-            negative_checks=["confirmation_present"],
-        ),
-        Stage(
-            id="CONFIRM",
-            goal="Confirm success and read back the confirmation number",
-            tools=["read", "write"],
-            done_predicate="confirm_done",
-            negative_checks=["not_still_on_form"],
-        ),
-    ]
+async def plan_goal(
+    reasoner: Reasoner,
+    goal: str,
+    orient: PageReadout,
+    affordances: list[Fact],
+) -> list[Subgoal]:
+    """Derive a generic, site-agnostic plan from the goal + the ORIENT readout +
+    the page affordances, via the injected ``Reasoner``. Replaces ``_hero_plan``.
+
+    The plan is GOAL-DERIVED: the subgoals come from the model reasoning over the
+    goal and what the page actually offers — there is ZERO site-specific code, no
+    baked stage list. Fails-open to a single generic subgoal if the reasoner
+    returns nothing, so the executor always has at least one loop to run."""
+    subgoals = await reasoner.plan_goal(goal, orient, affordances)
+    if not subgoals:
+        # The reasoner declined / returned empty — fall back to one generic
+        # subgoal naming the goal (still site-agnostic, still grounded execution).
+        return [Subgoal(description=goal, done_check="")]
+    return subgoals
 
 
-def plan_goal(goal: str) -> list[Stage]:
-    """Emit the ``plan: list[Stage]`` for ``goal``.
-
-    DETERMINISTIC for the hero goal (execution §3.1 / hero task §3.2). This is the
-    seam a model planner drops into later: a future implementation classifies the
-    goal and emits a tailored ``list[Stage]``; for the hackathon hero run it
-    always emits the six §3.2 stages. (Kept a free function, not a method, so the
-    swap is a one-line body change with the same signature.)
-    """
-    # A model planner would branch on `goal` here; the hero path is fixed.
-    return _hero_plan()
-
-
-def verbalize_plan(plan: list[Stage]) -> str:
-    """The read-aloud rendering of a plan (execution §3.1 "read aloud verbatim").
-    One coherent sentence the agent can speak so the user hears the whole plan
-    before any action — the legibility beat."""
-    steps = ", then ".join(s.goal.lower() for s in plan)
+def verbalize_subgoals(subgoals: list[Subgoal]) -> str:
+    """The read-aloud rendering of a goal-derived plan (the legibility beat — the
+    agent speaks the whole plan before any action). One coherent sentence over the
+    generic subgoal descriptions."""
+    if not subgoals:
+        return "I don't have a plan yet."
+    steps = ", then ".join(s.description.lower() for s in subgoals if s.description)
     return f"Here's my plan: first {steps}."
-
-
-__all__ = ["plan_goal", "verbalize_plan", "HERO_STAGE_IDS"]
