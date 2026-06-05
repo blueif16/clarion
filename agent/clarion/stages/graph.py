@@ -46,7 +46,7 @@ from clarion.contracts.state import (
     TraceEvent,
 )
 from clarion.kernel.graph import _ALLOWED_MSGPACK_MODULES, _PlanState, build_kernel, seed_state
-from clarion.stages.checks import evaluate_success_check
+from clarion.stages.checks import evaluate_success_check, make_anchor
 from clarion.stages.planner import plan_goal, verbalize_subgoals
 from clarion.stages.predicates import detect_rescue, needs_rescue
 
@@ -132,6 +132,25 @@ async def _paired_facts(actuator: Actuator) -> list[PairedFact]:
     if read is None:
         return []
     return await read()
+
+
+async def _current_url(actuator: Actuator) -> Optional[str]:
+    """The live page URL — the SEMANTIC ANCHOR substrate for the ``navigated``
+    done-check. Both real actuators surface it on their ``describe_page`` readout
+    (``PageReadout.url``: Playwright's ``page.url`` / the extension's
+    ``location.href``); a fake/replay transport without ``describe_page`` yields
+    ``None``, so ``navigated`` cleanly falls back to a structural delta. Best-effort
+    — never lets a URL read break the done-check (a blocked ``location.href`` just
+    degrades the anchor)."""
+    describe = getattr(actuator, "describe_page", None)
+    if describe is None:
+        return None
+    try:
+        readout = await describe()
+    except Exception:  # noqa: BLE001 - the anchor is best-effort; degrade, don't crash.
+        return None
+    url = (readout.url or "").strip()
+    return url or None
 
 
 def build_stage_graph(
@@ -267,9 +286,11 @@ def build_stage_graph(
                 goto=_RESCUE,
             )
 
-        # Capture the before-map + harvest the live pairings for THIS cycle (the
-        # done-check diff baseline + the fence #3 supply).
+        # Capture the before-map + the before-URL (the SEMANTIC ANCHOR baseline)
+        # + harvest the live pairings for THIS cycle (the done-check diff baseline
+        # + the fence #3 supply).
         before_map = sm
+        before_url = await _current_url(actuator)
         paired = await _paired_facts(actuator)
 
         # (2) Run the kernel loop scoped to this subgoal over the shared state.
@@ -280,10 +301,14 @@ def build_stage_graph(
         )
 
         # (3) GENERIC done-check (killer-closer #3): the reasoner-SELECTED
-        #     success_check, evaluated in CODE against the re-perceived tree.
+        #     success_check, evaluated in CODE against the re-perceived tree + the
+        #     SEMANTIC ANCHOR (the URL before/after the act). The anchor lets
+        #     ``navigated`` certify a real page move (URL changed) instead of a
+        #     bare structural delta a benign SPA re-render also produces.
         fresh: SelectorMap = merged["page_index"]
         check_name = merged.get("success_check") or subgoal.done_check or ""
-        anchor = state.get("_anchor")
+        after_url = await _current_url(actuator)
+        anchor = make_anchor(before_url, after_url)
         advanced = evaluate_success_check(
             check_name, merged, before_map, fresh, anchor  # type: ignore[arg-type]
         )
@@ -310,6 +335,7 @@ def build_stage_graph(
             "paired_facts": paired,
             "_kernel_threads": merged.get("_kernel_threads", {}),
             "_before_map": before_map,
+            "_anchor": anchor,
             "trace": kernel_new_trace
             + [
                 _trace(
@@ -318,6 +344,8 @@ def build_stage_graph(
                     subgoal=idx,
                     done=advanced,
                     success_check=check_name,
+                    url_before=before_url or "",
+                    url_after=after_url or "",
                 )
             ],
         }
