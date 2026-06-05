@@ -63,6 +63,11 @@ def _goal_tokens(goal: str) -> list[str]:
 def _score(fact: Fact, tokens: list[str]) -> tuple[int, int]:
     """Rank key for a page fact against the goal tokens. Higher is better.
 
+    This is a **HINT, never the decider** (architecture PARSE / ContextRanker bullet):
+    it ORDERS the grounded facts so the most goal-relevant value floats up, but
+    ``query`` never lets it DROP a fact the Reasoner might need — the unfiltered set
+    is always reachable via ``query_all`` so over-pruning can't cause a false decline.
+
     The pieces, tuned so a VALUE outranks its LABEL (the validated inversion):
       - ``overlap``: goal content-words appearing in the fact text;
       - ``value``: a CURRENCY/decimal amount scores high enough to beat a 2-word
@@ -89,6 +94,13 @@ class PageRetriever(Retriever):
     actuator and, per ``query``, reads the live page's text facts and returns the
     ``k`` most goal-relevant — each sourced to a real AX ``nodeId``.
 
+    The ranking is a **HINT, not a decider** (architecture PARSE / ContextRanker):
+      - ``query(q, k)``   → the top-K ranked SLICE (the hint surfaced to the
+        Reasoner); overrideable, never authoritative.
+      - ``query_all(q)``  → the UNFILTERED fallback: every grounded fact, ranked but
+        un-pruned, run before any honest-decline so over-pruning the slice can't
+        cause a false give-up on a value that is actually on the page.
+
     Falls back to the interactive ``SelectorMap`` (``readout_from_selector_map``)
     for an actuator without ``read_facts`` (e.g. the offline ``CachedActuator``),
     so it degrades to grounded affordance text rather than ever fabricating a fact.
@@ -111,17 +123,42 @@ class PageRetriever(Retriever):
         sm = await self._actuator.perceive()
         return list(readout_from_selector_map(sm).affordances)
 
+    def _ranked(self, facts: list[Fact], q: str) -> list[Fact]:
+        """All facts, RANKED by the goal hint but NOT pruned — stable order, every
+        fact stamped with the retrieval time (the latency-meter substrate)."""
+        tokens = _goal_tokens(q)
+        ranked = sorted(facts, key=lambda f: _score(f, tokens), reverse=True)
+        now = time.time()
+        return [f.model_copy(update={"retrieved_at": now}) for f in ranked]
+
     async def query(self, q: str, *, k: int = 5) -> list[Fact]:
+        """The frozen ``Retriever.query`` — returns the top-``k`` ranked slice as a
+        HINT (the most goal-relevant grounded facts float up). This is a hint, NOT a
+        verdict: it never originates a fact and never hides one the Reasoner needs —
+        the full grounded set is always available via ``query_all`` so a later
+        honest-decline can re-check before giving up (over-pruning ≠ a false decline).
+        """
         self.calls.append(q)
         facts = await self._page_facts()
         if not facts:
             # Honest absence: nothing on the page to ground → the kernel speaks
             # nothing and (via the done-predicates) declines, never a constant.
             return []
-        tokens = _goal_tokens(q)
-        ranked = sorted(facts, key=lambda f: _score(f, tokens), reverse=True)
-        now = time.time()
-        return [f.model_copy(update={"retrieved_at": now}) for f in ranked[:k]]
+        return self._ranked(facts, q)[:k]
+
+    async def query_all(self, q: str = "") -> list[Fact]:
+        """The UNFILTERED fallback (architecture PARSE bullet): EVERY grounded fact
+        on the page, ranked by the same hint but with NO top-K cut. The kernel runs
+        this BEFORE any honest-decline so an over-aggressive top-K can't make it give
+        up on a value that is actually present — the decline only stands if the value
+        is absent from the FULL set, not merely from the ranked slice. ``q`` only
+        orders the result (the hint); passing ``""`` returns the facts unranked-by-
+        relevance (still grounded, still all present)."""
+        self.calls.append(q)
+        facts = await self._page_facts()
+        if not facts:
+            return []
+        return self._ranked(facts, q)
 
 
 __all__ = ["PageRetriever", "extract_text_facts_ranked_score"]

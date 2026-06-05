@@ -21,9 +21,17 @@ perception logic below is shared verbatim. No provider import lives here.
 
 from __future__ import annotations
 
-from typing import Any
+import re
+from typing import Any, Optional
 
-from clarion.contracts.state import AxNode, Fact, PageDiff, PageReadout, SelectorMap
+from clarion.contracts.state import (
+    AxNode,
+    Fact,
+    PageDiff,
+    PageReadout,
+    PairedFact,
+    SelectorMap,
+)
 
 # AX roles we treat as "interactive" for the numbered map (execution §4.1.5).
 # Anything outside this set is structural and never gets an index — only things
@@ -60,6 +68,31 @@ _HEADING_ROLES = {"heading"}
 # to its real AX nodeId, as the page-grounded GROUND source — replacing any
 # fixture constant (foundation §1: no fact without a source; absence stays absent).
 _TEXT_CONTENT_ROLES = {"StaticText", "heading", "paragraph"}
+
+# Roles whose LIVE VALUE (the AX node's ``value.value``) is itself a page value a
+# task needs ("the amount field already holds $84.32", a selected combobox option).
+# A static-text harvest drops these — the value lives on the control, not in a
+# StaticText leaf — so GROUND must read it too (architecture PARSE bullet: "harvest
+# control-values"). Each is still grounded to the control's real AX nodeId.
+_CONTROL_VALUE_ROLES = {
+    "textbox",
+    "searchbox",
+    "textarea",
+    "combobox",
+    "spinbutton",
+    "slider",
+    "checkbox",
+    "radio",
+    "switch",
+    "option",
+}
+
+# A value-bearing string carries a currency/percent symbol or a digit — the kind of
+# text a task READS (an amount, a date, an account/confirmation number). These are
+# never deduped against each other (two different "$" amounts on a page MUST both
+# survive — architecture PARSE bullet: "stop deduping value-bearing facts"); only
+# pure-label text is deduped (the AX tree repeats a label across a node + its leaves).
+_VALUE_BEARING_RE = re.compile(r"[\$£€%]|\d")
 
 # Group the interactive roles into human-spoken affordance buckets for the ORIENT
 # readback ("3 fields you can fill: …"). Each entry is (singular, plural, roles);
@@ -575,33 +608,439 @@ def extract_text_facts(ax_tree: dict, *, max_facts: int = 60) -> list[Fact]:
     kernel grounds nothing and declines rather than ever speaking a fixture
     constant the real page never showed (foundation §1).
 
+    Also harvests CONTROL VALUES (an input's live ``value.value`` — the amount a
+    field already holds) and the text of ``aria-live`` regions (a status/error a
+    sighted user sees appear), each grounded to the control / region's real nodeId
+    (architecture PARSE bullet). These are page values a static-text harvest drops.
+
     Pure over the raw ``Accessibility.getFullAXTree`` dict (no provider import, no
     geometry). Shared verbatim by both actuator transports (Playwright + extension).
 
-    Dedup is by case-folded text (the AX tree repeats a string across a node and
-    its ``InlineTextBox`` leaves); the synthetic leaves carry NEGATIVE nodeIds and
-    are filtered so every surfaced fact points at a real, resolvable node."""
+    Dedup is by case-folded text — but **only for non-value-bearing (label) text**.
+    The AX tree repeats a LABEL across a node and its ``InlineTextBox`` leaves, so a
+    pure-label dedup is right; a VALUE-bearing string (anything with a digit / $ / %)
+    is NEVER deduped, so two distinct ``$142.10`` rows or two identical ``25.00%``
+    cells both survive (architecture PARSE bullet: "stop deduping value-bearing
+    facts" — over-dedup is how the amount-due gets confused with the past-due).
+    The synthetic ``InlineTextBox`` leaves carry NEGATIVE nodeIds and are filtered so
+    every surfaced fact points at a real, resolvable node."""
     facts: list[Fact] = []
     seen: set[str] = set()
     for ax in ax_tree.get("nodes", []) or []:
         if ax.get("ignored"):
             continue
         role = (ax.get("role") or {}).get("value", "") or ""
-        if role not in _TEXT_CONTENT_ROLES:
-            continue
-        name = _ax_name(ax)
-        if not name:
-            continue
         node_id = str(ax.get("nodeId", ""))
         # A real, positive AX nodeId only (InlineTextBox leaves carry synthetic
         # negative ids and merely duplicate their StaticText parent's text).
         if not node_id or node_id.startswith("-"):
             continue
-        key = name.casefold()
-        if key in seen:
+
+        value: str = ""
+        if role in _TEXT_CONTENT_ROLES:
+            value = _ax_name(ax)
+        elif role in _CONTROL_VALUE_ROLES:
+            # The control's LIVE value (what it currently holds), not its label.
+            value = ((ax.get("value") or {}).get("value") or "")
+            if isinstance(value, (int, float)):
+                value = str(value)
+            value = value.strip() if isinstance(value, str) else ""
+        elif _is_live_region(ax):
+            # An aria-live region's announced text (a status / validation message).
+            value = _ax_name(ax)
+        if not value:
             continue
-        seen.add(key)
-        facts.append(Fact(value=name, source_node_id=node_id, verified=True))
+
+        value_bearing = bool(_VALUE_BEARING_RE.search(value))
+        if not value_bearing:
+            # Only label text is deduped (the AX tree repeats it across leaves).
+            key = value.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+        facts.append(Fact(value=value, source_node_id=node_id, verified=True))
         if len(facts) >= max_facts:
             break
     return facts
+
+
+def _is_live_region(ax: dict) -> bool:
+    """True if the node is an ``aria-live`` region (or an ``alert``/``status``
+    role, which are implicitly live). Read from the AX ``properties`` — ``live``
+    is ``"polite"``/``"assertive"`` for an explicit region."""
+    role = (ax.get("role") or {}).get("value", "") or ""
+    if role in ("alert", "status"):
+        return True
+    for prop in ax.get("properties", []) or []:
+        if prop.get("name") == "live":
+            live = (prop.get("value") or {}).get("value")
+            if live in ("polite", "assertive"):
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# PARSE — geometric label↔value pairing (architecture killer-closer #1)
+# ---------------------------------------------------------------------------
+#
+# The worst epistemic failure is a CLEAN CITATION ON THE WRONG NUMBER (reading the
+# past-due row's $142.10 as the amount due). A bare pair of grounded ``Fact``s does
+# not protect against that — two true facts can be mis-associated. ``extract_paired_facts``
+# makes the ASSOCIATION itself grounded: it only emits a ``PairedFact`` when a REAL
+# STRUCTURAL/GEOMETRIC signal joins the label and the value, NEVER 8px reading-order.
+#
+# The four signals (``PairedFact.method``), strongest-first:
+#   - ``aria-labelledby`` : the value node's ``name.sources`` names the label node
+#                           via an ``aria-labelledby`` relatedElement (explicit).
+#   - ``for``             : a native ``<label for>`` relatedElement (``nativeSource``).
+#   - ``dom-ancestry``    : a table row/cell or a shared immediate parent joins a
+#                           label cell/header to a value cell (the AX ``row``/``cell``/
+#                           ``columnheader`` model + ``parentId``) — structural, not visual.
+#   - ``shared-row``      : the label text and a value text vertically overlap (one
+#                           visual row), the label is immediately LEFT of the value,
+#                           and the value is the UNIQUE nearest right-neighbour within
+#                           a small gap. Geometry — but disqualified the moment the
+#                           pairing is AMBIGUOUS (≥2 plausible values on the row), which
+#                           is exactly the reading-order mis-pairing this fence refuses.
+
+# Max horizontal gap (CSS px) between a label's right edge and a value's left edge
+# for a shared-row pairing — beyond this they are not "the same field" visually.
+_SHARED_ROW_MAX_GAP = 220.0
+# A second value within this px of the nearest one makes a shared-row pairing
+# AMBIGUOUS → refused (we never guess which of two adjacent values the label means).
+_SHARED_ROW_AMBIGUITY_MARGIN = 24.0
+
+
+def _grounded_text(ax: dict) -> tuple[str, str]:
+    """``(value, node_id)`` of a node's spoken text + its REAL nodeId, or ``("", "")``
+    when the node is ignored, leaf-synthetic (negative id), or empty. A control's
+    own ``value.value`` is included so a labelled input pairs to what it holds."""
+    if ax.get("ignored"):
+        return "", ""
+    node_id = str(ax.get("nodeId", ""))
+    if not node_id or node_id.startswith("-"):
+        return "", ""
+    role = (ax.get("role") or {}).get("value", "") or ""
+    text = _ax_name(ax)
+    if not text and role in _CONTROL_VALUE_ROLES:
+        v = (ax.get("value") or {}).get("value") or ""
+        text = str(v).strip()
+    return text, node_id
+
+
+def _node_text_via_children(ax: dict, by_id: dict[str, dict]) -> str:
+    """A cell/container's text — its own name, else the first grounded descendant's
+    (a ``cell`` often holds its text in a StaticText child)."""
+    own = _ax_name(ax)
+    if own:
+        return own
+    for cid in ax.get("childIds") or []:
+        child = by_id.get(str(cid))
+        if child is None:
+            continue
+        t = _ax_name(child)
+        if t:
+            return t
+    return ""
+
+
+def _resolve_related_label(
+    source: dict, by_id: dict[str, dict], by_backend: dict[int, dict]
+) -> Optional[dict]:
+    """Resolve the AX node a ``name.sources`` relatedElement points at (the LABEL),
+    via its ``backendDOMNodeId`` (CDP's relatedNodes key). Returns the label ax node
+    or ``None`` when the relationship is empty/unresolvable."""
+    for rel in source.get("relatedNodes") or []:
+        backend = rel.get("backendDOMNodeId")
+        node = by_backend.get(backend) if backend is not None else None
+        if node is None:
+            # Some CDP builds carry the text inline on the relatedNode itself.
+            text = (rel.get("text") or "").strip()
+            if text:
+                return {"__synthetic_text__": text, "backendDOMNodeId": backend}
+            continue
+        return node
+    return None
+
+
+def _aria_pairings(
+    nodes: list[dict], by_id: dict[str, dict], by_backend: dict[int, dict]
+) -> list[PairedFact]:
+    """``aria-labelledby`` / ``<label for>`` pairings: a control's name.sources names
+    a label node by relationship. The control (value) pairs with the label, BOTH
+    grounded to real nodeIds — the strongest, fully-explicit pairing signal.
+
+    The VALUE half is the control's LIVE value (``value.value`` — what the field
+    holds), not its accessible name (which, for a labelled control, is the label
+    echoed back). The value is grounded to the control's own nodeId; a control with
+    no live value yields no pairing (honest absence)."""
+    pairs: list[PairedFact] = []
+    for ax in nodes:
+        node_id = str(ax.get("nodeId", ""))
+        if not node_id or node_id.startswith("-") or ax.get("ignored"):
+            continue
+        # The control's own live value (the value half), not its label-echo name.
+        v = (ax.get("value") or {}).get("value")
+        value_text = str(v).strip() if v not in (None, "") else ""
+        value_id = node_id
+        if not value_text:
+            continue
+        name = ax.get("name") or {}
+        for src in name.get("sources") or []:
+            if src.get("superseded"):
+                continue
+            attr = src.get("attribute")
+            native = src.get("nativeSource")
+            if attr == "aria-labelledby":
+                method = "aria-labelledby"
+            elif native == "label":
+                method = "for"
+            else:
+                continue
+            label_node = _resolve_related_label(src, by_id, by_backend)
+            if label_node is None:
+                continue
+            if "__synthetic_text__" in label_node:
+                continue  # no real label nodeId to ground → skip (honest)
+            label_text, label_id = _grounded_text(label_node)
+            if not label_text or not label_id or label_id == value_id:
+                continue
+            pairs.append(
+                PairedFact(
+                    label=Fact(value=label_text, source_node_id=label_id, verified=True),
+                    value=Fact(value=value_text, source_node_id=value_id, verified=True),
+                    method=method,  # type: ignore[arg-type]
+                )
+            )
+            break  # one pairing per control (the first non-superseded source)
+    return pairs
+
+
+def _table_pairings(
+    nodes: list[dict], by_id: dict[str, dict]
+) -> list[PairedFact]:
+    """``dom-ancestry`` pairings from the AX TABLE model: pair every column header
+    with each value cell in its column, and the row header (first cell) with each
+    value cell in its row. Structural (the ``table``→``row``→``cell``/``columnheader``
+    tree), never visual — a value cell pairs ONLY to the header at its real column
+    index in the same row, so a wrong column never pairs.
+
+    Robustness: a header cell is never itself a value half (no header↔header noise),
+    and the column-header pairing only fires when the header row's cell count equals
+    the data row's — so a multi-level / spanned header (where column indices don't
+    line up) is NOT mis-aligned; the row-header pairing still grounds those rows."""
+    pairs: list[PairedFact] = []
+    header_roles = ("columnheader", "rowheader")
+    for table in nodes:
+        if (table.get("role") or {}).get("value") not in ("table", "grid", "treegrid"):
+            continue
+        # Collect rows in document order; the FIRST all-columnheader row is the
+        # column-header row (a later one is a multi-level header → ignored for
+        # column alignment, which the count-match guard below also enforces).
+        rows: list[list[dict]] = []
+        col_headers: list[dict] = []
+        for rid in _descendant_rows(table, by_id):
+            row = by_id.get(str(rid))
+            if row is None:
+                continue
+            cells = [by_id[str(c)] for c in (row.get("childIds") or []) if str(c) in by_id]
+            cells = [c for c in cells if (c.get("role") or {}).get("value")
+                     in ("cell", "gridcell", "columnheader", "rowheader")]
+            if not cells:
+                continue
+            header_row = all(
+                (c.get("role") or {}).get("value") == "columnheader" for c in cells
+            )
+            if header_row and not col_headers:
+                col_headers = cells
+                continue
+            rows.append(cells)
+
+        for cells in rows:
+            row_header = cells[0]
+            rh_text = _node_text_via_children(row_header, by_id)
+            rh_id = str(row_header.get("nodeId", ""))
+            # Column pairing only when the header row aligns 1:1 with this row.
+            aligned_headers = col_headers if len(col_headers) == len(cells) else []
+            for ci, cell in enumerate(cells):
+                # A header cell is structure, not a value → never the value half.
+                if (cell.get("role") or {}).get("value") in header_roles and ci != 0:
+                    continue
+                cell_text = _node_text_via_children(cell, by_id)
+                cell_id = str(cell.get("nodeId", ""))
+                if not cell_text or not cell_id or cell_id.startswith("-") or ci == 0:
+                    continue
+                # value cell ↔ its column header (same column index, same row).
+                if ci < len(aligned_headers):
+                    header = aligned_headers[ci]
+                    h_text = _node_text_via_children(header, by_id)
+                    h_id = str(header.get("nodeId", ""))
+                    if h_text and h_id and h_id != cell_id:
+                        pairs.append(
+                            PairedFact(
+                                label=Fact(value=h_text, source_node_id=h_id, verified=True),
+                                value=Fact(value=cell_text, source_node_id=cell_id, verified=True),
+                                method="dom-ancestry",
+                            )
+                        )
+                # value cell ↔ the row header (the row's first cell).
+                if rh_text and rh_id and not rh_id.startswith("-") and rh_id != cell_id:
+                    pairs.append(
+                        PairedFact(
+                            label=Fact(value=rh_text, source_node_id=rh_id, verified=True),
+                            value=Fact(value=cell_text, source_node_id=cell_id, verified=True),
+                            method="dom-ancestry",
+                        )
+                    )
+    return pairs
+
+
+def _descendant_rows(table: dict, by_id: dict[str, dict]) -> list[str]:
+    """The ``row`` nodeIds under a table, in document order (rows may sit under a
+    ``rowgroup``/``thead``/``tbody`` between the table and its rows)."""
+    out: list[str] = []
+    stack = list(table.get("childIds") or [])
+    # Preserve document order with an explicit DFS (childIds are ordered).
+    def walk(node_id: str) -> None:
+        node = by_id.get(str(node_id))
+        if node is None:
+            return
+        role = (node.get("role") or {}).get("value")
+        if role == "row":
+            out.append(str(node_id))
+            return  # cells handled by the caller; don't recurse into a row
+        for cid in node.get("childIds") or []:
+            walk(cid)
+
+    for cid in table.get("childIds") or []:
+        walk(cid)
+    return out
+
+
+def _shared_row_pairings(
+    nodes: list[dict], by_id: dict[str, dict], geometry: dict[int, list[float]]
+) -> list[PairedFact]:
+    """``shared-row`` pairings by GEOMETRY: a label text and a value text on one
+    visual row, label immediately LEFT of the value, value the UNIQUE nearest
+    right-neighbour within a gap. REFUSES the moment two values tie (ambiguous), so
+    a reading-order coincidence never becomes a pairing. ``geometry`` maps a real AX
+    nodeId → [x,y,w,h] (CSS px); when empty this signal yields nothing (pure path)."""
+    if not geometry:
+        return []
+    # Grounded laid-out text nodes only.
+    items: list[dict] = []
+    for ax in nodes:
+        if (ax.get("role") or {}).get("value") not in _TEXT_CONTENT_ROLES:
+            continue
+        text, node_id = _grounded_text(ax)
+        if not text or not node_id:
+            continue
+        box = geometry.get(node_id)
+        if not box or box[2] <= 0 or box[3] <= 0:
+            continue
+        items.append({"text": text, "id": node_id, "x": box[0], "y": box[1], "w": box[2], "h": box[3]})
+
+    pairs: list[PairedFact] = []
+    for label in items:
+        if _VALUE_BEARING_RE.search(label["text"]):
+            continue  # a value can't be a label
+        label_right = label["x"] + label["w"]
+        # Candidate values: value-bearing, same row, strictly to the right.
+        cands: list[tuple[float, dict]] = []
+        for val in items:
+            if val is label or not _VALUE_BEARING_RE.search(val["text"]):
+                continue
+            overlap = min(label["y"] + label["h"], val["y"] + val["h"]) - max(label["y"], val["y"])
+            if overlap < 0.5 * min(label["h"], val["h"]):
+                continue
+            gap = val["x"] - label_right
+            if -4.0 <= gap <= _SHARED_ROW_MAX_GAP:
+                cands.append((gap, val))
+        if not cands:
+            continue
+        cands.sort(key=lambda c: c[0])
+        nearest_gap, nearest = cands[0]
+        # AMBIGUITY fence: a second value almost as close → refuse (don't guess).
+        if len(cands) > 1 and (cands[1][0] - nearest_gap) < _SHARED_ROW_AMBIGUITY_MARGIN:
+            continue
+        pairs.append(
+            PairedFact(
+                label=Fact(value=label["text"], source_node_id=label["id"], verified=True),
+                value=Fact(value=nearest["text"], source_node_id=nearest["id"], verified=True),
+                method="shared-row",
+            )
+        )
+    return pairs
+
+
+def ax_node_geometry(
+    ax_tree: dict, layout_by_backend: dict[int, "_LayoutRect"]
+) -> dict[str, list[float]]:
+    """Map a node's REAL AX ``nodeId`` → its [x,y,w,h] (CSS px), bridging the AX
+    tree (nodeId) and the DOMSnapshot geometry (keyed by ``backendDOMNodeId``). Feeds
+    ``extract_paired_facts(geometry=…)`` so the ``shared-row`` signal uses the SAME
+    laid-out rects the numbered map does. Shared by both transports."""
+    geom: dict[str, list[float]] = {}
+    for n in ax_tree.get("nodes", []) or []:
+        if n.get("ignored"):
+            continue
+        node_id = str(n.get("nodeId", ""))
+        backend = n.get("backendDOMNodeId")
+        if not node_id or backend is None:
+            continue
+        rect = layout_by_backend.get(int(backend))
+        if rect is None or rect.w <= 0 or rect.h <= 0:
+            continue
+        geom[node_id] = [rect.x, rect.y, rect.w, rect.h]
+    return geom
+
+
+def extract_paired_facts(
+    ax_tree: dict,
+    *,
+    geometry: Optional[dict[str, list[float]]] = None,
+    max_pairs: int = 80,
+) -> list[PairedFact]:
+    """Harvest geometric label↔value ``PairedFact``s from a live AX tree — the
+    killer-closer-#1 fence at EXTRACT time (architecture). A ``PairedFact`` is emitted
+    ONLY when a real structural/geometric signal joins the two halves; both halves are
+    grounded to real AX nodeIds, so ``PairedFact.backs(label, value)`` is true iff a
+    single pairing grounds an "X is Y" claim byte-identically. A value that merely sits
+    near the wrong label in reading order produces NO backing pairing → the claim is
+    ungroundable and the kernel (Wave C) refuses it.
+
+    ``geometry`` (real AX nodeId → [x,y,w,h] CSS px, from the DOMSnapshot) enables the
+    ``shared-row`` signal; when omitted the function is fully pure over the AX dict and
+    relies on the explicit (aria/for) + structural (table) signals only. Shared verbatim
+    by both actuator transports (Playwright + extension).
+
+    De-duplicated by ``PairedFact.id`` (label-id + value-id + method) so the same
+    pairing surfaced by two signals appears once; distinct value cells never collapse."""
+    nodes = ax_tree.get("nodes", []) or []
+    by_id: dict[str, dict] = {}
+    by_backend: dict[int, dict] = {}
+    for n in nodes:
+        nid = str(n.get("nodeId", ""))
+        if nid:
+            by_id[nid] = n
+        backend = n.get("backendDOMNodeId")
+        if backend is not None:
+            by_backend[int(backend)] = n
+
+    pairs: list[PairedFact] = []
+    pairs.extend(_aria_pairings(nodes, by_id, by_backend))
+    pairs.extend(_table_pairings(nodes, by_id))
+    pairs.extend(_shared_row_pairings(nodes, by_id, geometry or {}))
+
+    # De-dup by stable pairing id (label-id + value-id + method); keep insertion
+    # order (strongest signal first). Distinct value cells never collapse.
+    out: list[PairedFact] = []
+    seen: set[str] = set()
+    for p in pairs:
+        if p.id in seen:
+            continue
+        seen.add(p.id)
+        out.append(p)
+        if len(out) >= max_pairs:
+            break
+    return out
