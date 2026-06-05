@@ -69,6 +69,14 @@ if lsof -ti tcp:8771 >/dev/null 2>&1 || lsof -ti tcp:8773 >/dev/null 2>&1; then
   sleep 1
 fi
 
+# Rotate logs → *.prev so THIS session starts with clean logs (a session never
+# reads stale lines from the last run — appended logs cost real debug time). One
+# previous generation is kept. Services below open fresh files.
+echo "[*] rotating logs → *.prev (fresh logs for this session)"
+for LOG in "$WORKER_LOG" "$BROKER_LOG" /tmp/clarion-ext.log /tmp/clarion-logsink.out; do
+  [ -f "$LOG" ] && mv -f "$LOG" "$LOG.prev" 2>/dev/null || true
+done
+
 # 2a. Always-on browser-log sink (extension SW/HUD → /tmp/clarion-ext.log) -----
 # Lets logs be READ directly (tail -f) instead of copy-pasted out of DevTools.
 if ! lsof -ti tcp:8772 >/dev/null 2>&1; then

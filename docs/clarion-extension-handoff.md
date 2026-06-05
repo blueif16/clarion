@@ -1,5 +1,9 @@
 # Clarion extension — hand-off (voice is the open bug)
 
+> ⚠️ **SUPERSEDED (2026-06-04).** Voice is NOT the open bug — it works end-to-end.
+> The live status + remaining work is now in **`docs/clarion-status.md`**; the
+> next-session prompt is **`docs/clarion-handoff-prompt.md`**. Kept below for history.
+
 Branch: `feat/clarion-extension`. The **relay-coupling bug is FIXED and verified**; the
 **browser-voice path does nothing** and is the next session's job. Read this in full,
 then the three memory entries (`clarion-runtime-and-logs`, `no-fakes-and-direct-logs`,
