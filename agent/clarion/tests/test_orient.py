@@ -82,7 +82,10 @@ def test_summary_is_spoken_ready_and_open_ended() -> None:
     s = readout.summary
     assert "Government benefits | USAGov" in s  # where they are
     assert "Government benefits" in s  # the section heading
-    assert "fields you can fill" in s or "links" in s or "buttons" in s  # affordances
+    # The grounded affordance NAMES are spoken back (robust to singular/plural).
+    assert "Search USAGov" in s and "Pay now" in s and "Disability benefits" in s
+    # Count labels are singular when there is exactly one of a kind.
+    assert "1 field you can fill" in s and "1 button" in s and "1 link" in s
     # Ends on an open prompt → the user states a goal (which is then confirmed).
     assert s.strip().endswith("What would you like to do?")
     # No banned "assistant/helper/assist" language (persona rule).

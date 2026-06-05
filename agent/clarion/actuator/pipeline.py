@@ -54,15 +54,18 @@ _INTERACTIVE_ROLES = {
 _HEADING_ROLES = {"heading"}
 
 # Group the interactive roles into human-spoken affordance buckets for the ORIENT
-# readback ("3 fields you can fill: …"). Order = the order they're read aloud.
-_AFFORDANCE_GROUPS: tuple[tuple[str, frozenset[str]], ...] = (
+# readback ("3 fields you can fill: …"). Each entry is (singular, plural, roles);
+# the readback picks singular/plural by count so "1 field" reads right. Order = the
+# order they're read aloud.
+_AFFORDANCE_GROUPS: tuple[tuple[str, str, frozenset[str]], ...] = (
     (
+        "field you can fill",
         "fields you can fill",
         frozenset({"textbox", "searchbox", "textarea", "combobox", "spinbutton", "slider"}),
     ),
-    ("buttons", frozenset({"button", "switch"})),
-    ("links", frozenset({"link", "menuitem", "tab"})),
-    ("choices", frozenset({"checkbox", "radio", "option", "listbox"})),
+    ("button", "buttons", frozenset({"button", "switch"})),
+    ("link", "links", frozenset({"link", "menuitem", "tab"})),
+    ("choice", "choices", frozenset({"checkbox", "radio", "option", "listbox"})),
 )
 
 # ~4 chars/token is the common rough heuristic; the SelectorMap serialized to the
@@ -412,6 +415,28 @@ def _ax_name(ax: dict) -> str:
     return ((ax.get("name") or {}).get("value", "") or "").strip()
 
 
+def _group_affordances(
+    by_role: dict[str, list[Fact]], *, max_per_group: int
+) -> tuple[list[Fact], list[str]]:
+    """Bucket grounded controls into human affordance groups and render one spoken
+    phrase per non-empty group (count + a few names, singular/plural by count).
+    Shared by both readout builders so the wording is identical everywhere."""
+    affordances: list[Fact] = []
+    phrases: list[str] = []
+    for singular, plural, roles in _AFFORDANCE_GROUPS:
+        items: list[Fact] = []
+        for role in roles:
+            items.extend(by_role.get(role, []))
+        if not items:
+            continue
+        affordances.extend(items)
+        label = singular if len(items) == 1 else plural
+        names = [f.value for f in items[:max_per_group]]
+        more = "" if len(items) <= max_per_group else f" (+{len(items) - max_per_group} more)"
+        phrases.append(f"{len(items)} {label}: {', '.join(names)}{more}")
+    return affordances, phrases
+
+
 def _readout_summary(
     title: str, headings: list[Fact], group_phrases: list[str]
 ) -> str:
@@ -469,19 +494,7 @@ def summarize_ax_tree(
         elif role in _INTERACTIVE_ROLES:
             by_role.setdefault(role, []).append(fact)
 
-    affordances: list[Fact] = []
-    group_phrases: list[str] = []
-    for label, roles in _AFFORDANCE_GROUPS:
-        items: list[Fact] = []
-        for role in roles:
-            items.extend(by_role.get(role, []))
-        if not items:
-            continue
-        affordances.extend(items)
-        names = [f.value for f in items[:max_per_group]]
-        more = "" if len(items) <= max_per_group else f" (+{len(items) - max_per_group} more)"
-        group_phrases.append(f"{len(items)} {label}: {', '.join(names)}{more}")
-
+    affordances, group_phrases = _group_affordances(by_role, max_per_group=max_per_group)
     summary = _readout_summary(title, headings[:max_headings], group_phrases)
     return PageReadout(
         title=title,
@@ -508,18 +521,6 @@ def readout_from_selector_map(
             Fact(value=name, source_node_id=node.node_id, verified=True)
         )
 
-    affordances: list[Fact] = []
-    group_phrases: list[str] = []
-    for label, roles in _AFFORDANCE_GROUPS:
-        items: list[Fact] = []
-        for role in roles:
-            items.extend(by_role.get(role, []))
-        if not items:
-            continue
-        affordances.extend(items)
-        names = [f.value for f in items[:max_per_group]]
-        more = "" if len(items) <= max_per_group else f" (+{len(items) - max_per_group} more)"
-        group_phrases.append(f"{len(items)} {label}: {', '.join(names)}{more}")
-
+    affordances, group_phrases = _group_affordances(by_role, max_per_group=max_per_group)
     summary = _readout_summary(title, [], group_phrases)
     return PageReadout(title=title, url=url, affordances=affordances, summary=summary)
