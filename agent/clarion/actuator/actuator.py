@@ -78,6 +78,7 @@ from clarion.actuator.pipeline import (  # noqa: F401  (re-exported)
     estimate_tokens,
     order_reading,
     parse_snapshot,
+    summarize_ax_tree,
 )
 from clarion.contracts.ports import Actuator
 from clarion.contracts.state import (
@@ -85,6 +86,7 @@ from clarion.contracts.state import (
     AxNode,
     Observation,
     PageDiff,
+    PageReadout,
     SelectorMap,
 )
 
@@ -196,6 +198,19 @@ class PlaywrightActuator(Actuator):
             self._index_to_bbox[index] = c["bbox"]
 
         return SelectorMap(nodes=nodes, token_estimate=estimate_tokens(nodes))
+
+    async def describe_page(self) -> PageReadout:
+        """ORIENT: a grounded readout of the WHOLE page (headings + affordances),
+        not just the interactive map ``perceive`` returns. Fetches the full AXTree
+        and runs the shared pure summarizer; every item is sourced to a real AX
+        ``nodeId`` (foundation §1). Not a ``perceive`` replacement — it's the
+        screen-reader read-back the voice plane speaks before a goal is set."""
+        ax_tree = await self._cdp.send("Accessibility.getFullAXTree")
+        try:
+            title = await self._page.title()
+        except Exception:  # noqa: BLE001 - title is best-effort
+            title = ""
+        return summarize_ax_tree(ax_tree, title=title, url=self._page.url or "")
 
     async def act(self, action: Action) -> Observation:
         """Execute the action against the live page, then re-perceive (§4.3)."""

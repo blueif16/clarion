@@ -73,6 +73,28 @@ class Fact(BaseModel):
     retrieved_at: float = 0.0
 
 
+class PageReadout(BaseModel):
+    """ORIENT — a grounded, spoken-ready description of the current page.
+
+    This is the screen-reader baseline the co-pilot reads back BEFORE any goal is
+    set (the goal-formation on-ramp): what the page IS and what the user can DO on
+    it. The invariant holds here too (foundation §1): every ``Fact`` in
+    ``headings`` / ``affordances`` carries the real AX ``source_node_id`` it was
+    read from — nothing in a readout is ungrounded.
+
+    ``affordances`` is the recommend step (the controls the page actually offers);
+    ``summary`` is the single readback string the voice plane speaks, ending on an
+    open prompt so the user states their goal (which is then confirmed — never
+    assumed).
+    """
+
+    title: str = ""
+    url: str = ""
+    headings: list[Fact] = Field(default_factory=list)
+    affordances: list[Fact] = Field(default_factory=list)
+    summary: str = ""
+
+
 class Passage(BaseModel):
     """A chunk produced by Ingest (Unsiloed) and consumed by the Retriever.
 
@@ -235,6 +257,7 @@ __all__ = [
     "AxNode",
     "SelectorMap",
     "Fact",
+    "PageReadout",
     "Passage",
     "Profile",
     "Action",

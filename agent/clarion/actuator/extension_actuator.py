@@ -46,6 +46,7 @@ from clarion.actuator.pipeline import (
     estimate_tokens,
     order_reading,
     parse_snapshot,
+    summarize_ax_tree,
 )
 from clarion.actuator.relay import CdpRelay
 from clarion.contracts.ports import Actuator
@@ -54,6 +55,7 @@ from clarion.contracts.state import (
     AxNode,
     Observation,
     PageDiff,
+    PageReadout,
     SelectorMap,
 )
 
@@ -138,6 +140,31 @@ class ExtensionActuator(Actuator):
             self._index_to_bbox[index] = c["bbox"]
 
         return SelectorMap(nodes=nodes, token_estimate=estimate_tokens(nodes))
+
+    async def describe_page(self) -> PageReadout:
+        """ORIENT readout over the relay transport — the SAME shared summarizer as
+        the Playwright path. Fetches the full AXTree via the relay and reads the
+        live tab's title/url with a small ``Runtime.evaluate``; every surfaced item
+        is sourced to a real AX ``nodeId`` (foundation §1)."""
+        await self._enable_domains()
+        ax_tree = await self._relay.send("Accessibility.getFullAXTree")
+        title = await self._eval_string("document.title")
+        url = await self._eval_string("location.href")
+        return summarize_ax_tree(ax_tree, title=title, url=url)
+
+    async def _eval_string(self, expression: str) -> str:
+        """Evaluate a string-returning JS expression over the relay (title/url for
+        the readout). Best-effort: returns "" on any failure so ORIENT never breaks
+        on a page that blocks evaluation."""
+        try:
+            res = await self._relay.send(
+                "Runtime.evaluate",
+                {"expression": expression, "returnByValue": True},
+            )
+            value = (res.get("result") or {}).get("value")
+            return str(value) if value is not None else ""
+        except Exception:  # noqa: BLE001 - readout metadata is best-effort
+            return ""
 
     async def act(self, action: Action) -> Observation:
         """Execute the action over the relay, then re-perceive (§4.3)."""
