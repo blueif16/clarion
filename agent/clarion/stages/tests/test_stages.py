@@ -1,20 +1,55 @@
-"""ST1 — LEGACY stage-graph acceptance tests — QUARANTINED (Wave-C de-hardcoding).
+"""Wave-C Step-7 — the GENERIC INVARIANT SPEC (the red-before-green guard).
 
-These 12 tests pin the DELETED hardcoded pay topology (AUTH→LOCATE→FILL→REVIEW→
-⟨PAY⟩→CONFIRM, the §3.2 done-predicate/negative-check table, the per-stage node
-advance). The Wave-C migration (architecture Step 3) replaced that baked topology
-with the GENERIC EXECUTOR (a Reasoner-derived ``list[Subgoal]`` + the kernel loop
-per subgoal + the generic ``evaluate_success_check``), so every assertion here is
-red-by-design.
+This file REPLACES the quarantined legacy pay-topology acceptance suite. The 12
+old tests pinned the DELETED hardcoded ``AUTH→LOCATE→FILL→REVIEW→⟨PAY⟩→CONFIRM``
+topology, the §3.2 done-predicate/negative-check table, and the ``_hero_plan``
+shape — every one of those symbols is gone (the strangler migration replaced the
+baked stages with a Reasoner-derived ``list[Subgoal]`` + the generic executor).
+ZERO topology assertions and no module skip remain.
 
-Per the migration plan they are NOT deleted — they are QUARANTINED so the rest of
-the suite stays green; AG-GREEN rewrites them as the generic spec in Wave D
-(invariant tests: ungrounded/mispaired/uncovered → refused; model-reversible
-submit still can't reach ACT in Fast; no-op doesn't advance).
+In their place: the goal-AGNOSTIC invariant battery from migration **Step 7**,
+asserted through the PUBLIC interface (``build_kernel`` / ``build_stage_graph``
+driven by a scripted ``FakeReasoner`` — BEHAVIOR, never internals). It is the guard
+that a silent invariant weakening (a fabricated value spoken, a model-reversible
+submit auto-acted in Fast, a confident negative on an unread region, a no-op
+advancing, a baked stage name reappearing) is caught RED before green.
 
-Module-level skip (the topology symbols this module imported — ``HERO_STAGE_IDS``,
-``plan_goal('pay my electric bill')``, the DONE_PREDICATES registry — no longer
-exist, so collection itself must not crash: we guard the imports and skip).
+The two invariants under guard (architecture "The two invariants, enforced in code"):
+  - **Epistemic** — no fact without a source; verbatim + paired-grounded speech.
+  - **Agentic** — no consequential act without a yes (dual-signal fail-closed gate).
+
+Network-free: FakeReasoner only — no real LLM / site / keys. Deterministic.
+
+------------------------------------------------------------------------------
+Step-7 coverage matrix (invariant → the test that pins it; ✦ = added here, the
+gaps the audit showed were NOT yet pinned through the public interface; the rest
+are cross-referenced to the owning suite so this spec consolidates without
+duplicating an already-green assertion):
+
+  1. ungrounded value (no source) → refused, never spoken
+        ✦ test_ungrounded_value_is_never_filled_or_spoken (build_kernel)
+        ↔ kernel/tests/test_kernel.py::test_verify_node_refuses_ungrounded_fact_in_graph
+  2. mispaired value (no single backing PairedFact) → refused
+        ✦ test_fabricated_value_ref_is_dropped_not_spoken (build_kernel)
+        ↔ kernel/tests/test_kernel.py::test_pairing_fence_needs_a_single_backing_pair
+        ↔ tests/test_paired_facts.py::test_table_refuses_the_cross_row_mispairing
+        ↔ tests/test_paired_facts.py::test_shared_row_refuses_when_two_values_tie
+  3. uncovered / truncated-harvest negative → HEDGE, not a confident "no X"
+        ↔ kernel/tests/test_gate_wiring.py::test_uncovered_negative_is_hedged_not_spoken
+        ↔ kernel/tests/test_negative_verifier.py::test_uncovered_negative_hedges_image_rendered_charge
+  4. a model-``reversible`` submit the structural net escalates → can't reach ACT
+     in Fast (routes through CONSENT)
+        ✦ test_model_reversible_but_structurally_escalated_submit_gates_in_fast (build_stage_graph)
+        ↔ kernel/tests/test_irreversibility_gate.py::test_model_reversible_cannot_downgrade_structural_escalation
+        ↔ kernel/tests/test_kernel.py::test_fast_mode_still_interrupts_irreversible
+  5. a no-op step (page unchanged) → does NOT advance
+        ↔ stages/tests/test_executor.py::test_noop_step_is_failed_not_advanced_across_every_check
+        ↔ stages/tests/test_executor.py::test_executor_replans_then_gives_up_on_stuck_subgoal
+  6. a goal-derived plan is goal-agnostic (no baked stage names / "pay electric bill")
+        ✦ test_plan_carries_no_baked_pay_topology (build_stage_graph, end-to-end)
+        ↔ stages/tests/test_executor.py::test_planner_emits_goal_derived_subgoals
+        ↔ stages/tests/test_executor.py::test_planner_falls_open_to_generic_subgoal_on_empty
+------------------------------------------------------------------------------
 """
 
 from __future__ import annotations
@@ -22,44 +57,24 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from langgraph.types import Command
 
-pytestmark = pytest.mark.skip(
-    reason="legacy pay-topology (AUTH→…→CONFIRM); AG-GREEN rewrites as the generic "
-    "spec (Wave D). Quarantined by AG-KERNEL during the Reasoner de-hardcoding."
-)
-
-from langgraph.types import Command  # noqa: E402
-
-from clarion.contracts.events import ConsentDecision  # noqa: E402
-from clarion.contracts.ports import Actuator, Retriever  # noqa: E402
-from clarion.contracts.state import (  # noqa: E402
+from clarion.contracts.events import ConsentDecision
+from clarion.contracts.ports import Actuator, Retriever
+from clarion.contracts.state import (
     Action,
     AxNode,
     Fact,
     Observation,
     PageDiff,
     SelectorMap,
+    StepProposal,
+    Subgoal,
 )
-from clarion.fakes import FakeActuator, FakeRetriever  # noqa: E402
-from clarion.kernel.graph import seed_state  # noqa: E402
-
-# The deleted pay-topology symbols this legacy module referenced. Stubbed to None
-# so module import (collection) succeeds; every test is skipped above, so the
-# NameErrors they would raise are never reached. AG-GREEN deletes these.
-HERO_STAGE_IDS = ()
-plan_goal = None  # type: ignore[assignment]
-verbalize_plan = None  # type: ignore[assignment]
-build_stage_graph = None  # type: ignore[assignment]
-seed_stage_state = None  # type: ignore[assignment]
-DONE_PREDICATES: dict = {}
-NEGATIVE_CHECKS: dict = {}
-detect_rescue = None  # type: ignore[assignment]
-fill_done = None  # type: ignore[assignment]
-is_choked_widget = None  # type: ignore[assignment]
-needs_rescue = None  # type: ignore[assignment]
-no_required_field_blank = None  # type: ignore[assignment]
-resolve_done_predicate = None  # type: ignore[assignment]
-resolve_negative_check = None  # type: ignore[assignment]
+from clarion.fakes import FakeActuator, FakeReasoner, FakeRetriever
+from clarion.kernel.graph import build_kernel, seed_state
+from clarion.kernel.policy import is_speakable_value, speakable
+from clarion.stages.graph import build_stage_graph, seed_stage_state
 
 
 def _cfg() -> dict:
@@ -67,247 +82,37 @@ def _cfg() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# SelectorMap fixtures
+# Scriptable fakes — deterministic, network-free.
 # ---------------------------------------------------------------------------
 
 
-def _sm_blank_required() -> SelectorMap:
-    """A form with ONE required textbox left blank (empty value) + a submit
-    button. The required flag is set; the name is the bare label only → blank."""
-    return SelectorMap(
-        nodes={
-            0: AxNode(
-                index=0,
-                role="textbox",
-                name="",  # blank value — only the label below carries text
-                state={"required": True},
-                node_id="n-amount",
-            ),
-            1: AxNode(index=1, role="button", name="Pay bill", node_id="n-pay"),
-        },
-        token_estimate=20,
-    )
+class _ScriptedRetriever(Retriever):
+    """Returns exactly the facts handed in (ungrounded ones included), so the
+    epistemic refusal paths are drivable verbatim."""
+
+    def __init__(self, facts: list[Fact]) -> None:
+        self._facts = facts
+
+    async def query(self, q: str, *, k: int = 5) -> list[Fact]:  # noqa: ARG002
+        return list(self._facts)[:k]
 
 
-def _sm_happy_filled() -> SelectorMap:
-    """The same form, required field now populated (a value-bearing name)."""
-    return SelectorMap(
-        nodes={
-            0: AxNode(
-                index=0,
-                role="textbox",
-                name="Amount: $42.00",  # populated
-                state={"required": True},
-                node_id="n-amount",
-            ),
-            1: AxNode(index=1, role="button", name="Pay bill", node_id="n-pay"),
-        },
-        token_estimate=24,
-    )
+class _FillActuator(Actuator):
+    """A one-textbox + one-button page. ``act`` records the action so we can prove
+    BY CALL whether a value was ever filled (the epistemic side-effect fence)."""
 
-
-def _sm_choked_widget() -> SelectorMap:
-    """A textbox with a role but an EMPTY accessible name — the screen reader has
-    nothing to announce → the RESCUE trigger (execution §3 note)."""
-    return SelectorMap(
-        nodes={
-            0: AxNode(index=0, role="textbox", name="", node_id="n-unlabeled"),
-            1: AxNode(index=1, role="button", name="Continue", node_id="n-continue"),
-        },
-        token_estimate=18,
-    )
-
-
-# ---------------------------------------------------------------------------
-# (1) planner emits the six named stages in order, each with predicate + checks
-# ---------------------------------------------------------------------------
-
-
-def test_planner_emits_six_named_stages_in_order() -> None:
-    plan = plan_goal("pay my electric bill")
-    assert [s.id for s in plan] == list(HERO_STAGE_IDS)
-    assert [s.id for s in plan] == ["AUTH", "LOCATE", "FILL", "REVIEW", "PAY", "CONFIRM"]
-
-    for stage in plan:
-        # Each stage carries a registered done-predicate (machine-checkable name,
-        # never model say-so — §3.3) ...
-        assert stage.done_predicate, f"{stage.id} has no done_predicate"
-        assert stage.done_predicate in DONE_PREDICATES, (
-            f"{stage.id}.done_predicate {stage.done_predicate!r} not registered"
-        )
-        assert callable(resolve_done_predicate(stage.done_predicate))
-        # ... and a non-empty negative-verification list, each entry registered.
-        assert stage.negative_checks, f"{stage.id} has no negative_checks"
-        for nc in stage.negative_checks:
-            assert nc in NEGATIVE_CHECKS, f"{stage.id} negative check {nc!r} not registered"
-            assert callable(resolve_negative_check(nc))
-        # ... and a tool subset (the specialized node's scoped tools — §3.2 col 2).
-        assert stage.tools, f"{stage.id} has no tool subset"
-
-    # The plan reads aloud as coherent stages (the legibility beat — §3.1).
-    spoken = verbalize_plan(plan)
-    assert spoken.lower().startswith("here's my plan")
-    assert "log in" in spoken.lower()
-
-
-def test_planner_matches_the_3_2_table_exactly() -> None:
-    """Pin the §3.2 done-predicate / negative-check mapping so a drift is caught."""
-    plan = {s.id: s for s in plan_goal("pay my electric bill")}
-    assert plan["AUTH"].done_predicate == "auth_done"
-    assert plan["AUTH"].negative_checks == ["no_error_banner"]
-    assert plan["LOCATE"].done_predicate == "locate_done"
-    assert plan["LOCATE"].negative_checks == ["no_autopay_scheduled"]
-    assert plan["FILL"].done_predicate == "fill_done"
-    assert plan["FILL"].negative_checks == [
-        "no_required_field_blank",
-        "no_silent_validation_error",
-    ]
-    assert plan["REVIEW"].done_predicate == "review_done"
-    assert plan["REVIEW"].negative_checks == ["no_surprise_fee"]
-    assert plan["PAY"].done_predicate == "pay_done"
-    assert plan["PAY"].negative_checks == ["confirmation_present"]
-    assert plan["CONFIRM"].done_predicate == "confirm_done"
-    assert plan["CONFIRM"].negative_checks == ["not_still_on_form"]
-
-
-# ---------------------------------------------------------------------------
-# (2) blank required field → FILL done-predicate False (cannot advance)
-# ---------------------------------------------------------------------------
-
-
-def test_fill_done_false_on_blank_required_field() -> None:
-    state = seed_state(goal="pay my electric bill")
-    sm = _sm_blank_required()
-    # The done-predicate refuses to advance: the required field is blank.
-    assert fill_done(state, sm) is False
-    # And the negative check names the exact violation.
-    assert no_required_field_blank(state, sm) is False
-    # RESCUE does NOT fire here — the field has a role; it's blank-of-value, not
-    # blank-of-name (a labelled-but-empty input is a different problem).
-    # (The blank in (2) is a *value* blank with required state, not an empty NAME.)
-
-
-# ---------------------------------------------------------------------------
-# (3) textbox with role but EMPTY name → RESCUE detection fires
-# ---------------------------------------------------------------------------
-
-
-def test_rescue_detection_fires_on_unlabeled_widget() -> None:
-    sm = _sm_choked_widget()
-    assert needs_rescue(sm) is True
-    choked = detect_rescue(sm)
-    assert len(choked) == 1
-    assert choked[0].node_id == "n-unlabeled"
-    assert is_choked_widget(choked[0]) is True
-    # A labelled control is NOT choked.
-    labelled = AxNode(index=2, role="button", name="Continue", node_id="n-x")
-    assert is_choked_widget(labelled) is False
-
-
-def test_rescue_detection_fires_on_focus_trap() -> None:
-    """The second RESCUE heuristic: a focused-but-hidden/disabled control (a
-    focus-trap) chokes the screen reader even with a name."""
-    trapped = AxNode(
-        index=0,
-        role="button",
-        name="OK",
-        state={"focused": True, "hidden": True},
-        node_id="n-trap",
-    )
-    assert is_choked_widget(trapped) is True
-    explicit = AxNode(
-        index=1,
-        role="textbox",
-        name="Search",
-        state={"focus_trap": True},
-        node_id="n-trap2",
-    )
-    assert is_choked_widget(explicit) is True
-
-
-# ---------------------------------------------------------------------------
-# (4) happy-path SelectorMap → FILL done-predicate True, advances
-# ---------------------------------------------------------------------------
-
-
-def test_fill_done_true_on_happy_path() -> None:
-    state = seed_state(goal="pay my electric bill")
-    sm = _sm_happy_filled()
-    assert fill_done(state, sm) is True
-    assert no_required_field_blank(state, sm) is True
-    assert needs_rescue(sm) is False  # labelled + filled → no rescue
-
-
-# ---------------------------------------------------------------------------
-# (4b) the FILL stage NODE advances on a happy page, replans on a blank one
-# ---------------------------------------------------------------------------
-
-
-# A retriever grounding the LOCATE facts (amount, payee, due-date) so the LOCATE
-# stage's done-predicate (>=3 speakable facts) is satisfied — the hero chain.
-def _hero_retriever() -> FakeRetriever:
-    facts = [
-        Fact(value="amount: $42.00", source_node_id="doc::amount", verified=True),
-        Fact(value="payee: City Electric", source_node_id="doc::payee", verified=True),
-        Fact(value="due date: 2026-06-15", source_node_id="doc::due", verified=True),
-    ]
-    # The FakeRetriever matches by query substring; key on the words the per-stage
-    # kernel goal carries so every stage's GROUND returns the grounded set.
-    return FakeRetriever(corpus={"": facts, "amount": facts, "find": facts})
-
-
-class _HeroActuator(Actuator):
-    """A self-hosted-clone analogue that satisfies the whole hero chain so the
-    stage graph flows AUTH → LOCATE → FILL → REVIEW → ⟨PAY⟩ → CONFIRM.
-
-    The tree always carries a logged-in marker (AUTH), the grounded amount on the
-    page (REVIEW cross-check), a required Amount field (FILL), and a Pay button.
-    ``fill`` populates the field; the Pay ``click`` flips the page to a
-    confirmation (PAY/CONFIRM). ``never_fills`` keeps FILL stuck for the replan
-    test."""
-
-    def __init__(self, *, never_fills: bool = False) -> None:
+    def __init__(self) -> None:
         self.act_calls: list[Action] = []
-        self._filled = False
-        self._paid = False
-        self._never_fills = never_fills
+        self._filled_value: str | None = None
 
     def _map(self) -> SelectorMap:
-        if self._paid:
-            return SelectorMap(
-                nodes={
-                    0: AxNode(
-                        index=0,
-                        role="status",
-                        name="Confirmation #12345 — payment success",
-                        node_id="n-confirm",
-                    ),
-                    1: AxNode(
-                        index=1, role="link", name="My account", node_id="n-acct"
-                    ),
-                },
-                token_estimate=30,
-            )
-        amount_name = "Amount: $42.00" if self._filled else ""
+        name = f"Amount: {self._filled_value}" if self._filled_value else "Amount"
         return SelectorMap(
             nodes={
-                0: AxNode(index=0, role="link", name="Log out", node_id="n-logout"),
-                1: AxNode(
-                    index=1,
-                    role="textbox",
-                    name=amount_name,
-                    state={"required": True},
-                    node_id="n-amount",
-                ),
-                2: AxNode(
-                    index=2,
-                    role="text",
-                    name="Balance due: amount: $42.00 to City Electric",
-                    node_id="n-balance",
-                ),
-                3: AxNode(index=3, role="button", name="Pay bill", node_id="n-pay"),
+                0: AxNode(index=0, role="textbox", name=name, node_id="n-amount"),
+                1: AxNode(index=1, role="button", name="Continue", node_id="n-c"),
             },
-            token_estimate=48,
+            token_estimate=20,
         )
 
     async def perceive(self) -> SelectorMap:
@@ -315,229 +120,305 @@ class _HeroActuator(Actuator):
 
     async def act(self, action: Action) -> Observation:
         self.act_calls.append(action)
-        if action.kind == "fill" and not self._never_fills:
-            self._filled = True
-        if action.kind == "click":
-            self._paid = True
+        if action.kind == "fill" and action.value is not None:
+            self._filled_value = action.value
         return Observation(selector_map=self._map(), success=True)
 
     async def diff(self, before: SelectorMap, after: SelectorMap) -> PageDiff:
         return PageDiff()
 
 
-async def test_fill_stage_node_advances_when_filled() -> None:
-    """A happy hero run: the kernel fills the required field, FILL.done is True,
-    and the FILL stage routes FORWARD (stage_idx advances past FILL)."""
-    retriever = _hero_retriever()
-    actuator = _HeroActuator()
-    # Fast mode so reversible fills auto-proceed; the irreversible Pay still gates,
-    # but we resume it below so the run reaches CONFIRM.
-    graph = build_stage_graph(retriever, actuator, mode="fast", max_replans=2)
-    config = _cfg()
-
-    seed = seed_stage_state(mode="fast", page_index=await actuator.perceive())
-    result = await graph.ainvoke(seed, config)
-    # The Pay step (irreversible) armed the consent gate even in Fast mode.
-    if "__interrupt__" in result:
-        result = await graph.ainvoke(
-            Command(resume=ConsentDecision(decision="approve").model_dump()), config
-        )
-
-    # The fill actually happened (the kernel's ACT fired the native-setter fill).
-    assert any(a.kind == "fill" for a in actuator.act_calls)
-    # FILL's machine done-gate passed against the re-perceived (now-filled) tree —
-    # the stage advanced rather than replanning forever.
-    fill_exit = [e for e in result["trace"] if e.node == "FILL" and e.event == "exit"]
-    assert fill_exit, "no FILL exit trace event"
-    assert fill_exit[-1].data["done"] is True
+def _fill_step(*, value_ref: str | None, say: str) -> FakeReasoner:
+    """A reasoner scripted to fill index 0 with ``value_ref`` (reversible)."""
+    return FakeReasoner(
+        steps=[
+            StepProposal(
+                scratch_reasoning="fill the amount",
+                action_kind="fill",
+                target_index=0,
+                value_ref=value_ref,
+                irreversibility="reversible",
+                success_check="field_nonempty",
+                say=say,
+            )
+        ]
+    )
 
 
-async def test_fill_stage_node_replans_when_field_stays_blank() -> None:
-    """A stuck FILL: the field never populates → FILL.done stays False → the
-    stage routes to the REPLANNER, which retries (bounded) and gives up to END
-    rather than looping forever."""
-    retriever = _hero_retriever()
-    actuator = _HeroActuator(never_fills=True)
-    graph = build_stage_graph(retriever, actuator, mode="fast", max_replans=1)
+# ===========================================================================
+# INVARIANT 1 (epistemic) — an UNGROUNDED value is refused: never filled, never
+# spoken. New behavioral pin through build_kernel: the kernel must not turn a
+# source-less fact into a side-effect or an utterance.
+# ===========================================================================
 
-    seed = seed_stage_state(mode="fast", page_index=await actuator.perceive())
+
+async def test_ungrounded_value_is_never_filled_or_spoken() -> None:
+    """An ungrounded fact (``source_node_id is None``) reaches GROUND, but VERIFY
+    refuses it and the membership fence (#2) drops it: it is neither filled into the
+    field nor read back as a spoken value. The kernel falls open to a safe
+    read-back, but the ungrounded string never appears in it.
+
+    (Cross-ref: VERIFY's refusal flag itself is pinned in
+    kernel/tests/test_kernel.py::test_verify_node_refuses_ungrounded_fact_in_graph;
+    here we pin the DOWNSTREAM behavior — it cannot be spoken or acted.)"""
+    ungrounded = Fact(value="made-up $999.00", source_node_id=None)
+    retriever = _ScriptedRetriever([ungrounded])
+    actuator = _FillActuator()
+    # The reasoner references the ungrounded fact's id — the guard accepts the id
+    # (it IS a live Fact.id), but is_speakable_value rejects the unverified value.
+    graph = build_kernel(
+        _fill_step(value_ref=ungrounded.id, say="made-up $999.00"),
+        retriever,
+        actuator,
+        mode="fast",
+    )
+    seed = seed_state(goal="enter the amount", mode="fast")
+    seed["page_index"] = await actuator.perceive()
     final = await graph.ainvoke(seed, _cfg())
 
-    # FILL never reported done ...
-    fill_exits = [e for e in final["trace"] if e.node == "FILL" and e.event == "exit"]
-    assert fill_exits and all(e.data["done"] is False for e in fill_exits)
-    # ... the replanner ran and ultimately gave up (bounded, no infinite loop).
-    gave_up = [
-        e for e in final["trace"] if e.node == "REPLANNER" and e.data.get("gave_up")
-    ]
-    assert gave_up, "expected the replanner to give up after max_replans"
+    # Epistemic clause: the source-less value was never filled into the field …
+    assert all(a.value != "made-up $999.00" for a in actuator.act_calls)
+    assert actuator._filled_value is None
+    # … and never surfaced in the spoken proposal.
+    assert "made-up" not in final["pending_proposal"].utterance.lower()
+    assert "$999" not in final["pending_proposal"].utterance
+    # The grounded set carries the fact but it is refused (verified False, unspeakable).
+    assert speakable(final["grounded_facts"]) == []
 
 
-# ---------------------------------------------------------------------------
-# (3b) the RESCUE cross-cut fires inside the live graph and returns to the stage
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# INVARIANT 2 (epistemic) — a MISPAIRED / fabricated value with no grounded
+# backing is refused. The kernel only ever fills/speaks a value that resolves to a
+# real Fact.id AND is a live grounded member; a value_ref the model invented (or a
+# paraphrase it tried to substitute) is dropped — never spoken.
+#
+# The geometric mis-pairing itself (a clean citation on the wrong number) is the
+# extract-time fence, pinned at the policy + extractor level (cross-refs below).
+# Through build_kernel the testable behavior is the value-fabrication refusal: the
+# kernel never emits an "X is Y" the grounded set doesn't back.
+# ===========================================================================
 
 
-class _ChokedThenClearActuator(Actuator):
-    """The SEEDED stage-entry tree (passed as ``page_index``) has a choked widget;
-    the rescue sub-flow's re-perceive returns a CLEAN tree (the choked widget now
-    carries an accessible name). Proves RESCUE fires, runs, clears, and returns
-    control to the interrupted stage. ``perceive`` is the rescue's relabel — it is
-    ALWAYS clean (the choked state lives only in the seeded ``page_index``)."""
+async def test_fabricated_value_ref_is_dropped_not_spoken() -> None:
+    """The reasoner points ``value_ref`` at an id that resolves to NO live Fact (a
+    value the model fabricated rather than read off a grounded span). The
+    reasoner_guard rejects the off-grounding proposal → the kernel discards it for a
+    safe read-back; the fabricated value is never filled and never spoken.
+
+    (Cross-ref for the geometric mis-pairing refusal itself:
+    kernel/tests/test_kernel.py::test_pairing_fence_needs_a_single_backing_pair and
+    tests/test_paired_facts.py::{test_table_refuses_the_cross_row_mispairing,
+    test_shared_row_refuses_when_two_values_tie}.)"""
+    grounded = Fact(value="$84.32", source_node_id="n-amount", verified=True)
+    retriever = _ScriptedRetriever([grounded])
+    actuator = _FillActuator()
+    graph = build_kernel(
+        _fill_step(value_ref="fact-deadbeefdeadbeef", say="$142.10"),  # dangling id
+        retriever,
+        actuator,
+        mode="fast",
+    )
+    seed = seed_state(goal="enter the amount", mode="fast")
+    seed["page_index"] = await actuator.perceive()
+    final = await graph.ainvoke(seed, _cfg())
+
+    # The fabricated/mispaired value never reached the page as a side-effect: the
+    # discarded proposal degrades to a harmless read-back, so NO fill (and no
+    # action carrying the fabricated value) is ever executed.
+    assert all(a.kind != "fill" for a in actuator.act_calls)
+    assert all(a.value != "$142.10" for a in actuator.act_calls)
+    assert actuator._filled_value is None
+    # … and is not in the utterance (the dangling-ref discard left a grounded
+    # read-back of the REAL fact only).
+    assert "$142.10" not in final["pending_proposal"].utterance
+    # The guard recorded the rejection (audit trail of the refusal).
+    rejected = [e for e in final["trace"] if e.node == "PROPOSE" and "rejected" in e.data]
+    assert rejected, "expected a PROPOSE rejection of the dangling value_ref"
+    # Sanity: the real grounded value WOULD be speakable (the fence is selective,
+    # not a blanket mute).
+    assert is_speakable_value("$84.32", final["grounded_facts"]) is True
+
+
+# ===========================================================================
+# INVARIANT 3 (epistemic) — an uncovered / truncated-harvest negative HEDGES.
+# Fully owned by the AG-GATE suite through the public build_kernel API; pinned
+# end-to-end there. Cross-referenced (no re-assertion) to keep this spec a single
+# coherent, non-duplicating battery:
+#   ↔ kernel/tests/test_gate_wiring.py::test_uncovered_negative_is_hedged_not_spoken
+#   ↔ kernel/tests/test_gate_wiring.py::test_covered_negative_is_spoken
+#   ↔ kernel/tests/test_negative_verifier.py::test_uncovered_negative_hedges_image_rendered_charge
+# ===========================================================================
+
+
+# ===========================================================================
+# INVARIANT 4 (agentic) — a control the MODEL judges ``reversible`` that the
+# independent structural net escalates (no grounded undo) CANNOT reach ACT in Fast
+# mode: it routes through CONSENT. New end-to-end pin through the EXECUTOR (the
+# public stage graph) — the dual-signal gate fires under the real run, not just in
+# the classifier unit. (Classifier unit: test_irreversibility_gate.py.)
+# ===========================================================================
+
+
+class _SubmitActuator(Actuator):
+    """A page with ONE consequential, benignly-named control and NO undo/cancel
+    affordance anywhere — the structural net's UNKNOWN-on-no-undo trigger."""
 
     def __init__(self) -> None:
         self.act_calls: list[Action] = []
 
-    @staticmethod
-    def choked() -> SelectorMap:
+    def _map(self) -> SelectorMap:
         return SelectorMap(
-            nodes={0: AxNode(index=0, role="textbox", name="", node_id="n-blind")},
+            nodes={0: AxNode(index=0, role="button", name="Continue", node_id="n-c")},
             token_estimate=10,
         )
 
-    def _clean(self) -> SelectorMap:
-        # The relabelled tree: the widget now has an accessible name (rescued).
-        return SelectorMap(
-            nodes={
-                0: AxNode(
-                    index=0, role="textbox", name="Amount", node_id="n-blind"
-                ),
-            },
-            token_estimate=14,
-        )
-
     async def perceive(self) -> SelectorMap:
-        return self._clean()
+        return self._map()
 
     async def act(self, action: Action) -> Observation:
         self.act_calls.append(action)
-        return Observation(selector_map=self._clean(), success=True)
+        return Observation(selector_map=self._map(), success=True)
 
     async def diff(self, before: SelectorMap, after: SelectorMap) -> PageDiff:
         return PageDiff()
 
 
-async def test_rescue_cross_cut_fires_and_returns_in_graph() -> None:
-    """In the live stage graph: entering the first stage on a choked tree branches
-    to RESCUE; RESCUE re-perceives a clean tree and returns to that stage."""
-    retriever = FakeRetriever()
-    actuator = _ChokedThenClearActuator()
-    graph = build_stage_graph(retriever, actuator, mode="fast", max_replans=1)
-
-    # Seed the graph with the choked tree (what the first stage sees on entry).
-    seed = seed_stage_state(mode="fast", page_index=actuator.choked())
-    final = await graph.ainvoke(seed, _cfg())
-
-    # RESCUE fired and recorded the choked node ...
-    triggered = [e for e in final["trace"] if e.data.get("rescue_triggered")]
-    assert triggered, "RESCUE was not triggered on the choked tree"
-    # ... ran and returned control to a stage node (the AUTH stage is first).
-    rescue_exit = [e for e in final["trace"] if e.node == "RESCUE" and e.event == "exit"]
-    assert rescue_exit, "RESCUE sub-flow did not run"
-    assert rescue_exit[-1].data["returned_to"].startswith("stage_")
-    assert rescue_exit[-1].data["resolved"] is True  # the clean re-perceive cleared it
-    # The returned-to stage did NOT immediately re-trigger rescue (the
-    # _rescue_done_for guard) — only one rescue_triggered event.
-    assert len(triggered) == 1, "rescue re-triggered on the same tree (loop guard failed)"
+def _reversible_click_reasoner() -> FakeReasoner:
+    """The model is CONFIDENT this consequential click is reversible — the worst
+    agentic failure mode (a benignly-named control that mutates). One subgoal so the
+    executor runs exactly this step."""
+    return FakeReasoner(
+        subgoals=[Subgoal(description="proceed", done_check="node_added")],
+        steps=[
+            StepProposal(
+                scratch_reasoning="this looks like a harmless next button",
+                action_kind="click",
+                target_index=0,
+                value_ref=None,
+                irreversibility="reversible",  # the model is wrong / over-confident
+                success_check="node_added",
+                say="",
+            )
+        ],
+    )
 
 
-# ---------------------------------------------------------------------------
-# (5) nodes return ONLY-NEW trace entries — no double-count under the reducer
-# ---------------------------------------------------------------------------
+async def test_model_reversible_but_structurally_escalated_submit_gates_in_fast() -> None:
+    """Through the public stage graph in FAST mode: the model says ``reversible``,
+    but the structural pre-screen escalates a consequential control with no grounded
+    undo to ``unknown`` → the step CANNOT auto-act; it routes through CONSENT and
+    the executor re-surfaces the interrupt. Nothing is clicked before the yes.
 
-
-async def test_no_double_count_under_reducer() -> None:
-    """The §18.7 reducer rule: every node returns ONLY its new trace/consent
-    entries. We prove no double-count two ways:
-      (a) the planner's single PLANNER exit event appears EXACTLY once;
-      (b) no TraceEvent object identity is duplicated across the accumulated trace
-          (a node re-emitting prior+new would surface the same kernel event twice).
-    """
-    retriever = _hero_retriever()
-    actuator = _HeroActuator()
-    graph = build_stage_graph(retriever, actuator, mode="fast", max_replans=2)
+    The agentic invariant survives the de-hardcoding: the model can never downgrade
+    the structural net (cross-ref:
+    kernel/tests/test_irreversibility_gate.py::test_model_reversible_cannot_downgrade_structural_escalation)."""
+    reasoner = _reversible_click_reasoner()
+    actuator = _SubmitActuator()
+    graph = build_stage_graph(
+        reasoner, FakeRetriever(), actuator, mode="fast", max_replans=1
+    )
     config = _cfg()
+    seed = seed_stage_state(
+        goal="proceed", mode="fast", page_index=await actuator.perceive()
+    )
 
-    seed = seed_stage_state(mode="fast", page_index=await actuator.perceive())
-    final = await graph.ainvoke(seed, config)
-    if "__interrupt__" in final:
-        final = await graph.ainvoke(
-            Command(resume=ConsentDecision(decision="approve").model_dump()), config
-        )
-
-    trace = final["trace"]
-    # (a) the planner emits exactly one PLANNER exit.
-    planner_exits = [e for e in trace if e.node == "PLANNER" and e.event == "exit"]
-    assert len(planner_exits) == 1, f"PLANNER exit double-counted: {len(planner_exits)}"
-
-    # (b) the kernel's GROUND exit (carrying retrieval_ms) appears once PER stage
-    #     run, never duplicated within a single stage's forwarded delta. We assert
-    #     the count of GROUND exits equals the number of distinct stage runs that
-    #     reached the kernel — i.e. the per-stage delta-slicing did NOT re-forward
-    #     a prior stage's GROUND event. Concretely: every GROUND exit's (node,at)
-    #     timestamp pair is unique (no object re-emitted).
-    ground_exits = [e for e in trace if e.node == "GROUND" and e.event == "exit"]
-    stamps = [(e.node, e.at, id(e)) for e in ground_exits]
-    assert len(stamps) == len(set(stamps)), "a GROUND event was forwarded twice"
-
-    # (c) and the trace strictly grew by appends only: it is non-empty and the
-    #     planner event is the first stage-graph event recorded.
-    assert trace, "no trace emitted"
-    first_stagegraph = next(e for e in trace if e.node == "PLANNER")
-    assert first_stagegraph.event == "exit"
-
-
-async def test_consent_log_not_double_counted_in_normal_mode() -> None:
-    """Normal mode arms the consent gate on the FILL stage's fill proposal. After
-    one approve, the consent_log carries EXACTLY one entry for that proposal — the
-    per-stage delta-forwarding did not re-append the kernel's accumulated log."""
-    retriever = _hero_retriever()
-    actuator = _HeroActuator()
-    graph = build_stage_graph(retriever, actuator, mode="normal", max_replans=2)
-    config = _cfg()
-
-    seed = seed_stage_state(mode="normal", page_index=await actuator.perceive())
     paused = await graph.ainvoke(seed, config)
-    # The AUTH stage's kernel interrupted at ⟨CONSENT⟩ (a consequential step in
-    # Normal mode — every consequential step gates).
+    # Fast mode would auto-act a truly reversible step — but the structural
+    # escalation forced a consent beat instead.
     assert "__interrupt__" in paused
+    assert actuator.act_calls == []  # NO side-effect before the yes
 
-    # Drive the whole chain to completion, approving each consent gate. The graph
-    # re-interrupts per consequential stage; resume until it finishes (bounded).
-    final = paused
-    approve = Command(resume=ConsentDecision(decision="approve").model_dump())
-    for _ in range(12):
-        if "__interrupt__" not in final:
-            break
-        final = await graph.ainvoke(approve, config)
+    # And the surfaced consent flags it as gated (irreversible/unknown).
+    (interrupt_obj,) = paused["__interrupt__"]
+    assert interrupt_obj.value["irreversible"] is True
 
-    # Each consented proposal appears EXACTLY once in the log — the per-stage
-    # delta-forwarding did not re-append the kernel's accumulated consent_log.
-    assert "__interrupt__" not in final, "did not converge"
-    seen: dict[str, int] = {}
-    for c in final["consent_log"]:
-        key = f"{c.proposal_id}:{c.decision}:{c.at}"
-        seen[key] = seen.get(key, 0) + 1
-    dupes = {k: v for k, v in seen.items() if v > 1}
-    assert not dupes, f"consent_log double-counted entries: {dupes}"
+    # On approve it proceeds (the gate is a checkpoint, not a dead-end).
+    final = await graph.ainvoke(
+        Command(resume=ConsentDecision(decision="approve").model_dump()), config
+    )
+    assert any(a.kind == "click" for a in actuator.act_calls)
     assert any(c.decision == "approve" for c in final["consent_log"])
 
 
-# ---------------------------------------------------------------------------
-# Bonus: the shared FakeActuator drives a stage run without error (integration
-# smoke — the stage graph composes the K1 kernel over the C1 fakes).
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# INVARIANT 5 (agentic / done-check) — a NO-OP step does not advance. Fully owned
+# by AG-DONE through the generic check evaluator AND the live executor giving-up
+# path. Cross-referenced (no re-assertion):
+#   ↔ stages/tests/test_executor.py::test_noop_step_is_failed_not_advanced_across_every_check
+#   ↔ stages/tests/test_executor.py::test_executor_replans_then_gives_up_on_stuck_subgoal
+# ===========================================================================
 
 
-async def test_stage_graph_runs_over_fake_actuator() -> None:
+# ===========================================================================
+# INVARIANT 6 (de-hardcoding) — the plan is GOAL-DERIVED and goal-AGNOSTIC: no
+# baked AUTH→…→CONFIRM stage names, no "pay electric bill" topology. AG-DONE pins
+# the planner unit (test_executor.py); here we add the END-TO-END pin: a full run
+# over the public stage graph never materializes the deleted topology on state.
+# ===========================================================================
+
+
+async def test_plan_carries_no_baked_pay_topology() -> None:
+    """A full executor run with a Reasoner-derived plan: the spoken plan + the
+    subgoals on state are exactly what the reasoner returned — none of the DELETED
+    hardcoded stage names (AUTH/LOCATE/FILL/REVIEW/PAY/CONFIRM) or the baked
+    "pay … electric bill" goal appears anywhere. This is the guard that a baked
+    topology cannot silently creep back in via the planner.
+
+    (Planner-unit cross-ref:
+    stages/tests/test_executor.py::test_planner_emits_goal_derived_subgoals.)"""
+    reasoner = FakeReasoner(
+        subgoals=[
+            Subgoal(description="find the application status", done_check="confirmation_fact"),
+            Subgoal(description="read it back to me", done_check="confirmation_fact"),
+        ]
+    )
+    actuator = FakeActuator()
+    graph = build_stage_graph(
+        reasoner, FakeRetriever(), actuator, mode="fast", max_replans=1
+    )
+    seed = seed_stage_state(
+        goal="check my benefits status", mode="fast", page_index=await actuator.perceive()
+    )
+    final = await graph.ainvoke(seed, _cfg())
+
+    # The plan is the reasoner's, derived from the goal.
+    assert [s.description for s in final["subgoals"]] == [
+        "find the application status",
+        "read it back to me",
+    ]
+    # No DELETED hardcoded stage id survives anywhere on the plan or its done-checks.
+    _BAKED = {"auth", "locate", "fill", "review", "pay", "confirm"}
+    for s in final["subgoals"]:
+        words = set(s.description.lower().split()) | {s.done_check.lower()}
+        assert not (words & _BAKED), f"baked topology leaked into subgoal: {s}"
+    # The legacy goal string is gone.
+    plan_blob = " ".join(s.description.lower() for s in final["subgoals"])
+    assert "pay" not in plan_blob and "electric bill" not in plan_blob
+    # The planner ran and spoke the goal-derived plan (legibility beat).
+    planner_exit = next(e for e in final["trace"] if e.node == "PLANNER")
+    assert "here's my plan" in str(planner_exit.data.get("utterance", "")).lower()
+
+
+# ===========================================================================
+# Bonus: the spine still composes over the shared fakes (the K1 kernel under the
+# generic executor over the C1 fakes) — a smoke that the public surface is wired,
+# with NO topology assertion (the deleted `HERO_STAGE_IDS` check is gone).
+# ===========================================================================
+
+
+async def test_stage_graph_composes_over_fakes_no_topology() -> None:
+    reasoner = FakeReasoner()  # default: one generic subgoal naming the goal
     retriever = FakeRetriever()
     actuator = FakeActuator()
-    graph = build_stage_graph(retriever, actuator, mode="fast", max_replans=1)
+    graph = build_stage_graph(reasoner, retriever, actuator, mode="fast", max_replans=1)
 
-    seed = seed_stage_state(mode="fast", page_index=await actuator.perceive())
+    seed = seed_stage_state(
+        goal="do the private task", mode="fast", page_index=await actuator.perceive()
+    )
     final = await graph.ainvoke(seed, _cfg())
-    # The plan was emitted and the run produced trace events for the planner + at
-    # least the first stage.
+
+    # The planner ran and a goal-derived plan landed on state — not a baked list.
     assert any(e.node == "PLANNER" for e in final["trace"])
-    assert final["plan"], "plan not set on state"
-    assert [s.id for s in final["plan"]] == list(HERO_STAGE_IDS)
+    assert final["subgoals"], "no subgoals on state"
+    # The single generic fallback subgoal names the real goal, not a topology.
+    assert "do the private task" in final["subgoals"][0].description.lower()
