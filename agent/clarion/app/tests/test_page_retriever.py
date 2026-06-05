@@ -215,3 +215,63 @@ async def test_propose_fills_with_the_value_not_the_label() -> None:
     # The load-bearing assertion: the VALUE, not the label.
     assert prop.action.value == "$84.32", f"PROPOSE used {prop.action.value!r}, not the value"
     assert "$84.32" in prop.utterance and "Amount due" not in prop.utterance
+
+
+# ---------------------------------------------------------------------------
+# The ranker is a HINT, never the decider: query(k) is a top-K slice, but
+# query_all is the UNFILTERED fallback so over-pruning the slice can never cause a
+# false honest-decline on a value that is actually on the page (architecture PARSE).
+# ---------------------------------------------------------------------------
+
+
+def _many_facts_tree() -> dict:
+    """A page with several value-bearing lines + a low-relevance one, so a small
+    top-K provably PRUNES a real fact that the unfiltered fallback still returns."""
+    return {
+        "nodes": [
+            _ax("13", "StaticText", "Amount due"),
+            _ax("14", "StaticText", "$84.32"),
+            _ax("15", "StaticText", "Due date"),
+            _ax("16", "StaticText", "June 15, 2026"),
+            _ax("17", "StaticText", "Confirmation number"),
+            _ax("18", "StaticText", "NW-4417-0093"),
+            _ax("19", "StaticText", "Late fee"),
+            _ax("20", "StaticText", "$5.00"),
+        ]
+    }
+
+
+async def test_query_returns_a_topk_hint_slice() -> None:
+    retriever = PageRetriever(_FactsActuator(_many_facts_tree()))
+    hint = await retriever.query("find the amount due", k=2)
+    # The hint is exactly the top-K slice (a hint, not the whole set).
+    assert len(hint) == 2
+    assert all(f.source_node_id for f in hint)
+
+
+async def test_query_all_unfiltered_fallback_returns_facts_the_hint_pruned() -> None:
+    """The over-pruning guard: a small top-K hint DROPS some grounded facts, but
+    ``query_all`` returns the FULL grounded set — so a later honest-decline re-checks
+    everything before giving up (over-pruning can't cause a false give-up)."""
+    retriever = PageRetriever(_FactsActuator(_many_facts_tree()))
+    hint = await retriever.query("find the amount due", k=2)
+    fallback = await retriever.query_all("find the amount due")
+
+    hint_values = {f.value for f in hint}
+    fallback_values = {f.value for f in fallback}
+
+    # The fallback is a strict SUPERSET of the hint — nothing the hint had is lost.
+    assert hint_values < fallback_values
+    # And it contains real value-bearing facts the top-K hint pruned (e.g. the late
+    # fee + the confirmation number) — these are reachable for a re-check.
+    pruned = fallback_values - hint_values
+    assert "$5.00" in pruned or "NW-4417-0093" in pruned
+    # Every fallback fact is still grounded to a real node (never a fabrication).
+    assert all(f.source_node_id and not f.source_node_id.startswith("-") for f in fallback)
+    # The fallback also stamps the retrieval time (latency-meter substrate).
+    assert all(f.retrieved_at > 0 for f in fallback)
+
+
+async def test_query_all_honest_absence_on_empty_page() -> None:
+    empty = _FactsActuator({"nodes": [_ax("1", "button", "Continue")]})
+    assert await PageRetriever(empty).query_all("pay my bill") == []

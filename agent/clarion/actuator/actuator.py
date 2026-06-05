@@ -73,10 +73,12 @@ from clarion.actuator.pipeline import (  # noqa: F401  (re-exported)
     _NATIVE_SETTER_JS,
     _NODE_STATE_JS,
     _READ_JS,
+    ax_node_geometry,
     build_candidates,
     containment_filter,
     diff_maps,
     estimate_tokens,
+    extract_paired_facts,
     extract_text_facts,
     order_reading,
     parse_snapshot,
@@ -90,6 +92,7 @@ from clarion.contracts.state import (
     Observation,
     PageDiff,
     PageReadout,
+    PairedFact,
     SelectorMap,
 )
 
@@ -236,6 +239,29 @@ class PlaywrightActuator(Actuator):
         the ``PageRetriever`` calls it to feed the kernel's GROUND."""
         ax_tree = await self._cdp.send("Accessibility.getFullAXTree")
         return extract_text_facts(ax_tree)
+
+    async def read_paired_facts(self) -> list[PairedFact]:
+        """PARSE source: harvest geometric label↔value ``PairedFact``s (killer-closer
+        #1). Fetches the AXTree + the DOMSnapshot (for the ``shared-row`` geometry,
+        keyed back to AX nodeIds), then runs the shared pure ``extract_paired_facts``;
+        BOTH halves of every pairing are sourced to a real AX ``nodeId`` so the kernel
+        (Wave C) can enforce the "X is Y needs one PairedFact" fence. Not part of the
+        frozen ``Actuator`` port — an extra read parallel to ``read_facts`` /
+        ``describe_page``; symmetric with the extension transport."""
+        ax_tree, snapshot = await asyncio.gather(
+            self._cdp.send("Accessibility.getFullAXTree"),
+            self._cdp.send(
+                "DOMSnapshot.captureSnapshot",
+                {
+                    "computedStyles": [],
+                    "includePaintOrder": True,
+                    "includeDOMRects": True,
+                },
+            ),
+        )
+        layout_by_backend, _ = parse_snapshot(snapshot)
+        geometry = ax_node_geometry(ax_tree, layout_by_backend)
+        return extract_paired_facts(ax_tree, geometry=geometry)
 
     async def act(self, action: Action) -> Observation:
         """Execute the action against the live page, then re-perceive (§4.3)."""

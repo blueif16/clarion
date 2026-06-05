@@ -42,10 +42,12 @@ from clarion.actuator.pipeline import (
     _NATIVE_SETTER_JS,
     _NODE_STATE_JS,
     _READ_JS,
+    ax_node_geometry,
     build_candidates,
     containment_filter,
     diff_maps,
     estimate_tokens,
+    extract_paired_facts,
     extract_text_facts,
     order_reading,
     parse_snapshot,
@@ -60,6 +62,7 @@ from clarion.contracts.state import (
     Observation,
     PageDiff,
     PageReadout,
+    PairedFact,
     SelectorMap,
 )
 
@@ -190,6 +193,29 @@ class ExtensionActuator(Actuator):
         await self._enable_domains()
         ax_tree = await self._relay.send("Accessibility.getFullAXTree")
         return extract_text_facts(ax_tree)
+
+    async def read_paired_facts(self) -> list[PairedFact]:
+        """PARSE source over the relay transport — the SAME shared pure
+        ``extract_paired_facts`` as the Playwright path. Fetches the AXTree + the
+        DOMSnapshot via the relay (for the ``shared-row`` geometry, keyed back to AX
+        nodeIds) and harvests geometric label↔value ``PairedFact``s; BOTH halves of
+        every pairing are sourced to a real AX ``nodeId`` (killer-closer #1).
+        Symmetric with ``PlaywrightActuator.read_paired_facts``."""
+        await self._enable_domains()
+        ax_tree, snapshot = await asyncio.gather(
+            self._relay.send("Accessibility.getFullAXTree"),
+            self._relay.send(
+                "DOMSnapshot.captureSnapshot",
+                {
+                    "computedStyles": [],
+                    "includePaintOrder": True,
+                    "includeDOMRects": True,
+                },
+            ),
+        )
+        layout_by_backend, _ = parse_snapshot(snapshot)
+        geometry = ax_node_geometry(ax_tree, layout_by_backend)
+        return extract_paired_facts(ax_tree, geometry=geometry)
 
     async def _eval_string(self, expression: str) -> str:
         """Evaluate a string-returning JS expression over the relay (title/url for
