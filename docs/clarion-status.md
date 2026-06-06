@@ -135,6 +135,8 @@ real page; NOT a completed irreversible action (we drive to the gate and stop).
 
 ```bash
 scripts/clarion-up.sh                 # rotates logs → .prev, starts logsink+broker+worker, opens Chrome on usa.gov/benefits
+                                      # SHARED COCKPIT: durable profile (~/.clarion/chrome-profile-durable — logins persist)
+                                      # + CDP on :9222 (override CLARION_CHROME_PROFILE / CLARION_CDP_PORT)
 scripts/clarion-status.sh             # ONE command: ports + procs + tail of every log (run this first to see state)
 scripts/clarion-down.sh               # stop everything (reaps the worker's whole job tree)
 
@@ -151,7 +153,16 @@ cd agent && .venv/bin/python -m clarion.app.gov_proof   # the generic TAS driver
 - Reap first: `pkill -if "clarion.app.voice_entry"; pkill -if "from multiprocessing.spawn"` (orphan job subprocs steal dispatches).
 - Start detached: `CLARION_ACTUATOR=extension nohup .venv/bin/python -m clarion.app.voice_entry dev >>/tmp/clarion-worker.log 2>&1 &` inside a `( … )` subshell.
 
+**Shared cockpit (observe the human's tab):** the human logs in by hand; you SEE login state via
+Playwright `connect_over_cdp("http://localhost:9222")` — but **only while the extension is idle**
+(before the shortcut). A live CDP session and the extension's `chrome.debugger` cannot share a tab,
+so once it's driving, read the LOG FILES, not CDP. Detach (`browser.close()` on the Playwright side)
+before pressing the shortcut.
+
 **Operational gotchas (cost real time before — see project memory):**
+- A Chrome already running on the durable profile makes a new `clarion-up.sh` launch a no-op for its
+  flags (no fresh `--load-extension`, no CDP) — it just opens a tab in the live instance. Quit that
+  Chrome first for a clean relaunch (the script now warns when :9222 is already listening).
 - Same-profile Chrome relaunch does NOT reload the extension → prove fresh SW code by a NEW line in `/tmp/clarion-ext.log`.
 - `chrome.debugger` attach fails while DevTools is open on the tab.
 - Killing a job leaves the LiveKit room's agent slot occupied → **delete the room** to force a clean dispatch (`api.LiveKitAPI(...).room.delete_room(...)`, creds in `agent/.env`).

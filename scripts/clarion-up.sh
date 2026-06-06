@@ -10,7 +10,11 @@
 #   3. starts the LiveKit voice worker (CLARION_ACTUATOR=extension), whose actuator
 #      now reaches the tab THROUGH the broker as a client (it never binds 8771);
 #   4. launches Chrome with the extension loaded, the debugger banner suppressed,
-#      and a dedicated profile (does not touch your main Chrome).
+#      a DURABLE dedicated profile (logins persist across runs; does not touch your
+#      main Chrome), and a CDP port so Playwright can OBSERVE the tab on demand —
+#      the shared cockpit. NB: a live CDP session and the extension's chrome.debugger
+#      cannot share one tab, so observe via CDP only while the extension is idle
+#      (login/browse); read the LOG FILES while it drives.
 #
 # Then: press Ctrl/Cmd+Shift+Y on a tab to attach. Stop with scripts/clarion-down.sh.
 #
@@ -25,7 +29,10 @@ EXT="$ROOT/web/extension"
 PY="$AGENT/.venv/bin/python"
 ROOM="${CLARION_ROOM:-clarion-hero}"
 START_URL="${1:-https://www.usa.gov/benefits}"
-PROFILE="/tmp/clarion-chrome-profile"
+# Durable profile (logins persist across runs/reboots — unlike the old /tmp one).
+# Override with CLARION_CHROME_PROFILE; CDP port lets Playwright observe on demand.
+PROFILE="${CLARION_CHROME_PROFILE:-$HOME/.clarion/chrome-profile-durable}"
+CDP_PORT="${CLARION_CDP_PORT:-9222}"
 WORKER_LOG="/tmp/clarion-worker.log"
 WORKER_PID_FILE="/tmp/clarion-worker.pid"
 BROKER_LOG="/tmp/clarion-broker.log"
@@ -114,17 +121,25 @@ fi
 
 # 4. Launch Chrome with the extension + debugger flag -------------------------
 echo "[4/4] launching Chrome (dedicated profile; extension loaded; banner suppressed)…"
+# If a Chrome is already running on this profile, a new launch just opens a tab in
+# it and SILENTLY IGNORES these flags (no fresh extension, no CDP) — warn loudly.
+if lsof -nP -iTCP:"$CDP_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "      NOTE: :$CDP_PORT already listening — a Chrome on this profile is likely up;"
+  echo "            its flags won't refresh. Quit that Chrome first for a clean relaunch."
+fi
 if [ -x "$CHROME" ]; then
   "$CHROME" --user-data-dir="$PROFILE" \
+    --remote-debugging-port="$CDP_PORT" \
+    "--remote-allow-origins=*" \
     --silent-debugger-extension-api \
     --load-extension="$EXT" \
     --disable-features=DisableLoadExtensionCommandLineSwitch \
     --no-first-run --no-default-browser-check \
     "$START_URL" >/tmp/clarion-chrome.log 2>&1 &
-  echo "      Chrome launched → $START_URL"
+  echo "      Chrome launched → $START_URL (profile: $PROFILE · CDP: http://localhost:$CDP_PORT)"
 else
   echo "!! Chrome not at $CHROME — open it yourself with:"
-  echo "   '$CHROME' --user-data-dir=$PROFILE --silent-debugger-extension-api --load-extension=$EXT $START_URL"
+  echo "   '$CHROME' --user-data-dir=$PROFILE --remote-debugging-port=$CDP_PORT --remote-allow-origins='*' --silent-debugger-extension-api --load-extension=$EXT $START_URL"
 fi
 
 cat <<NEXT
@@ -134,6 +149,8 @@ cat <<NEXT
     on the tab to attach (no need to wait for voice/mic; that's the whole point).
   • Grant the mic if 'request-mic' opens (voice only — the relay works without it).
   • If the extension didn't auto-load: chrome://extensions → Developer mode → Load unpacked → $EXT
+  • Observe login state:      Playwright connect_over_cdp("http://localhost:$CDP_PORT")
+                              — ONLY while the extension is idle (before the shortcut).
   • Watch the broker:         tail -f $BROKER_LOG
   • Watch the agent attach:   tail -f $WORKER_LOG
   • Watch the browser side:   tail -f /tmp/clarion-ext.log
