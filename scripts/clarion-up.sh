@@ -9,7 +9,9 @@
 #      the extension can always reach it (the broker is independent of voice);
 #   3. starts the LiveKit voice worker (CLARION_ACTUATOR=extension), whose actuator
 #      now reaches the tab THROUGH the broker as a client (it never binds 8771);
-#   4. launches Chrome with the extension loaded, the debugger banner suppressed,
+#   4. launches Google Chrome for Testing (branded Chrome DROPPED --load-extension;
+#      its CDP replacement needs --remote-debugging-pipe, which kills our port) with
+#      the extension AUTO-loaded, the debugger banner suppressed,
 #      a DURABLE dedicated profile (logins persist across runs; does not touch your
 #      main Chrome), and a CDP port so Playwright can OBSERVE the tab on demand —
 #      the shared cockpit. NB: a live CDP session and the extension's chrome.debugger
@@ -31,13 +33,14 @@ ROOM="${CLARION_ROOM:-clarion-hero}"
 START_URL="${1:-https://www.usa.gov/benefits}"
 # Durable profile (logins persist across runs/reboots — unlike the old /tmp one).
 # Override with CLARION_CHROME_PROFILE; CDP port lets Playwright observe on demand.
-PROFILE="${CLARION_CHROME_PROFILE:-$HOME/.clarion/chrome-profile-durable}"
+# Default profile is the Chrome-for-Testing one (the primary browser below).
+PROFILE="${CLARION_CHROME_PROFILE:-$HOME/.clarion/chromium-profile-durable}"
 CDP_PORT="${CLARION_CDP_PORT:-9222}"
 WORKER_LOG="/tmp/clarion-worker.log"
 WORKER_PID_FILE="/tmp/clarion-worker.pid"
 BROKER_LOG="/tmp/clarion-broker.log"
 BROKER_PID_FILE="/tmp/clarion-broker.pid"
-CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME_BRANDED="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"  # manual-load fallback only
 
 echo "== Clarion up =="
 [ -x "$PY" ] || { echo "!! venv python missing at $PY — run: cd agent && pip install -e '.[spike]' && pip install -e '.[retrieval]'"; exit 1; }
@@ -119,27 +122,44 @@ else
   echo "!! worker exited early — last lines of $WORKER_LOG:"; tail -15 "$WORKER_LOG"; exit 1
 fi
 
-# 4. Launch Chrome with the extension + debugger flag -------------------------
-echo "[4/4] launching Chrome (dedicated profile; extension loaded; banner suppressed)…"
-# If a Chrome is already running on this profile, a new launch just opens a tab in
-# it and SILENTLY IGNORES these flags (no fresh extension, no CDP) — warn loudly.
+# 4. Launch the browser with the extension auto-loaded ------------------------
+# Branded Google Chrome REMOVED --load-extension (abuse vector); its CDP
+# replacement Extensions.loadUnpacked needs --remote-debugging-pipe, which is
+# incompatible with our CDP port. Playwright's "Google Chrome for Testing" still
+# honors --load-extension → we launch THAT for true auto-load. Branded Chrome
+# stays a manual-load fallback (Load unpacked persists in the durable profile).
+echo "[4/4] launching the browser (Chrome for Testing; extension auto-loaded; CDP open)…"
+# A browser already on this profile makes a new launch a no-op for these flags
+# (it just opens a tab in the live instance) — warn loudly.
 if lsof -nP -iTCP:"$CDP_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "      NOTE: :$CDP_PORT already listening — a Chrome on this profile is likely up;"
-  echo "            its flags won't refresh. Quit that Chrome first for a clean relaunch."
+  echo "      NOTE: :$CDP_PORT already listening — a browser on this profile is likely up;"
+  echo "            its flags won't refresh. Quit it first for a clean relaunch."
 fi
-if [ -x "$CHROME" ]; then
-  "$CHROME" --user-data-dir="$PROFILE" \
+CFT="$("$PY" -c 'from playwright.sync_api import sync_playwright
+with sync_playwright() as p: print(p.chromium.executable_path)' 2>/dev/null || true)"
+if [ -n "$CFT" ] && [ -x "$CFT" ]; then
+  "$CFT" --user-data-dir="$PROFILE" \
     --remote-debugging-port="$CDP_PORT" \
     "--remote-allow-origins=*" \
     --silent-debugger-extension-api \
     --load-extension="$EXT" \
-    --disable-features=DisableLoadExtensionCommandLineSwitch \
     --no-first-run --no-default-browser-check \
     "$START_URL" >/tmp/clarion-chrome.log 2>&1 &
-  echo "      Chrome launched → $START_URL (profile: $PROFILE · CDP: http://localhost:$CDP_PORT)"
+  echo "      Chrome for Testing launched → $START_URL"
+  echo "      (profile: $PROFILE · CDP: http://localhost:$CDP_PORT · extension auto-loaded)"
+elif [ -x "$CHROME_BRANDED" ]; then
+  echo "      !! Chrome for Testing not found (run: $PY -m playwright install chromium)."
+  echo "         Falling back to branded Chrome — it CANNOT auto-load the extension."
+  "$CHROME_BRANDED" --user-data-dir="$PROFILE" \
+    --remote-debugging-port="$CDP_PORT" \
+    "--remote-allow-origins=*" \
+    --silent-debugger-extension-api \
+    --no-first-run --no-default-browser-check \
+    "$START_URL" >/tmp/clarion-chrome.log 2>&1 &
+  echo "      branded Chrome launched → load the extension ONCE: chrome://extensions →"
+  echo "      Developer mode → Load unpacked → $EXT  (persists in the durable profile)."
 else
-  echo "!! Chrome not at $CHROME — open it yourself with:"
-  echo "   '$CHROME' --user-data-dir=$PROFILE --remote-debugging-port=$CDP_PORT --remote-allow-origins='*' --silent-debugger-extension-api --load-extension=$EXT $START_URL"
+  echo "!! no usable browser (Chrome for Testing or branded Chrome) — install one."
 fi
 
 cat <<NEXT

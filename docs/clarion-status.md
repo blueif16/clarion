@@ -135,7 +135,8 @@ real page; NOT a completed irreversible action (we drive to the gate and stop).
 
 ```bash
 scripts/clarion-up.sh                 # rotates logs → .prev, starts logsink+broker+worker, opens Chrome on usa.gov/benefits
-                                      # SHARED COCKPIT: durable profile (~/.clarion/chrome-profile-durable — logins persist)
+                                      # SHARED COCKPIT: launches Chrome for Testing (NOT branded Chrome — see gotcha)
+                                      # durable profile (~/.clarion/chromium-profile-durable — logins persist)
                                       # + CDP on :9222 (override CLARION_CHROME_PROFILE / CLARION_CDP_PORT)
 scripts/clarion-status.sh             # ONE command: ports + procs + tail of every log (run this first to see state)
 scripts/clarion-down.sh               # stop everything (reaps the worker's whole job tree)
@@ -160,6 +161,11 @@ so once it's driving, read the LOG FILES, not CDP. Detach (`browser.close()` on 
 before pressing the shortcut.
 
 **Operational gotchas (cost real time before — see project memory):**
+- **Branded Google Chrome REMOVED `--load-extension`** (abuse vector; verified Chrome 148, 2026-06-05).
+  The CDP replacement `Extensions.loadUnpacked` needs `--remote-debugging-pipe` (kills our CDP port).
+  Fix: `clarion-up.sh` launches **Google Chrome for Testing** (Playwright's bundled binary —
+  `p.chromium.executable_path`), which still honors `--load-extension`. Our SW loads as
+  `chrome-extension://…/service-worker.js`. Branded Chrome = manual `Load unpacked` fallback only.
 - A Chrome already running on the durable profile makes a new `clarion-up.sh` launch a no-op for its
   flags (no fresh `--load-extension`, no CDP) — it just opens a tab in the live instance. Quit that
   Chrome first for a clean relaunch (the script now warns when :9222 is already listening).
