@@ -17,9 +17,15 @@
 //                LiveKit CLI (`lk token create`) using the API key/secret from
 //                agent/.env — see the README "Mint a participant token" section.
 //                Tokens expire; regenerate when joining.
+// MIC_MATCH    — OPTIONAL. A label substring (e.g. "MacBook Pro Microphone") to
+//                force a specific input device. Leave empty to let the offscreen
+//                doc AUTO-PREFER a real mic over virtual devices (MMAudio, Teams,
+//                loopbacks…) — those are often the OS default and capture silence.
+// MIC_DEVICE_ID — OPTIONAL. An exact deviceId (overrides MIC_MATCH).
 
 export default {
   LIVEKIT_URL: "wss://YOUR-PROJECT.livekit.cloud",
   ROOM_NAME: "clarion-hero",
   TOKEN: "REPLACE_WITH_A_FRESH_PARTICIPANT_TOKEN",
+  MIC_MATCH: "",
 };

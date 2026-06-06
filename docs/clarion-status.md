@@ -161,6 +161,12 @@ so once it's driving, read the LOG FILES, not CDP. Detach (`browser.close()` on 
 before pressing the shortcut.
 
 **Operational gotchas (cost real time before — see project memory):**
+- **The mic is the OS default, which is often a VIRTUAL device** → ASR hears silence and the
+  panel shows nothing heard. This machine's default input is `MMAudio Device` (Transport: Virtual),
+  not the real `MacBook Pro Microphone`. The offscreen doc now AUTO-PREFERS a real mic (skips
+  MMAudio/Teams/loopback/virtual), logs the device list + chosen device + an audio-level check to
+  the HUD, and the worker logs every transcript as `[asr] HEARD ✓ final: …`. Grep `/tmp/clarion-worker.log`
+  for `[asr]`; override the pick with `CLARION_MIC_MATCH="MacBook Pro Microphone"`.
 - **Branded Google Chrome REMOVED `--load-extension`** (abuse vector; verified Chrome 148, 2026-06-05).
   The CDP replacement `Extensions.loadUnpacked` needs `--remote-debugging-pipe` (kills our CDP port).
   Fix: `clarion-up.sh` launches **Google Chrome for Testing** (Playwright's bundled binary —

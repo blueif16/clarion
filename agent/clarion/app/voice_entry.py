@@ -358,7 +358,12 @@ async def entrypoint(ctx) -> None:
     your tab" until the runner is ready. This removes the old coupling where the
     agent's ears only turned on AFTER the relay attached. Every phase is logged with
     a `[loop]` prefix so the whole post-shortcut loop is observable in one place."""
-    from livekit.agents import Agent, AgentSession
+    from livekit.agents import (
+        Agent,
+        AgentSession,
+        UserInputTranscribedEvent,
+        UserStateChangedEvent,
+    )
 
     from clarion.adapters.tts_vertex import VertexExpressSynthesizer
     from clarion.app.extension_runtime import extension_actuator_selected
@@ -396,6 +401,19 @@ async def entrypoint(ctx) -> None:
         turn_detection=_MultilingualModel() if _MultilingualModel else None,
     )
     agent = Agent(instructions=_INSTRUCTIONS, tools=tools)
+
+    # ASR observability: log EXACTLY what the STT heard (and when the user is
+    # detected speaking at all), so a dead/wrong mic is obvious in the worker log
+    # — these are the [asr] lines to grep when "the panel shows nothing heard".
+    @session.on("user_input_transcribed")
+    def _on_heard(ev: UserInputTranscribedEvent) -> None:
+        tag = "HEARD ✓ final" if getattr(ev, "is_final", False) else "heard… partial"
+        loop(f"[asr] {tag}: {ev.transcript!r}")
+
+    @session.on("user_state_changed")
+    def _on_user_state(ev: UserStateChangedEvent) -> None:
+        # 'speaking' = mic audio is reaching the agent's VAD (independent of STT).
+        loop(f"[asr] user {ev.new_state}")
 
     # *** The agent's ears turn ON here — BEFORE the tab relay. Speak → heard. ***
     await session.start(agent=agent, room=ctx.room)

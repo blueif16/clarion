@@ -393,6 +393,7 @@ const VOICE_MSG = {
   CONNECT: "voice.connect", // SW → offscreen
   DISCONNECT: "voice.disconnect", // SW → offscreen
   STATE: "voice.state", // offscreen → SW
+  LOG: "voice.log", // offscreen → SW (diagnostic line → HUD + /tmp/clarion-ext.log)
   MIC_RESULT: "voice.mic-result", // request-mic → SW
 };
 const OFFSCREEN_TARGET = "offscreen-voice";
@@ -542,6 +543,9 @@ async function startVoice() {
     livekitUrl: cfg.LIVEKIT_URL,
     token: cfg.TOKEN,
     roomName: cfg.ROOM_NAME || "",
+    // Optional mic override (else the offscreen doc auto-prefers a real device).
+    micDeviceId: cfg.MIC_DEVICE_ID || "",
+    micMatch: cfg.MIC_MATCH || "",
   });
 }
 
@@ -585,5 +589,11 @@ chrome.runtime.onMessage.addListener((msg) => {
       msg.state === "connected" ? "MIC" : msg.state === "error" ? "ERR" : "·",
       level
     );
+  } else if (msg.type === VOICE_MSG.LOG) {
+    // Diagnostic line from the offscreen voice doc (mic device + signal). Route
+    // to the on-page HUD if a tab is attached, else just the file sink.
+    const entry = { phase: msg.phase || "voice", detail: msg.detail || "", level: msg.level || "info" };
+    if (session && session.tabId != null) pushHud(session.tabId, entry);
+    else sinkLog(entry);
   }
 });
