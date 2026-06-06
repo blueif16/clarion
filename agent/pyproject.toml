@@ -17,12 +17,14 @@ test = [
 # contracts/ or kernel/. Install with: pip install -e ".[spike]".
 spike = [
     "livekit-agents>=1.0",
-    "livekit-plugins-google",
+    "livekit-plugins-minimax",
     "livekit-plugins-deepgram",
     "livekit-plugins-silero",
     "livekit-plugins-turn-detector",
     "playwright>=1.40",
     "google-genai>=1.0",
+    "openai>=1.0",
+    "httpx>=0.27",
     "python-dotenv>=1.0",
 ]
 # R-Moss — the live Retriever + Ingest + Memory stack (Moss + Gemini embeddings).

@@ -7,12 +7,12 @@ never reimplements STT / turn-detect / barge-in / TTS.
 
 Frozen stack (NO model swaps — execution §18.6, standing rule):
   - STT  = Deepgram        (`livekit-plugins-deepgram`,  DEEPGRAM_API_KEY)
-  - LLM  = Google Gemini   (`livekit-plugins-google`,    GEMINI_MODEL / GOOGLE_API_KEY)
-  - TTS  = Gemini TTS via Vertex Express — our `VertexExpressSynthesizer`
-           (adapters/tts_vertex.py) behind the `Synthesizer` contract, because
-           the LiveKit google.beta plugin can't take the AQ.* express key
-           (execution §18.6 seam discovery). The session's audio-output TTS uses
-           the google.beta plugin, which activates with a project-backed cred.
+  - LLM  = MiniMax-M3      (`livekit-plugins-minimax`,   MINIMAX_LLM_MODEL / MINIMAX_API_KEY)
+  - TTS  = MiniMax Speech 2.6-turbo — the LiveKit `minimax.TTS` plugin for the
+           session's audio output; the kernel-facing `Synthesizer` is our
+           `MinimaxSynthesizer` (adapters/minimax_synthesizer.py, streaming PCM
+           off `/v1/t2a_v2`) behind the frozen contract. MiniMax + LiveKit are
+           wired together here (the plugin reads MINIMAX_API_KEY / MINIMAX_GROUP_ID).
   - VAD  = Silero (local) ; turn detection = LiveKit MultilingualModel (local).
 
 The four contract surfaces this maps onto LiveKit:
@@ -52,7 +52,7 @@ import asyncio
 import os
 from typing import Any, Callable, Optional
 
-from clarion.adapters.tts_vertex import VertexExpressSynthesizer
+from clarion.adapters.minimax_synthesizer import MinimaxSynthesizer
 from clarion.contracts.ports import SpeechHandle, Synthesizer, VoiceTransport
 
 # LiveKit plugins register their Plugin singletons at import; this MUST happen on
@@ -64,13 +64,13 @@ from clarion.contracts.ports import SpeechHandle, Synthesizer, VoiceTransport
 # reported at construction time, not import).
 try:  # pragma: no cover - import-time plugin registration
     from livekit.plugins import deepgram as _deepgram  # noqa: F401
-    from livekit.plugins import google as _google  # noqa: F401
+    from livekit.plugins import minimax as _minimax  # noqa: F401
     from livekit.plugins import silero as _silero  # noqa: F401
 
     _PLUGINS_OK = True
     _PLUGIN_IMPORT_ERROR = ""
 except Exception as e:  # noqa: BLE001
-    _deepgram = _google = _silero = None  # type: ignore[assignment]
+    _deepgram = _minimax = _silero = None  # type: ignore[assignment]
     _PLUGINS_OK = False
     _PLUGIN_IMPORT_ERROR = f"{type(e).__name__}: {e}"
 
@@ -169,11 +169,11 @@ class LiveKitVoiceTransport(VoiceTransport):
         llm_model: Optional[str] = None,
         session: Optional[Any] = None,
     ) -> None:
-        # Contract-correct TTS the kernel sees (Vertex Express). Constructed but
-        # not exercised until first synthesize (billing-blocked — see module doc).
-        self.synthesizer: Synthesizer = synthesizer or VertexExpressSynthesizer()
+        # Contract-correct TTS the kernel sees (MiniMax Speech 2.6). Constructed
+        # but not exercised until first synthesize (lazy httpx client).
+        self.synthesizer: Synthesizer = synthesizer or MinimaxSynthesizer()
         self._stt_model = stt_model or "nova-3"
-        self._llm_model = llm_model or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
+        self._llm_model = llm_model or os.environ.get("MINIMAX_LLM_MODEL", "MiniMax-M3")
 
         # The live AgentSession (injected for tests, else built in `start`).
         self._session: Optional[Any] = session
@@ -257,10 +257,9 @@ class LiveKitVoiceTransport(VoiceTransport):
                 language="en-US",
                 api_key=os.environ["DEEPGRAM_API_KEY"],
             ),
-            llm=_google.LLM(
-                model=self._llm_model,
-                api_key=os.environ["GOOGLE_API_KEY"],
-            ),
+            # MiniMax-M3 via the LiveKit minimax plugin (reads MINIMAX_API_KEY /
+            # MINIMAX_GROUP_ID from env — no explicit api_key kwarg needed).
+            llm=_minimax.LLM(model=self._llm_model),
             tts=_build_audio_tts(),
             vad=_silero.VAD.load(),
             turn_detection=_MultilingualModel() if _MultilingualModel else None,
@@ -316,16 +315,15 @@ _FILLERS = {
 
 
 def _build_audio_tts() -> Any:
-    """The LiveKit audio-output TTS. google.beta.GeminiTTS cannot take the AQ.*
-    express key (its vertexai branch nulls the key and requires a project/ADC —
-    execution §18.6), so on the express path it activates only when a
-    project-backed credential is present. We still construct it so the audio wiring
-    is genuine; the kernel-facing Synthesizer is VertexExpressSynthesizer."""
-    from livekit.plugins import google
+    """The LiveKit audio-output TTS: MiniMax Speech 2.6-turbo via the minimax
+    plugin (reads MINIMAX_API_KEY / MINIMAX_GROUP_ID from env). The kernel-facing
+    Synthesizer is our streaming `MinimaxSynthesizer`; this is the session's audio
+    output. Model + voice come from env (no swaps)."""
+    from livekit.plugins import minimax
 
-    return google.beta.GeminiTTS(
-        model=os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts"),
-        voice_name=os.environ.get("GEMINI_TTS_VOICE", "Kore"),
+    return minimax.TTS(
+        model=os.environ.get("MINIMAX_TTS_MODEL", "speech-2.6-turbo"),
+        voice=os.environ.get("MINIMAX_TTS_VOICE", "Friendly_Person"),
     )
 
 

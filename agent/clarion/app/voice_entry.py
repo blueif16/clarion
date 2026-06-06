@@ -1,8 +1,9 @@
 """I1 — the LiveKit worker entrypoint (execution §1, §5).
 
 The production voice plane for the hero flow. Wires the V1 transport
-(`LiveKitVoiceTransport`: live Deepgram STT + Gemini LLM + AI-Studio Gemini TTS +
-Silero VAD + MultilingualModel turn detection) over an `AgentSession`, and attaches
+(`LiveKitVoiceTransport`: live Deepgram STT + MiniMax-M3 LLM + MiniMax Speech
+2.6-turbo TTS + Silero VAD + MultilingualModel turn detection) over an
+`AgentSession` (MiniMax wired through the LiveKit minimax plugin), and attaches
 the `advance_task` `@function_tool` that drives the ST1 **stage graph**
 NON-BLOCKING (the proven S1 seam, execution §5):
 
@@ -22,9 +23,9 @@ NON-BLOCKING (the proven S1 seam, execution §5):
     (?live=1) reflects stage/step/consent/latency/trace live (execution §6).
 
 The advance/resume seam logic is `clarion.adapters.voice_livekit.advance_non_blocking`
-(shared with the GATE harness — ONE implementation). The TTS is the reconciled
-`VertexExpressSynthesizer` defaulting to **AI Studio** mode (the live GOOGLE_API_KEY;
-the AQ.* Vertex Express key is billing-blocked — execution §18.6, I1 reconcile).
+(shared with the GATE harness — ONE implementation). The kernel-facing TTS is the
+streaming `MinimaxSynthesizer` (MiniMax Speech 2.6-turbo over `/v1/t2a_v2`); the
+session's audio output uses the LiveKit `minimax.TTS` plugin.
 
 LIVE vs SIMULATED (honest, execution §18.6 / S1): construction + wiring are REAL,
 and the STT/LLM/TTS are now LIVE on the AI-Studio GOOGLE_API_KEY (verified: live
@@ -58,12 +59,12 @@ _AGENT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__
 # contracts-only / no-native-dep environment still imports.
 try:  # pragma: no cover - import-time plugin registration
     from livekit.plugins import deepgram as _deepgram  # noqa: F401
-    from livekit.plugins import google as _google  # noqa: F401
+    from livekit.plugins import minimax as _minimax  # noqa: F401
     from livekit.plugins import silero as _silero  # noqa: F401
 
     _PLUGINS_OK = True
 except Exception as _e:  # noqa: BLE001
-    _deepgram = _google = _silero = None  # type: ignore[assignment]
+    _deepgram = _minimax = _silero = None  # type: ignore[assignment]
     _PLUGINS_OK = False
 
 # `RunContext` / `function_tool` MUST resolve in module globals: with
@@ -365,7 +366,7 @@ async def entrypoint(ctx) -> None:
         UserStateChangedEvent,
     )
 
-    from clarion.adapters.tts_vertex import VertexExpressSynthesizer
+    from clarion.adapters.minimax_synthesizer import MinimaxSynthesizer
     from clarion.app.extension_runtime import extension_actuator_selected
     from clarion.app.runtime import HeroRuntime
 
@@ -381,9 +382,10 @@ async def entrypoint(ctx) -> None:
     runner = StageGraphRunner()
     tools = build_voice_tools(runner)
 
-    # Contract-correct TTS the kernel sees (AI Studio by default — the live key);
-    # constructed so the wiring is genuine even though the audio path uses google.beta.
-    _synth = VertexExpressSynthesizer()  # noqa: F841 - mode defaults to ai_studio
+    # Contract-correct TTS the kernel sees (MiniMax Speech 2.6, streaming PCM);
+    # constructed so the wiring is genuine even though the audio path uses the
+    # LiveKit minimax.TTS plugin below.
+    _synth = MinimaxSynthesizer()  # noqa: F841 - lazy httpx client
 
     vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") else None
     session = AgentSession(
@@ -392,10 +394,9 @@ async def entrypoint(ctx) -> None:
             language="en-US",
             api_key=os.environ["DEEPGRAM_API_KEY"],
         ),
-        llm=_google.LLM(
-            model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
-            api_key=os.environ["GOOGLE_API_KEY"],
-        ),
+        # MiniMax-M3 via the LiveKit minimax plugin (reads MINIMAX_API_KEY /
+        # MINIMAX_GROUP_ID from env — no explicit api_key kwarg needed).
+        llm=_minimax.LLM(model=os.environ.get("MINIMAX_LLM_MODEL", "MiniMax-M3")),
         tts=_build_audio_tts(),
         vad=vad or _silero.VAD.load(),
         turn_detection=_MultilingualModel() if _MultilingualModel else None,
@@ -486,14 +487,14 @@ async def entrypoint(ctx) -> None:
 
 
 def _build_audio_tts():
-    """The LiveKit audio-output TTS plugin. NOTE: the google.beta.GeminiTTS plugin
-    routes through the SDK's own auth; the kernel-facing live TTS is the AI-Studio
-    `VertexExpressSynthesizer`. Model + voice come from env (no swaps)."""
-    from livekit.plugins import google
+    """The LiveKit audio-output TTS plugin: MiniMax Speech 2.6-turbo (reads
+    MINIMAX_API_KEY / MINIMAX_GROUP_ID from env). The kernel-facing live TTS is the
+    streaming `MinimaxSynthesizer`. Model + voice come from env (no swaps)."""
+    from livekit.plugins import minimax
 
-    return google.beta.GeminiTTS(
-        model=os.environ.get("GEMINI_TTS_MODEL", "gemini-2.5-flash-preview-tts"),
-        voice_name=os.environ.get("GEMINI_TTS_VOICE", "Kore"),
+    return minimax.TTS(
+        model=os.environ.get("MINIMAX_TTS_MODEL", "speech-2.6-turbo"),
+        voice=os.environ.get("MINIMAX_TTS_VOICE", "Friendly_Person"),
     )
 
 

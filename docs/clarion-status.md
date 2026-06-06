@@ -1,6 +1,9 @@
 # Clarion — LIVE STATUS (read this first each session)
 
-_Last updated: 2026-06-05 · branch `feat/clarion-extension`._
+_Last updated: 2026-06-06 · branch `feat/clarion-extension`._
+_Latest: provider swap → **MiniMax** (MiniMax-M3 brain + Speech 2.6-turbo voice),
+wired through LiveKit; Deepgram STT + Gemini retrieval embeddings unchanged. Tests
+green; live-verify pending the MiniMax key (`scripts/set-minimax-key.sh`)._
 
 This is the single source of truth for **where we are and what's left**. Keep it
 current: when you finish or change something, edit this file in the same commit.
@@ -31,7 +34,7 @@ never the `web/demo-site` clone.
 
 | Piece | State | Evidence / location |
 |---|---|---|
-| Voice: LiveKit · Deepgram STT · Gemini LLM · Gemini TTS | **REAL, live** | `app/voice_entry.py` |
+| Voice: LiveKit · Deepgram STT · **MiniMax-M3 LLM · MiniMax Speech 2.6-turbo TTS** | **REAL, wired (live-verify pending key)** | `app/voice_entry.py` — MiniMax via the LiveKit `minimax` plugin; STT stays Deepgram |
 | Perception (CDP AXTree → numbered map), lazy-stamp | **REAL, cheap** | `actuator/pipeline.py`, `actuator/*actuator.py` (perceive 0 stamp round-trips; `reperceive_node`) |
 | Actuator act (click/fill/navigate over CDP) + `filled` record | **REAL** | native-setter fills stamp `state["filled"]` by node_id |
 | Kernel loop GROUND→VERIFY→PROPOSE→⟨GATE⟩→CONSENT→ACT→CONFIRM | **REAL** | `kernel/graph.py` |
@@ -39,7 +42,7 @@ never the `web/demo-site` clone.
 | Goal source | **REAL (from confirmed user intent)** | `voice_entry.py` `set_goal`; no baked default |
 | **Task PLAN / topology** | **✅ REAL — LLM Reasoner, generic executor** | `Reasoner.plan_goal`→subgoals; `stages/graph.py` generic executor (no baked topology) |
 | **Next-step decision (PROPOSE)** | **✅ REAL — `Reasoner.decide_step` over top-K slice** | `kernel/graph.py`; off-page index/value rejected by `kernel/reasoner_guard.py` |
-| Reasoner adapter | **✅ REAL** | `adapters/gemini_reasoner.py` (default, `thinking_budget=0`, ~2s) · `adapters/openai_reasoner.py` (Qwen/Nebius failover) |
+| Reasoner adapter | **✅ REAL — MiniMax-M3** | `adapters/minimax_reasoner.py` (default; OpenAI-compatible `MiniMax-M3` via `OpenAIReasoner`, same guard) + same-provider MiniMax failover (`gov_proof._build_reasoner`). `gemini_reasoner.py`/`openai_reasoner.py` kept as alternates |
 | **GROUND facts (page values) + PairedFacts** | **✅ REAL (page-grounded)** | `app/page_retriever.py`; `actuator/pipeline.py` `extract_text_facts`/`extract_paired_facts` (geometric, both halves real node ids) |
 | **Epistemic fences** | **✅ REAL** | `kernel/policy.py` membership (`is_speakable_value`) + pairing (`pairing_backs`); `NegativeVerifier` hedge |
 | **Irreversibility gate** | **✅ REAL — dual-signal** | `kernel/irreversibility.py` (structural pre-screen escalate-only; UNKNOWN-on-no-undo gates Fast) |
@@ -118,11 +121,22 @@ behavior on a real site with `load_dotenv` keys, never an exit code.
 - [x] **De-hardcoding proven end-to-end on REAL gov sites** (usa.gov read-only +
       weather.gov form), ZERO site-specific code, every invariant live.
 - [x] `pytest clarion -q` green (**178 passed, 10 deselected**) + goal-agnostic
-      invariant spec (red-before-green proven by mutation).
+      invariant spec (red-before-green proven by mutation). Green AFTER the MiniMax swap.
+- [x] **Provider swap → MiniMax** (LLM + voice): `MinimaxReasoner` (MiniMax-M3,
+      OpenAI-compatible) is the default decider + same-provider failover;
+      `MinimaxSynthesizer` (Speech 2.6-turbo, `/v1/t2a_v2` streaming PCM) is the
+      kernel TTS; LiveKit voice plane uses `minimax.LLM` + `minimax.TTS`. STT stays
+      Deepgram; retrieval keeps Gemini embeddings (KB already built on them).
+- [ ] **MiniMax live-verify (pending key):** `scripts/set-minimax-key.sh` → key in
+      `agent/.env`, then `pip install -e ".[spike]"` (pulls `livekit-plugins-minimax`
+      + `httpx`) → `python -m clarion.app.gov_proof` (M3 decides) + a voice run
+      (hear the Speech 2.6 voice). Confirm M3 honors the structured-output schema
+      (else `OpenAIReasoner` auto-falls back to `json_object`).
 - [ ] **Live-voice product-path proof** on the de-hardcoded stack (extension on a
       real tab; hear the readback + the per-step consent + the irreversible hard-stop).
 - [ ] **Step-6 speculation** before the live voice demo (hide the ~2s decode).
-- [ ] **Qwen key rotation:** the `NEBIUS_API_KEY` was pasted in chat — rotate it.
+- [x] **Qwen/Nebius retired from the default path** — failover is now MiniMax, so the
+      pasted `NEBIUS_API_KEY` is unused (still: rotate it, it leaked in chat).
 - [ ] `python scripts/copy_lint.py <file>` on any new copy (no "assistant/helper/assist").
 
 **Testing rule (LOCKED):** never test on the `web/demo-site` clone — only ACTUAL

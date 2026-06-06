@@ -307,7 +307,8 @@ class HeroRuntime:
         self.publisher = publisher
         self.mode = mode
         # The de-hardcoding boundary: the LLM that reasons the plan + next step
-        # (GeminiReasoner live; FakeReasoner in tests). Injected into the executor.
+        # (MinimaxReasoner / MiniMax-M3 live; FakeReasoner in tests). Injected into
+        # the executor.
         self.reasoner = reasoner
         # The Moss-backed KB retriever (live) or the offline cached replay (demo).
         self.kb_retriever = kb_retriever
@@ -371,13 +372,13 @@ class HeroRuntime:
         kb = kb_retriever if kb_retriever is not None else await select_kb_retriever(
             demo_mode=demo
         )
-        # The de-hardcoding boundary: the real GeminiReasoner (the LLM decider)
-        # unless one is injected (tests inject a FakeReasoner). Lazy client — no
-        # I/O at construct (load_dotenv resolves agent/.env keys on first call).
+        # The de-hardcoding boundary: the real MinimaxReasoner (MiniMax-M3, the LLM
+        # decider) unless one is injected (tests inject a FakeReasoner). Lazy client
+        # — no I/O at construct (load_dotenv resolves agent/.env keys on first call).
         if reasoner is None:
-            from clarion.adapters.gemini_reasoner import GeminiReasoner
+            from clarion.adapters.minimax_reasoner import MinimaxReasoner
 
-            reasoner = GeminiReasoner()
+            reasoner = MinimaxReasoner()
         publisher = PanelPublisher(room=room, retriever=timed, sink=panel_sink)
         return cls(
             actuator=actuator,

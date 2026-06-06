@@ -23,7 +23,7 @@ import asyncio
 
 import pytest
 
-from clarion.adapters.tts_vertex import VertexExpressSynthesizer
+from clarion.adapters.minimax_synthesizer import MinimaxSynthesizer
 from clarion.adapters.voice_livekit import (
     LiveKitVoiceTransport,
     advance_non_blocking,
@@ -120,11 +120,11 @@ def test_transport_constructs_without_session_or_creds() -> None:
     # No injected session, no env — must still construct (lazy session build).
     vt = LiveKitVoiceTransport()
     assert isinstance(vt, VoiceTransport)
-    # The kernel-facing synthesizer is the Vertex Express one, constructed but
-    # with NO SDK client built yet (no network at construction).
+    # The kernel-facing synthesizer is the MiniMax one, constructed but with NO
+    # HTTP client built yet (no network at construction).
     assert isinstance(vt.synthesizer, Synthesizer)
-    assert isinstance(vt.synthesizer, VertexExpressSynthesizer)
-    assert vt.synthesizer._client is None  # lazy — no genai.Client(), no network
+    assert isinstance(vt.synthesizer, MinimaxSynthesizer)
+    assert vt.synthesizer._client is None  # lazy — no httpx.AsyncClient(), no network
 
 
 # ---------------------------------------------------------------------------

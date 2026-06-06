@@ -7,8 +7,8 @@ script here, no demo-site creds, no per-stage predicate, no "Submit payment"
 button name. The driver only:
 
   1. ``HeroRuntime.create(url, mode="normal", …)`` over a REAL ``PlaywrightActuator``
-     + the LIVE ``GeminiReasoner`` (the de-hardcoding boundary), Qwen/Nebius
-     failover behind a 503-aware wrapper;
+     + the LIVE ``MinimaxReasoner`` (MiniMax-M3, the de-hardcoding boundary), a
+     same-provider MiniMax failover behind a 503-aware wrapper;
   2. ``runtime.build_stage_graph()`` — the generic executor (``stages.graph``:
      planner derives a goal-derived ``list[Subgoal]``; the kernel loop runs per
      subgoal; the done-check is the reasoner-SELECTED generic check evaluated in
@@ -86,9 +86,9 @@ def _p(msg: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 503-aware Reasoner wrapper — retry/backoff on Gemini high-demand, then fall
-# over to the OpenAIReasoner (Qwen/Nebius). The hard constraint: handle Gemini
-# 503 high-demand; if it persists, fall back and SAY SO. This wraps a Reasoner
+# 503-aware Reasoner wrapper — retry/backoff on MiniMax high-demand, then fall
+# over to a SECONDARY MiniMax client. The hard constraint: handle transient
+# 503/high-demand; if it persists, fall back and SAY SO. This wraps a Reasoner
 # transparently so the kernel/stage graph see the frozen port unchanged.
 # ---------------------------------------------------------------------------
 
@@ -108,9 +108,10 @@ def _is_overloaded(exc: Exception) -> bool:
 
 
 class ResilientReasoner(Reasoner):
-    """A frozen-port ``Reasoner`` that wraps a PRIMARY (Gemini) and, on persistent
-    transient overload, FAILS OVER to a SECONDARY (Qwen/Nebius). Each call: retry
-    the primary with exponential backoff; if it still overloads, try the secondary
+    """A frozen-port ``Reasoner`` that wraps a PRIMARY (MiniMax-M3) and, on
+    persistent transient overload, FAILS OVER to a SECONDARY (MiniMax). Each call:
+    retry the primary with exponential backoff; if it still overloads, try the
+    secondary
     (also with backoff); on a non-transient error, raise. Records every failover so
     the report can say plainly which provider answered.
 
@@ -220,16 +221,17 @@ class ResilientReasoner(Reasoner):
 
 
 def _build_reasoner() -> ResilientReasoner:
-    """The live decider: GeminiReasoner primary, OpenAIReasoner (Qwen/Nebius)
-    failover, behind the 503-aware wrapper. Lazy clients (no I/O at construct)."""
-    from clarion.adapters.gemini_reasoner import GeminiReasoner
+    """The live decider: MinimaxReasoner (MiniMax-M3) primary, with a same-provider
+    MiniMax failover behind the 503-aware wrapper. ``MINIMAX_LLM_MODEL_FALLBACK``
+    lets the event point the secondary at a high-speed MiniMax model if M3 is
+    saturated; absent it, the secondary is a fresh M3 client. Lazy clients (no I/O
+    at construct)."""
+    from clarion.adapters.minimax_reasoner import MinimaxReasoner
 
     def _secondary_factory():
-        from clarion.adapters.openai_reasoner import OpenAIReasoner
+        return MinimaxReasoner(model=os.environ.get("MINIMAX_LLM_MODEL_FALLBACK"))
 
-        return OpenAIReasoner()
-
-    return ResilientReasoner(GeminiReasoner(), secondary_factory=_secondary_factory)
+    return ResilientReasoner(MinimaxReasoner(), secondary_factory=_secondary_factory)
 
 
 # ---------------------------------------------------------------------------
