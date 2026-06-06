@@ -68,6 +68,9 @@ export default {
   LIVEKIT_URL: "$LK_URL",
   ROOM_NAME: "$ROOM",
   TOKEN: "$TOKEN",
+  // Optional mic override (label substring). Empty → offscreen auto-prefers a
+  // real device over virtual ones (MMAudio/Teams/etc). Set CLARION_MIC_MATCH.
+  MIC_MATCH: "${CLARION_MIC_MATCH:-}",
 };
 JS
 echo "      wrote $EXT/config.js (url + room '$ROOM' + fresh token)"
