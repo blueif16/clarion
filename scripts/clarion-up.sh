@@ -171,7 +171,8 @@ cat <<NEXT
   • On the tab: press Ctrl/Cmd+Shift+Y to attach, grant the mic, then TALK.
   • If the extension didn't auto-load: chrome://extensions → Developer mode → Load unpacked → $EXT
   • Lines below are tagged [worker] (agent/STT/LLM/TTS/tools/errors), [broker] (relay),
-    [ext] (browser mic + HUD). The worker's voice lines also appear under [ext] (unified).
+    [ext] (browser mic + HUD). Each line appears ONCE — worker lines are [worker] only;
+    the on-page HUD still mirrors the important ones (clarion-log topic).
   • Ctrl-C in THIS window tears the whole stack down (same as scripts/clarion-down.sh).
   Read-only up to the auth wall — no credentials, no submit.
 NEXT

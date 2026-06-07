@@ -315,28 +315,23 @@ _FILLERS = {
 
 
 def _build_audio_tts() -> Any:
-    """The LiveKit audio-output TTS: MiniMax Speech via the minimax plugin.
+    """The LiveKit audio-output TTS, via **LiveKit Inference** — the native path.
 
-    The plugin REQUIRES both MINIMAX_API_KEY and MINIMAX_GROUP_ID, and its
-    model/voice enums DIFFER from the raw `/v1/t2a_v2` API the kernel-facing
-    `MinimaxSynthesizer` uses (the plugin rejects `speech-2.6-turbo` /
-    `Friendly_Person`). So it reads its OWN env (MINIMAX_PLUGIN_TTS_MODEL /
-    MINIMAX_PLUGIN_TTS_VOICE) with plugin-valid defaults; the kwarg is `voice_id`."""
-    from livekit.plugins import minimax
+    Routed through the LiveKit Cloud project's own credentials (no per-provider
+    key, no MiniMax dependency). Defaults to Cartesia Sonic-2 + a Deepgram Aura-2
+    failover; override with CLARION_TTS_MODEL / CLARION_TTS_VOICE / CLARION_TTS_FALLBACK.
+    Kept in sync with `app/voice_entry._build_audio_tts` (the live worker path)."""
+    from livekit.agents import inference
 
-    api_key = os.environ.get("MINIMAX_API_KEY")
-    group_id = os.environ.get("MINIMAX_GROUP_ID")
-    if not api_key or not group_id:
-        raise RuntimeError(
-            "MiniMax voice needs MINIMAX_API_KEY and MINIMAX_GROUP_ID in agent/.env. "
-            "Run: scripts/set-minimax-key.sh <API_KEY> <GROUP_ID>"
-        )
-    return minimax.TTS(
-        api_key=api_key,
-        group_id=group_id,
-        model=os.environ.get("MINIMAX_PLUGIN_TTS_MODEL", "speech-02-turbo"),
-        voice_id=os.environ.get("MINIMAX_PLUGIN_TTS_VOICE", "Serene_Woman"),
-    )
+    model = os.environ.get("CLARION_TTS_MODEL", "cartesia/sonic-2")
+    voice = os.environ.get("CLARION_TTS_VOICE", "")
+    fallback = os.environ.get("CLARION_TTS_FALLBACK", "deepgram/aura-2")
+    kwargs: dict = {"model": model}
+    if voice:
+        kwargs["voice"] = voice
+    if fallback and fallback.lower() != "off":
+        kwargs["fallback"] = fallback
+    return inference.TTS(**kwargs)
 
 
 __all__ = [

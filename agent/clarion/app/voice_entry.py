@@ -43,7 +43,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import urllib.request
 from typing import Optional
 
 from langgraph.types import Command
@@ -55,30 +54,16 @@ from clarion.contracts.state import PageReadout
 
 _AGENT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# --- unified voice-log fan-out -------------------------------------------------
-# Worker voice logs go three places so BOTH a human and an agent can debug live
+# --- voice-log fan-out ---------------------------------------------------------
+# Worker voice logs go TWO places so BOTH a human and an agent can debug live
 # without copy-pasting out of DevTools:
-#   1. stdout            → /tmp/clarion-worker.log (the worker's own log)
-#   2. the browser sink  → /tmp/clarion-ext.log    (the SAME file the extension
-#                          POSTs to — one unified `tail -f` stream)
-#   3. LiveKit room data → the offscreen doc → service worker → on-page HUD panel
-# All three are best-effort and never block or break a turn.
-_SINK_URL = os.environ.get("CLARION_LOGSINK", "http://127.0.0.1:8772/log")
-
-
-def _sink_post(line: str) -> None:
-    """Blocking POST to the browser-log sink (run in an executor — NEVER on the
-    event loop). Mirrors hud.js `sinkLog` so worker + extension logs share one
-    file. Silent on any failure (the sink may simply be down)."""
-    try:
-        req = urllib.request.Request(
-            _SINK_URL,
-            data=line.encode("utf-8"),
-            headers={"Content-Type": "text/plain"},
-        )
-        urllib.request.urlopen(req, timeout=0.5).close()
-    except Exception:  # noqa: BLE001 - logging must never raise
-        pass
+#   1. stdout            → /tmp/clarion-worker.log (the worker's own log; the
+#                          cockpit `clarion-up.sh` tags these [worker])
+#   2. LiveKit room data → the offscreen doc → service worker → on-page HUD panel
+# The worker does NOT POST to the browser sink (/tmp/clarion-ext.log): the cockpit
+# tails BOTH worker.log AND ext.log, so a worker line ALSO sent to ext.log showed up
+# TWICE (once [worker], once [ext]) — the "duplicated log lines". ext.log is now
+# browser-only and the cockpit is the unified view. Both paths never block a turn.
 
 
 async def _publish_hud(room, entry: dict) -> None:
@@ -409,13 +394,11 @@ async def entrypoint(ctx) -> None:
     from clarion.app.runtime import HeroRuntime
 
     def _fanout(line: str) -> None:
-        """stdout (worker.log) + the browser sink (ext.log), offloaded so the
-        event loop never blocks on the HTTP POST."""
+        """Worker log line → stdout (/tmp/clarion-worker.log). Deliberately NOT the
+        browser sink: the cockpit tails worker.log AND ext.log, so POSTing here
+        double-logged every worker line. ext.log is browser-only now; the HUD still
+        gets IMPORTANT lines via the clarion-log topic (see `hud()`)."""
         print(f"  {line}", flush=True)
-        try:
-            asyncio.get_running_loop().run_in_executor(None, _sink_post, line)
-        except RuntimeError:  # no running loop (shouldn't happen inside entrypoint)
-            pass
 
     def loop(msg: str) -> None:
         """One observable line per loop phase → worker.log + the unified ext.log."""
@@ -462,13 +445,24 @@ async def entrypoint(ctx) -> None:
             endpointing_ms=int(os.environ.get("STT_ENDPOINTING_MS", "300")),
             api_key=os.environ["DEEPGRAM_API_KEY"],
         ),
-        # MiniMax-M3 via the LiveKit minimax plugin, pinned to the io-region host.
+        # MiniMax-M3 via the MiniMax Anthropic gateway (LiveKit `anthropic` plugin).
         llm=_build_llm(),
+        # Voice = LiveKit Inference (native; no per-provider key) — Cartesia Sonic-2
+        # default + Deepgram Aura-2 failover. Override with CLARION_TTS_MODEL/_VOICE.
         tts=_build_audio_tts(),
         vad=vad or _silero.VAD.load(),
         turn_detection=_MultilingualModel() if _MultilingualModel else None,
     )
     agent = Agent(instructions=_INSTRUCTIONS, tools=tools)
+    # Surface the live voice so "is the agent speaking?" is answerable from the log
+    # + HUD (the prior MiniMax path went silent without saying which model was up).
+    _tts_fb = os.environ.get("CLARION_TTS_FALLBACK", "deepgram/aura-2")
+    hud(
+        "[tts] voice",
+        f"LiveKit Inference · {os.environ.get('CLARION_TTS_MODEL', 'cartesia/sonic-2')}"
+        + (f" → {_tts_fb}" if _tts_fb.lower() != "off" else ""),
+        "ok",
+    )
 
     # ───────────────────────── voice-conversation observability ─────────────────
     # The WHOLE turn is logged: what the mic/STT HEARD, the agent's state machine
@@ -645,92 +639,34 @@ def _build_llm():
 
 
 def _build_audio_tts():
-    """The LiveKit audio-output TTS plugin (MiniMax Speech).
+    """The LiveKit audio-output TTS, via **LiveKit Inference** — the native path.
 
-    The plugin REQUIRES both MINIMAX_API_KEY and MINIMAX_GROUP_ID, and its
-    model/voice enums DIFFER from the raw `/v1/t2a_v2` API the kernel-facing
-    `MinimaxSynthesizer` uses — the plugin rejects `speech-2.6-turbo` and the
-    `Friendly_Person` voice. So it reads its OWN env (MINIMAX_PLUGIN_TTS_MODEL /
-    MINIMAX_PLUGIN_TTS_VOICE) with plugin-valid defaults, never the raw-API
-    MINIMAX_TTS_MODEL/_VOICE. The plugin kwarg is `voice_id`, not `voice`.
+    Inference routes synthesis through the LiveKit Cloud project's OWN credentials
+    (LIVEKIT_API_KEY/SECRET, already in agent/.env), so there is no per-provider
+    API key and no MiniMax dependency. Model + voice come from env with a high-
+    performance default — **Cartesia Sonic-2**, LiveKit's recommended low-latency
+    TTS — and an automatic **Deepgram Aura-2** failover, mirroring the LLM's
+    `FallbackAdapter` so a Cartesia hiccup degrades the voice instead of going
+    silent. `voice` is optional (provider default if unset); override either knob:
 
-    BUGFIX — multi-sentence TTS crash (plugin 1.2.9 × livekit-agents 1.5.15):
-    the plugin's `SynthesizeStream._run` opens a NEW emitter segment per sentence
-    (`start_segment`/`end_segment` inside its loop). agents 1.5.15 forbids a second
-    `start_segment()` before the prior `end_segment()` ("start_segment() called
-    before the previous segment was ended"), so ANY reply past the first sentence
-    crashed the TTS task (greeting died after "Hello. I'm Clarion,"). No plugin
-    version is compatible with agents 1.5.15 (latest 1.3.0 *pins* agents 1.2.9 and
-    downgrading breaks the deepgram/anthropic/turn-detector 1.5.15 plugins), and the
-    plugin's `synthesize()` raises NotImplementedError so `StreamAdapter` is out.
-    Fix without a downgrade: run the plugin's `_run` against a PROXY emitter that
-    collapses its per-sentence segments into ONE segment per utterance — let the
-    first `start_segment` through, swallow the rest and the per-sentence
-    `end_segment`s, then close the single segment once when `_run` finishes. Audio
-    still streams sentence-by-sentence; the MiniMax voice is unchanged."""
-    from livekit.plugins import minimax
-    from livekit.plugins.minimax import tts as _mx_tts
+        CLARION_TTS_MODEL     e.g. cartesia/sonic-2 | deepgram/aura-2 | elevenlabs/eleven_turbo_v2_5
+        CLARION_TTS_VOICE     provider voice (e.g. deepgram 'athena'); empty → provider default
+        CLARION_TTS_FALLBACK  failover model id, or 'off' to disable
 
-    api_key = os.environ.get("MINIMAX_API_KEY")
-    group_id = os.environ.get("MINIMAX_GROUP_ID")
-    if not api_key or not group_id:
-        raise RuntimeError(
-            "MiniMax voice needs MINIMAX_API_KEY and MINIMAX_GROUP_ID in agent/.env. "
-            "Run: scripts/set-minimax-key.sh <API_KEY> <GROUP_ID>"
-        )
+    This replaced the MiniMax `minimax.TTS` plugin (+ a per-sentence one-segment
+    workaround for the plugin-1.2.9 × agents-1.5.15 `start_segment()` crash);
+    Inference uses the native agents-1.5.15 streaming API, so no workaround is needed."""
+    from livekit.agents import inference
 
-    class _OneSegmentEmitter:
-        """Forwards everything to the real AudioEmitter but coalesces the plugin's
-        per-sentence segments into one: first `start_segment` opens it, later ones +
-        every `end_segment` are dropped; `finish()` closes it exactly once."""
-
-        def __init__(self, real):
-            self._real = real
-            self._opened = False
-
-        def start_segment(self, *a, **k):
-            if self._opened:
-                return None
-            self._opened = True
-            return self._real.start_segment(*a, **k)
-
-        def end_segment(self, *a, **k):
-            return None  # defer to finish()
-
-        def finish(self):
-            if self._opened:
-                self._opened = False
-                self._real.end_segment()
-
-        def __getattr__(self, name):  # initialize/push/flush/… → real emitter
-            return getattr(self._real, name)
-
-    class _OneSegmentStream(_mx_tts.SynthesizeStream):
-        async def _run(self, emitter) -> None:
-            proxy = _OneSegmentEmitter(emitter)
-            try:
-                await super()._run(proxy)
-            finally:
-                try:
-                    proxy.finish()  # close the single segment (no-op if barge-in cancelled pre-open)
-                except Exception:  # noqa: BLE001 - emitter may already be closing
-                    pass
-
-    class _OneSegmentTTS(minimax.TTS):
-        def stream(self, *, conn_options=_mx_tts.DEFAULT_API_CONNECT_OPTIONS):
-            return _OneSegmentStream(
-                tts=self,
-                conn_options=conn_options,
-                opts=self._opts,
-                session=self._ensure_session(),
-            )
-
-    return _OneSegmentTTS(
-        api_key=api_key,
-        group_id=group_id,
-        model=os.environ.get("MINIMAX_PLUGIN_TTS_MODEL", "speech-02-turbo"),
-        voice_id=os.environ.get("MINIMAX_PLUGIN_TTS_VOICE", "Serene_Woman"),
-    )
+    model = os.environ.get("CLARION_TTS_MODEL", "cartesia/sonic-2")
+    voice = os.environ.get("CLARION_TTS_VOICE", "")
+    fallback = os.environ.get("CLARION_TTS_FALLBACK", "deepgram/aura-2")
+    kwargs: dict = {"model": model}
+    if voice:
+        kwargs["voice"] = voice
+    if fallback and fallback.lower() != "off":
+        kwargs["fallback"] = fallback
+    return inference.TTS(**kwargs)
 
 
 def prewarm(proc) -> None:

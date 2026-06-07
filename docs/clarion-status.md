@@ -1,9 +1,13 @@
 # Clarion — LIVE STATUS (read this first each session)
 
-_Last updated: 2026-06-06 · branch `feat/clarion-extension`._
-_Latest: provider swap → **MiniMax** (MiniMax-M3 brain + Speech 2.6-turbo voice),
-wired through LiveKit; Deepgram STT + Gemini retrieval embeddings unchanged. Tests
-green; live-verify pending the MiniMax key (`scripts/set-minimax-key.sh`).
+_Last updated: 2026-06-06 · branch `feat/clarion-memory`._
+_Latest: **voice TTS swapped MiniMax → LiveKit Inference** (`inference.TTS`, native —
+no per-provider key, routed through the LiveKit Cloud creds): default **Cartesia
+Sonic-2** + automatic **Deepgram Aura-2** failover; knobs `CLARION_TTS_MODEL/_VOICE/
+_FALLBACK` (`app/voice_entry._build_audio_tts`). Dropped the MiniMax `_OneSegmentTTS`
+plugin workaround. The **brain stays MiniMax-M3** (Anthropic gateway). Tests green (190).
+Earlier: provider swap → **MiniMax** (MiniMax-M3 brain + Speech 2.6-turbo voice),
+wired through LiveKit; Deepgram STT + Gemini retrieval embeddings unchanged.
 **Voice-LLM resilience:** M3's endpoint intermittently 5xx'd ("unknown error (1000)")
 under load and the agent went SILENT — now `_build_llm()` wraps M3 (primary) +
 `MiniMax-M2.7` in `llm.FallbackAdapter` (`MINIMAX_LLM_MODEL_FALLBACK`, `off` to
@@ -60,7 +64,7 @@ never the `web/demo-site` clone.
 
 | Piece | State | Evidence / location |
 |---|---|---|
-| Voice: LiveKit · Deepgram STT · **MiniMax-M3 LLM (M2.7 failover) · MiniMax Speech 2.6-turbo TTS** | **REAL, wired (live-verify pending key)** | `app/voice_entry.py` — MiniMax via the LiveKit `minimax` plugin; STT stays Deepgram. **`_build_llm()` = `llm.FallbackAdapter([M3, MiniMax-M2.7])`** so an M3 5xx fails OVER instead of going silent (both share the `reasoning_split`-wrapped client). **Plugin needs `MINIMAX_GROUP_ID` + `voice_id` (not `voice`); model/voice enums differ from the raw t2a_v2 synth → reads `MINIMAX_PLUGIN_TTS_MODEL/_VOICE`** |
+| Voice: LiveKit · Deepgram STT · **MiniMax-M3 LLM (M2.7 failover) · LiveKit Inference TTS (Cartesia Sonic-2 + Deepgram Aura-2 failover)** | **REAL, wired** | `app/voice_entry.py` — MiniMax via the LiveKit `minimax` plugin; STT stays Deepgram. **`_build_llm()` = `llm.FallbackAdapter([M3, MiniMax-M2.7])`** so an M3 5xx fails OVER instead of going silent (both share the `reasoning_split`-wrapped client). **Plugin needs `MINIMAX_GROUP_ID` + `voice_id` (not `voice`); model/voice enums differ from the raw t2a_v2 synth → reads `MINIMAX_PLUGIN_TTS_MODEL/_VOICE`** |
 | Voice-conversation observability (ASR heard · agent state · tool calls · errors) | **REAL — on the HUD panel + unified log; deduped** | `voice_entry.py` `hud()` → LiveKit room-data (`clarion-log` topic) → `offscreen.js` `DataReceived` → SW `pushHud`; the worker also POSTs to the sink so `/tmp/clarion-ext.log` is ONE stream — and the HUD round-trip now skips the sink (`fromWorker`) so worker lines aren't double-logged. **Per-frame VAD/STT metrics + `[asr] user` state are silenced** (re-enable in `voice_entry.py` for profiling). **HUD panel = LiveKit-style status visualizer** (`hud.js`): the bar-orb reflects the live agent state machine off the `[agent] old → new` lines (reads the *new* state, right of the arrow), `setHudStatus` covers the attach/voice-connect/teardown edges the machine doesn't; the log is category-coloured + draggable + sanitized (role label → "Clarion") |
 | Perception (CDP AXTree → numbered map), lazy-stamp | **REAL, cheap** | `actuator/pipeline.py`, `actuator/*actuator.py` (perceive 0 stamp round-trips; `reperceive_node`) |
 | Actuator act (click/fill/navigate over CDP) + `filled` record | **REAL** | native-setter fills stamp `state["filled"]` by node_id |
