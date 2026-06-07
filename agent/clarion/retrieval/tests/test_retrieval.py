@@ -159,11 +159,14 @@ async def test_live_ingest_query_roundtrip() -> None:
 
 @live
 async def test_live_memory_write_read() -> None:
-    """A written verified fact reads back from the per-user profile (R3)."""
-    mem = MossMemory(user_id=f"test-{os.getpid()}")
-    from clarion.retrieval.memory_moss import _index_for
+    """A written verified fact reads back from the user's profile (R3).
 
-    idx = _index_for(f"test-{os.getpid()}")
+    Uses a DISPOSABLE profile index (the category index is shared across users, so
+    we must never delete the real ``clarion-profile`` in cleanup) — write + read are
+    scoped by the ``user_id`` metadata filter exactly as in production."""
+    uid = f"test-{os.getpid()}"
+    test_idx = f"clarion-profile-test-{os.getpid()}"
+    mem = MossMemory(user_id=uid, profile_index=test_idx)
     try:
         fact = Fact(
             value="The customer prefers AutoPay enrollment.",
@@ -171,7 +174,7 @@ async def test_live_memory_write_read() -> None:
             verified=True,
         )
         await mem.write(fact)
-        profile = await mem.read_profile(f"test-{os.getpid()}")
+        profile = await mem.read_profile(uid)
         assert isinstance(profile, Profile)
         assert any("autopay" in f.value.lower() for f in profile.facts)
         written = next(f for f in profile.facts if "autopay" in f.value.lower())
@@ -179,6 +182,6 @@ async def test_live_memory_write_read() -> None:
         assert written.source_node_id == "clarion-kb::autopay"
     finally:
         try:
-            await MossClient().delete_index(idx)
+            await MossClient().delete_index(test_idx)
         except Exception:  # noqa: BLE001
             pass
