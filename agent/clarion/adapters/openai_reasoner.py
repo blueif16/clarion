@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -158,6 +159,9 @@ class OpenAIReasoner(Reasoner):
             "NEBIUS_BASE_URL", _DEFAULT_BASE_URL
         )
         self._client = None  # built lazily
+        # Provider-specific request body merged into every create() call (e.g.
+        # MiniMax-M3's thinking-disable switch). Subclasses set this; None = omit.
+        self._extra_body: dict[str, Any] | None = None
         # Once a strict-json_schema call is rejected, remember to use json_object.
         self._use_json_object_fallback = False
         # Observability parity with the other reasoners.
@@ -220,6 +224,7 @@ class OpenAIReasoner(Reasoner):
                     ),
                     response_format={"type": "json_object"},
                     temperature=0.0,
+                    extra_body=self._extra_body,
                 )
                 return resp.choices[0].message.content or "", True
             resp = client.chat.completions.create(
@@ -229,6 +234,7 @@ class OpenAIReasoner(Reasoner):
                 ),
                 response_format=_json_schema_format("reasoner_output", schema),
                 temperature=0.0,
+                extra_body=self._extra_body,
             )
             return resp.choices[0].message.content or "", False
 
@@ -244,7 +250,7 @@ class OpenAIReasoner(Reasoner):
                 self._use_json_object_fallback = True
                 text, used = await asyncio.to_thread(_call, True)
         self.last_used_fallback = used
-        return json.loads(_strip_fence(text))
+        return json.loads(_strip_fence(_strip_think(text)))
 
     async def plan_goal(
         self,
@@ -315,6 +321,19 @@ class OpenAIReasoner(Reasoner):
                 )
         self.last_decide_ms = (time.perf_counter() - t0) * 1000.0
         return proposal
+
+
+def _strip_think(text: str) -> str:
+    """Strip reasoning blocks some models (MiniMax M-series, Qwen) inline in the
+    content as ``<think>…</think>`` before the JSON. A no-op when absent. Defensive
+    even when the provider's thinking switch is off (``self._extra_body``)."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Unclosed <think> with no terminator: jump to the first JSON bracket.
+    if "<think>" in text.lower():
+        for i, ch in enumerate(text):
+            if ch in "{[":
+                return text[i:]
+    return text
 
 
 def _strip_fence(text: str) -> str:
