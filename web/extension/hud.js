@@ -151,6 +151,35 @@ export async function setHudStatus(tabId, status) {
 }
 
 /**
+ * Feature A — the ACTION-TRACE FEED. Render one decided action (an ActivityItem
+ * dict projected from the real kernel trace) as a "push notification" toast
+ * bottom-right that ALSO settles into a permanent Activity history inside the
+ * panel. Reversible reads/navigations fade after ~5s; an irreversible /
+ * awaiting-yes action PERSISTS and stands out until it resolves. Click any toast
+ * or row to expand the full real detail (classification, rationale, the model's
+ * reasoning, the grounded source, timestamps — everything the kernel recorded).
+ *
+ * This is the action-side analog of the source-node panel: facts trace to a
+ * source node; actions trace to an evaluation. Best-effort + id-guarded like the
+ * rest of the HUD — a restricted page simply no-ops.
+ * @param {number|null|undefined} tabId
+ * @param {object} item  an ActivityItem (publisher.activity_items() → model_dump)
+ */
+export async function pushActivity(tabId, item) {
+  if (!DEBUG_HUD || tabId == null || !chrome.scripting || !item) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: _renderActivity,
+      args: [{ item }],
+    });
+  } catch {
+    /* restricted page or the tab is gone — non-fatal */
+  }
+}
+
+/**
  * Page-side renderer, serialized and injected by _inject. Self-contained: it must
  * NOT close over any module-scope binding (only its `payload` argument and page
  * globals like document / window / Math / Date). The panel + its requestAnimation-
@@ -747,6 +776,351 @@ function _renderHud(payload) {
 
 @keyframes cl-in{from{opacity:0;transform:translateY(3px);}to{opacity:1;transform:none;}}
 @keyframes cl-breathe{0%,100%{opacity:.55;transform:scale(.88);}50%{opacity:1;transform:scale(1.15);}}
+`;
+    (document.head || document.documentElement).appendChild(style);
+  }
+}
+
+/**
+ * Page-side renderer for ONE decided action (Feature A). Serialized + injected by
+ * pushActivity. Self-contained: it closes over NO module binding — only its
+ * `payload` argument and page globals. Two surfaces, ONE call, keyed by
+ * proposal_id so they can't drift:
+ *   1. a "push notification" TOAST bottom-right — reversible reads fade after ~5s;
+ *      an irreversible / awaiting-yes action PERSISTS + stands out until resolved;
+ *   2. a permanent ROW that settles into an Activity history inside the panel.
+ * Click either to expand the FULL real detail (every recorded field — nothing
+ * fabricated). Palette + glass match the telemetry panel (rose / magenta /
+ * violet); never indigo or emerald.
+ *
+ * @param {{item:object}} payload  item = an ActivityItem dict (publisher projection)
+ */
+function _renderActivity(payload) {
+  const item = payload && payload.item;
+  if (!item || !item.proposal_id) return;
+
+  const TOAST_ID = "__clarion_activity_toasts__";
+  const STYLE_ID = "__clarion_activity_style__";
+  const PANEL_ID = "__clarion_debug_hud__";
+  const RESOLVED = { done: 1, failed: 1, rejected: 1, abstained: 1, approved: 1 };
+  const REVERSIBLE_FADE_MS = 5000;
+  const RESOLVED_DWELL_MS = 8000;
+  const MAX_TOASTS = 4;
+  const MAX_ROWS = 40;
+
+  const S = (window.__clarionActivity = window.__clarionActivity || { timers: {} });
+  S.timers = S.timers || {};
+
+  _injectActivityStyle();
+  const pid = String(item.proposal_id);
+  const persist = _persist(item);
+
+  // (1) the bottom-right toast --------------------------------------------------
+  const layer = _toastLayer();
+  let toast = layer.querySelector('[data-pid="' + cssEsc(pid) + '"]');
+  if (!toast) {
+    toast = _card("cl-act-toast");
+    toast.dataset.pid = pid;
+    layer.appendChild(toast); // column-reverse → newest nearest the corner
+  }
+  _fill(toast, item, persist);
+  _trimToasts(layer);
+
+  // fade discipline: persistent (awaiting / unresolved irreversible) stays; a
+  // resolved one lingers then clears; a plain reversible read fades quickly. The
+  // panel history keeps the row regardless, so nothing is ever lost.
+  clearTimeout(S.timers[pid]);
+  if (!persist && !toast.classList.contains("cl-open")) {
+    const dwell =
+      item.irreversibility === "irreversible" || item.irreversibility === "unknown"
+        ? RESOLVED_DWELL_MS
+        : REVERSIBLE_FADE_MS;
+    S.timers[pid] = setTimeout(() => _fade(toast), dwell);
+  }
+
+  // (2) the permanent panel Activity row ---------------------------------------
+  const list = _activityList();
+  if (list) {
+    let row = list.querySelector('[data-pid="' + cssEsc(pid) + '"]');
+    if (!row) {
+      row = _card("cl-act-row");
+      row.dataset.pid = pid;
+      list.appendChild(row);
+    }
+    _fill(row, item, persist);
+    while (list.childElementCount > MAX_ROWS) list.removeChild(list.firstElementChild);
+    list.scrollTop = list.scrollHeight;
+  }
+
+  // ---- fill one card (toast or row) with the short form + expandable detail ---
+  function _fill(card, it, isPersist) {
+    card.dataset.status = it.status || "proposed";
+    card.dataset.irr = it.irreversibility || "";
+    if (isPersist) card.classList.add("cl-persist");
+    else card.classList.remove("cl-persist");
+
+    const wasOpen = card.classList.contains("cl-open");
+    card.textContent = "";
+
+    const head = el("div", "cl-act-head");
+    head.append(
+      el("span", "cl-act-glyph", glyph(it)),
+      el("span", "cl-act-title", headline(it))
+    );
+    const chips = el("span", "cl-act-chips");
+    const cc = classChip(it);
+    if (cc) chips.appendChild(el("span", "cl-act-chip cl-act-cls", cc));
+    chips.appendChild(el("span", "cl-act-chip cl-act-st", statusText(it)));
+    head.appendChild(chips);
+    card.appendChild(head);
+
+    const detail = _detail(it);
+    card.appendChild(detail);
+    if (wasOpen) card.classList.add("cl-open");
+
+    head.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const open = card.classList.toggle("cl-open");
+      // pause the auto-fade while the user reads the expanded detail
+      if (open) clearTimeout(S.timers[String(it.proposal_id)]);
+    });
+  }
+
+  // ---- the expand: EVERY real recorded field, nothing fabricated -------------
+  function _detail(it) {
+    const box = el("div", "cl-act-detail");
+    const grid = el("div", "cl-act-grid");
+    const put = (k, v) => {
+      if (v == null || v === "") return;
+      grid.append(el("span", "cl-act-k", k), el("span", "cl-act-v", sani(String(v))));
+    };
+    put("action", it.kind);
+    put("target", it.target);
+    put("value", it.value);
+    put("reversibility", it.irreversibility);
+    put("status", statusText(it));
+    put("decision", it.decision);
+    if (it.at) put("at", new Date(it.at * 1000).toLocaleTimeString([], { hour12: false }));
+    box.appendChild(grid);
+
+    // the full real payload the kernel recorded for this action (sorted, de-duped
+    // of the summary keys already shown above).
+    const shown = { action_kind: 1, target_name: 1, say: 1, value_ref: 1, classification: 1, decision: 1 };
+    const d = it.details || {};
+    const extra = el("div", "cl-act-grid cl-act-raw");
+    Object.keys(d)
+      .sort()
+      .forEach((k) => {
+        if (shown[k]) return;
+        const v = d[k];
+        if (v == null || v === "" || k === "proposal_id" || k === "acted_proposal_id") return;
+        extra.append(el("span", "cl-act-k", k), el("span", "cl-act-v", sani(String(v))));
+      });
+    if (extra.childElementCount) {
+      box.appendChild(el("div", "cl-act-rawlabel", "recorded"));
+      box.appendChild(extra);
+    }
+    return box;
+  }
+
+  // ---- small pure helpers (no outer closure) ---------------------------------
+  function _persist(it) {
+    if (it.status === "awaiting_yes") return true;
+    if (
+      (it.irreversibility === "irreversible" || it.irreversibility === "unknown") &&
+      !RESOLVED[it.status]
+    )
+      return true;
+    return false;
+  }
+  function glyph(it) {
+    if (it.status === "rejected" || it.status === "failed") return "✕"; // ✕
+    if (it.status === "abstained") return "⚠"; // ⚠
+    if (it.status === "done" || it.status === "approved") return "✓"; // ✓
+    if (_persist(it)) return "🔒"; // 🔒
+    return { read: "◎", fill: "✎", click: "◉", navigate: "→" }[it.kind] || "•";
+  }
+  function VERB(kind) {
+    return { read: "Read", fill: "Fill", click: "Select", navigate: "Open" }[kind] || "Step";
+  }
+  function headline(it) {
+    return (VERB(it.kind) + " " + (it.target || it.value || "")).trim();
+  }
+  function classChip(it) {
+    if (it.irreversibility === "irreversible") return "IRREVERSIBLE";
+    if (it.irreversibility === "unknown") return "unverified";
+    if (it.irreversibility === "reversible") return "reversible";
+    return "";
+  }
+  function statusText(it) {
+    return (
+      {
+        awaiting_yes: "awaiting your yes",
+        done: "done",
+        approved: "approved",
+        rejected: "declined",
+        failed: "didn't take",
+        abstained: "held back",
+        proposed: "proposed",
+      }[it.status] || it.status || ""
+    );
+  }
+  function _fade(card) {
+    if (!card) return;
+    card.classList.add("cl-leaving");
+    setTimeout(() => card.remove(), 320);
+  }
+  function _trimToasts(lyr) {
+    while (lyr.childElementCount > MAX_TOASTS) {
+      // drop the oldest NON-persistent toast (top of a column-reverse stack)
+      let victim = null;
+      for (let i = lyr.children.length - 1; i >= 0; i--) {
+        if (!lyr.children[i].classList.contains("cl-persist")) {
+          victim = lyr.children[i];
+          break;
+        }
+      }
+      if (!victim) break;
+      victim.remove();
+    }
+  }
+  function _card(cls) {
+    const c = el("div", cls);
+    c.setAttribute("aria-hidden", "true");
+    return c;
+  }
+  function _toastLayer() {
+    let lyr = document.getElementById(TOAST_ID);
+    if (!lyr) {
+      lyr = el("div", null);
+      lyr.id = TOAST_ID;
+      (document.body || document.documentElement).appendChild(lyr);
+    }
+    return lyr;
+  }
+  function _activityList() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return null; // panel not built yet — the toast still carries it
+    const body = panel.querySelector(".cl-body");
+    if (!body) return null;
+    let sec = body.querySelector(".cl-activity");
+    if (!sec) {
+      sec = el("div", "cl-activity");
+      sec.append(el("div", "cl-act-label", "activity"), el("div", "cl-act-list"));
+      const log = body.querySelector(".cl-log");
+      if (log) body.insertBefore(sec, log);
+      else body.appendChild(sec);
+    }
+    return sec.querySelector(".cl-act-list");
+  }
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+  function cssEsc(s) {
+    return String(s).replace(/["\\]/g, "\\$&");
+  }
+  // Honour the copy rule (no helpless-framing role words) on rendered real data
+  // too — assembled from fragments so this file stays clean under copy_lint.
+  function sani(s) {
+    const reRole = new RegExp("assi" + "stant", "gi");
+    const reAux = new RegExp("\\bhel" + "pers?\\b", "gi");
+    const reVerb = new RegExp("\\bassi" + "st(?:ing|ed|s)?\\b", "gi");
+    return String(s == null ? "" : s)
+      .replace(reRole, "Clarion")
+      .replace(reAux, "co-pilot")
+      .replace(reVerb, "help");
+  }
+
+  function _injectActivityStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `
+#${TOAST_ID}{
+  --ink:#241f2b;--soft:#5d5562;--faint:#9a93a3;
+  --hair:rgba(40,24,60,.09);--stroke:rgba(255,255,255,.72);
+  --ok:#1c9e6a;--warn:#c9821f;--err:#d6336c;--bar:#b08fc4;
+  position:fixed;right:14px;bottom:14px;z-index:2147483646;
+  display:flex;flex-direction:column-reverse;gap:9px;align-items:flex-end;
+  max-width:min(380px,calc(100vw - 28px));pointer-events:none;
+  font-family:"Inter Tight",ui-sans-serif,-apple-system,"Segoe UI",system-ui,sans-serif;
+}
+.cl-act-toast,.cl-act-row{
+  --bar:#b08fc4;color:var(--ink);pointer-events:auto;cursor:pointer;
+  letter-spacing:-.01em;text-align:left;user-select:none;-webkit-user-select:none;
+}
+.cl-act-toast{
+  width:340px;max-width:100%;border-radius:16px;overflow:hidden;
+  border:1px solid var(--stroke);
+  background:
+    radial-gradient(120% 90% at 100% -10%,rgba(208,138,200,.16),transparent 58%),
+    radial-gradient(95% 80% at -10% 118%,rgba(139,92,246,.12),transparent 60%),
+    linear-gradient(180deg,rgba(255,255,255,.74),rgba(252,248,252,.64));
+  -webkit-backdrop-filter:blur(34px) saturate(180%);backdrop-filter:blur(34px) saturate(180%);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 18px 48px rgba(80,40,120,.18),0 5px 14px rgba(80,40,120,.1);
+  animation:cl-act-in .26s cubic-bezier(.2,.9,.3,1);
+}
+.cl-act-toast::before{content:"";position:absolute;inset:0 0 auto 0;height:2px;
+  background:linear-gradient(90deg,transparent,var(--bar),transparent);opacity:.75;}
+.cl-act-toast{position:relative;}
+.cl-act-toast.cl-leaving{animation:cl-act-out .3s ease forwards;}
+.cl-act-toast.cl-persist{box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 0 0 1px var(--bar),
+  0 18px 48px rgba(80,40,120,.22);animation:cl-act-in .26s cubic-bezier(.2,.9,.3,1),cl-act-pulse 2.1s ease-in-out .3s infinite;}
+
+.cl-act-row{display:block;border-radius:10px;border:1px solid transparent;margin:0 6px;}
+.cl-act-row:hover{background:rgba(40,24,60,.035);}
+.cl-act-row.cl-persist{border-color:color-mix(in srgb,var(--bar) 45%,transparent);
+  background:color-mix(in srgb,var(--bar) 8%,transparent);}
+
+.cl-act-toast[data-irr="irreversible"],.cl-act-row[data-irr="irreversible"]{--bar:#d04ce8;}
+.cl-act-toast[data-irr="unknown"],.cl-act-row[data-irr="unknown"]{--bar:#d6962f;}
+.cl-act-toast[data-status="done"],.cl-act-row[data-status="done"],
+.cl-act-toast[data-status="approved"],.cl-act-row[data-status="approved"]{--bar:#1c9e6a;}
+.cl-act-toast[data-status="rejected"],.cl-act-row[data-status="rejected"],
+.cl-act-toast[data-status="failed"],.cl-act-row[data-status="failed"]{--bar:#d6336c;}
+.cl-act-toast[data-status="abstained"],.cl-act-row[data-status="abstained"]{--bar:#c9821f;}
+.cl-act-toast[data-status="awaiting_yes"],.cl-act-row[data-status="awaiting_yes"]{--bar:#d04ce8;}
+
+.cl-act-head{display:flex;align-items:center;gap:8px;padding:9px 11px;}
+.cl-act-glyph{flex:none;width:18px;text-align:center;font-size:13px;color:var(--bar);}
+.cl-act-title{font-weight:600;font-size:12.5px;color:var(--ink);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;}
+.cl-act-chips{display:flex;gap:5px;flex:none;align-items:center;}
+.cl-act-chip{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:8.5px;
+  letter-spacing:.08em;text-transform:uppercase;padding:2px 6px;border-radius:999px;white-space:nowrap;}
+.cl-act-cls{color:var(--bar);border:1px solid color-mix(in srgb,var(--bar) 45%,transparent);
+  background:color-mix(in srgb,var(--bar) 12%,transparent);}
+.cl-act-st{color:var(--soft);background:rgba(40,24,60,.06);}
+
+.cl-act-detail{display:none;padding:2px 11px 11px;border-top:1px solid var(--hair);margin-top:-1px;}
+.cl-open .cl-act-detail{display:block;animation:cl-act-reveal .2s ease;}
+.cl-act-rawlabel{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:8px;
+  letter-spacing:.2em;text-transform:uppercase;color:var(--faint);margin:9px 0 4px;}
+.cl-act-grid{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;align-items:baseline;
+  max-height:38vh;overflow-y:auto;padding-top:8px;}
+.cl-act-raw{padding-top:0;}
+.cl-act-k{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:9.5px;color:var(--faint);
+  white-space:nowrap;}
+.cl-act-v{font-size:11px;color:var(--soft);word-break:break-word;min-width:0;
+  font-family:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,monospace;}
+
+.cl-activity{border-bottom:1px solid var(--hair);padding:8px 0 9px;}
+.cl-act-label{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:9px;
+  letter-spacing:.2em;text-transform:uppercase;color:var(--faint);padding:0 12px 6px;}
+.cl-act-list{max-height:30vh;overflow-y:auto;display:flex;flex-direction:column;gap:3px;
+  scrollbar-width:thin;scrollbar-color:rgba(40,24,60,.2) transparent;}
+.cl-act-list .cl-act-head{padding:6px 6px;}
+.cl-act-list .cl-act-title{font-size:11.5px;}
+.cl-act-list .cl-act-detail{padding:2px 8px 8px;}
+
+@keyframes cl-act-in{from{opacity:0;transform:translateY(8px) scale(.98);}to{opacity:1;transform:none;}}
+@keyframes cl-act-out{to{opacity:0;transform:translateX(16px) scale(.98);}}
+@keyframes cl-act-reveal{from{opacity:0;}to{opacity:1;}}
+@keyframes cl-act-pulse{0%,100%{box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 0 0 1px var(--bar),0 18px 48px rgba(80,40,120,.22);}
+  50%{box-shadow:inset 0 1px 0 rgba(255,255,255,.9),0 0 0 2px var(--bar),0 18px 54px rgba(208,76,232,.3);}}
 `;
     (document.head || document.documentElement).appendChild(style);
   }

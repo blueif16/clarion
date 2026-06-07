@@ -69,6 +69,25 @@ function swLog(phase, detail, level, fromWorker) {
   }
 }
 
+/**
+ * Forward one decided ACTION (an ActivityItem dict, Feature A) to the service
+ * worker so it lands on the on-page toast feed + the panel's Activity history.
+ * Carried on the same voice.log channel with an `activity` payload. Best-effort.
+ * @param {object} item
+ */
+function swActivity(item) {
+  try {
+    chrome.runtime.sendMessage({
+      type: "voice.log",
+      target: SW_TARGET,
+      activity: item,
+      fromWorker: true,
+    });
+  } catch {
+    /* no receiver — non-fatal */
+  }
+}
+
 // Labels that are NOT a real microphone: virtual routers, loopbacks, meeting-app
 // devices. The macOS DEFAULT input is often one of these (e.g. "MMAudio Device"),
 // which is exactly why trusting the OS default captures silence.
@@ -234,7 +253,12 @@ async function connect(cfg) {
     if (topic && topic !== "clarion-log") return;
     try {
       const entry = JSON.parse(new TextDecoder().decode(payload));
-      if (entry && entry.phase) {
+      // A frame carrying an `activity` payload is a decided ACTION (Feature A) —
+      // route it to the on-page toast feed + the panel's Activity section instead
+      // of the diagnostic event log, so the action trace stays distinct.
+      if (entry && entry.activity) {
+        swActivity(entry.activity);
+      } else if (entry && entry.phase) {
         // fromWorker=true: HUD-render only, no sink re-POST (already in ext.log).
         swLog(entry.phase, entry.detail || "", entry.level || "info", true);
       }

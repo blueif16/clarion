@@ -24,7 +24,7 @@ import {
 // DEBUG-ONLY visual feedback (toolbar badge + on-page HUD) + a file log sink so
 // the logs are readable directly (tail /tmp/clarion-ext.log), not copy-pasted.
 // Remove this import and the setBadge/pushHud/sinkLog call sites to strip it all.
-import { setBadge, pushHud, setHudStatus, sinkLog } from "./hud.js";
+import { setBadge, pushHud, pushActivity, setHudStatus, sinkLog } from "./hud.js";
 
 // --- configuration ----------------------------------------------------------
 
@@ -611,6 +611,13 @@ chrome.runtime.onMessage.addListener((msg) => {
     const orb = VOICE_ORB_STATUS[msg.state];
     if (orb && session && session.tabId != null) setHudStatus(session.tabId, orb);
   } else if (msg.type === VOICE_MSG.LOG) {
+    // A decided ACTION (Feature A) carries an `activity` payload — render it on the
+    // on-page action-trace feed (toast + panel Activity history) instead of the
+    // diagnostic event log. Needs an attached tab; no file-sink mirror.
+    if (msg.activity) {
+      if (session && session.tabId != null) pushActivity(session.tabId, msg.activity);
+      return;
+    }
     // Diagnostic line from the offscreen voice doc (mic device + signal) OR a
     // worker line forwarded off the clarion-log topic. Route to the on-page HUD if
     // a tab is attached, else the file sink. Worker lines (msg.fromWorker) are
