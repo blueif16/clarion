@@ -19,9 +19,11 @@ from clarion.contracts.state import (
     PageReadout,
     Passage,
     Profile,
+    Recall,
     SelectorMap,
     StepProposal,
     Subgoal,
+    WorkflowEpisode,
 )
 
 
@@ -168,13 +170,44 @@ class Ingest(ABC):
 
 class Memory(ABC):
     """Durable write-back of verified facts + profile read (Moss/Atlas)
-    (execution §2.2 CONFIRM, §6)."""
+    (execution §2.2 CONFIRM, §6).
+
+    The knowledge-layer additions (the user-memory design, backlog #4) are
+    CONCRETE no-op defaults, NOT new ``@abstractmethod``s — so ``FakeMemory`` and
+    every existing/future adapter stay valid without implementing them, and a
+    runtime with memory disabled is a clean no-op. ``recall`` returns a ``Recall``,
+    NEVER ``list[Fact]``: the return type itself prevents a remembered value from
+    entering the kernel as a grounded fact (the invariant firewall — see
+    ``state.Recall``)."""
 
     @abstractmethod
     async def write(self, fact: Fact) -> None: ...
 
     @abstractmethod
     async def read_profile(self, user_id: str) -> Profile: ...
+
+    async def write_preference(
+        self, user_id: str, key: str, value: str, *, origin: str = "stated"
+    ) -> None:
+        """Durably remember a user preference (a standing trait), captured ONLY via
+        the consent-gated end-of-flow "remember?" offer — *no memory without a
+        yes*. Default no-op."""
+        return None
+
+    async def write_episode(self, user_id: str, episode: WorkflowEpisode) -> None:
+        """Persist a completed-workflow record (the reasoned plan + consent
+        decisions + timings) for replay-assisted planning next time. Stores the
+        plan SHAPE, never a grounded page value. Default no-op."""
+        return None
+
+    async def recall(
+        self, user_id: str, goal: str, url_host: str, *, k: int = 3
+    ) -> Recall:
+        """Return a ``Recall`` (plan hint + preferences + consent reminder) to
+        warm-start the next run on the same/similar goal. Advisory only — every
+        remembered item is re-grounded / re-consented live. Default: empty
+        ``Recall``."""
+        return Recall()
 
 
 __all__ = [
