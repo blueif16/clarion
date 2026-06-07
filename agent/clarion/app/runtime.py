@@ -467,6 +467,28 @@ class HeroRuntime:
 
             on_orient = schedule_auto_index
 
+        # Semantic top-K candidate ranker (de-hardcoded successor to the deleted
+        # lexical _topk_slice): shrinks the target_index enum PROPOSE hands the
+        # Reasoner → faster constrained decode. Opt-in (CLARION_CONTEXT_RANK=1,
+        # default OFF → full map, no regression) over a LOCAL MiniLM (fastembed/ONNX,
+        # in-process, keyless — moss-minilm's speed without the Moss cloud index).
+        # Fail-open: a missing fastembed/model just leaves ranking off.
+        ranker = None
+        rank_min_nodes = None
+        if os.environ.get("CLARION_CONTEXT_RANK") == "1":
+            try:
+                from clarion.retrieval.context_ranker import (
+                    EmbeddingContextRanker,
+                    LocalMiniLMEmbedder,
+                )
+
+                ranker = EmbeddingContextRanker(LocalMiniLMEmbedder())
+                # Optional override of the win-or-free node-count gate.
+                _min = os.environ.get("CLARION_CONTEXT_RANK_MIN")
+                rank_min_nodes = int(_min) if _min else None
+            except Exception:  # noqa: BLE001 - ranking is optional; degrade to full map
+                ranker = None
+
         return build_stage_graph(
             self.reasoner,
             self.retriever,
@@ -477,6 +499,8 @@ class HeroRuntime:
             memory=self.memory,
             user_id=self.user_id,
             remember_nominate=remember_nominate,
+            ranker=ranker,
+            rank_min_nodes=rank_min_nodes,
         )
 
     async def close(self) -> None:

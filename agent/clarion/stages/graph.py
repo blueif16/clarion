@@ -37,7 +37,7 @@ from urllib.parse import urlparse
 
 from clarion.actuator.pipeline import readout_from_selector_map
 from clarion.contracts.events import ConsentDecision, ConsentRequest
-from clarion.contracts.ports import Actuator, Memory, Reasoner, Retriever
+from clarion.contracts.ports import Actuator, ContextRanker, Memory, Reasoner, Retriever
 from clarion.contracts.state import (
     ClarionState,
     Consent,
@@ -234,6 +234,8 @@ def build_stage_graph(
     memory: Optional[Memory] = None,
     user_id: str = "default",
     remember_nominate: Optional[RememberNominate] = None,
+    ranker: Optional[ContextRanker] = None,
+    rank_min_nodes: Optional[int] = None,
 ):
     """Compile the GENERIC EXECUTOR graph.
 
@@ -259,8 +261,17 @@ def build_stage_graph(
     the reasoner derives from the goal.
     """
 
-    # One kernel, reused across subgoals (state lives in ClarionState).
-    kernel = build_kernel(reasoner, retriever, actuator, mode=mode)
+    # One kernel, reused across subgoals (state lives in ClarionState). The optional
+    # semantic ``ContextRanker`` slices the candidate set PROPOSE hands the Reasoner
+    # (gated to large pages by ``rank_min_nodes`` so it is win-or-free).
+    kernel = build_kernel(
+        reasoner,
+        retriever,
+        actuator,
+        mode=mode,
+        ranker=ranker,
+        rank_min_nodes=rank_min_nodes,
+    )
 
     # ---- planner ---------------------------------------------------------
     async def planner(state: _StageState) -> Command:

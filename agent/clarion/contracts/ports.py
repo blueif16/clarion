@@ -148,6 +148,32 @@ class Reasoner(ABC):
         ...
 
 
+class ContextRanker(ABC):
+    """Semantic pre-ranker for the candidate slice PROPOSE hands the Reasoner.
+
+    The kernel CAN feed ``decide_step`` the full live map, but on a busy page that
+    is a large ``target_index`` enum (slower constrained decode) + more prefill. A
+    ``ContextRanker`` returns the top-``k`` most goal-relevant nodes as a SUB-map
+    keyed by the SAME live indices (so a returned ``target_index`` still resolves
+    into the full map). Ranking is by MEANING (embeddings behind this port) — NEVER
+    a lexical keyword table: the deleted lexical ``_topk_slice`` pruned the
+    goal-relevant control by string-overlap → untargetable → give-up. This is its
+    de-hardcoded successor.
+
+    Recall-first contract: an implementation MUST keep any node a grounded ``Fact``
+    points at, and MUST fail OPEN (return the full map unchanged) on any embed
+    error rather than risk pruning the target."""
+
+    @abstractmethod
+    async def rank(
+        self, intent: str, page: SelectorMap, facts: list[Fact], k: int
+    ) -> SelectorMap:
+        """Return the top-``k`` goal-relevant sub-map (a real ``SelectorMap`` keyed
+        by the SAME live indices). ``intent`` is the user's verbatim goal; the
+        source nodes of ``facts`` are always retained (recall guarantee)."""
+        ...
+
+
 class Actuator(ABC):
     """The a11y-tree actuator (Playwright/CDP). The kernel sees only
     ``action -> observation`` (foundation §6, execution §4)."""

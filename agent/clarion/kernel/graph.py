@@ -47,7 +47,7 @@ from langgraph.graph import StateGraph
 from langgraph.types import interrupt
 
 from clarion.contracts.events import ConsentDecision, ConsentRequest
-from clarion.contracts.ports import Actuator, Reasoner, Retriever
+from clarion.contracts.ports import Actuator, ContextRanker, Reasoner, Retriever
 from clarion.contracts.state import (
     Action,
     ClarionState,
@@ -110,6 +110,13 @@ Mode = Literal["normal", "fast"]
 # The default top-K hint slice the Reasoner decides over (the latency trim — feed
 # the ranked top-K candidates, NOT all ~48 live ids, then re-measure decide_ms).
 _DEFAULT_TOPK = 12
+
+# The node-count GATE for the semantic ContextRanker: only rank when the live map
+# has at least this many nodes. Measured (MiniMax-M3, local-MiniLM embed): at ~41
+# nodes the enum-shrink decode savings (~340ms) ≈ the embed cost (~335ms) → wash;
+# the ranker is a clear WIN only on bigger pages. Below the gate we feed the full
+# map (skip the embed) so the ranker is win-or-FREE, never a net loss.
+_DEFAULT_RANK_MIN_NODES = 48
 
 # Fast-mode cap: how many REVERSIBLE auto-acts the agent may chain before it MUST
 # surface a spoken progress beat / consent (architecture migration Step 5 — "cap
@@ -287,6 +294,8 @@ def build_kernel(
     *,
     top_k: int = _DEFAULT_TOPK,
     fast_act_cap: int = _DEFAULT_FAST_ACT_CAP,
+    ranker: Optional["ContextRanker"] = None,
+    rank_min_nodes: Optional[int] = None,
 ):
     """Compile the GROUND→VERIFY→PROPOSE→IrreversibilityGate→⟨CONSENT⟩→ACT→CONFIRM
     kernel — the de-hardcoded spine (architecture Thesis: the LLM decides, the
@@ -312,6 +321,11 @@ def build_kernel(
     fully auto-proceeding Fast run completes in a single ``ainvoke`` with no
     interrupt.
     """
+
+    # The ContextRanker node-count gate (resolved once; win-or-free).
+    _rank_min = (
+        rank_min_nodes if rank_min_nodes is not None else _DEFAULT_RANK_MIN_NODES
+    )
 
     # ---- GROUND ----------------------------------------------------------
     async def ground(state: ClarionState) -> dict:
@@ -389,9 +403,23 @@ def build_kernel(
         # consequential agent in the loop, so it gets the most context.
         ctx = await _build_decide_context(state, actuator)
 
-        # (1) Reasoner decides over the FULL live map (LLM is the semantic decider).
+        # (1) Reasoner decides over the candidate slice. With a ``ContextRanker``
+        # injected, that's the SEMANTIC top-K (smaller target_index enum → faster
+        # constrained decode + less prefill); otherwise the FULL live map. The kernel
+        # still validates/resolves against the full ``page`` below, so a sliced index
+        # is a strict subset and always resolves back. Best-effort: a ranker hiccup
+        # degrades to the full map, never breaks the decision.
+        ranked = page
+        if ranker is not None and len(page.nodes) >= _rank_min:
+            try:
+                ranked = await ranker.rank(
+                    ctx.user_intent or state["goal"], page, sayable, top_k
+                )
+            except Exception:  # noqa: BLE001 — ranking is best-effort; never break the decision
+                ranked = page
+
         step: StepProposal = await reasoner.decide_step(
-            state["goal"], page, sayable, history, context=ctx
+            state["goal"], ranked, sayable, history, context=ctx
         )
         new_history = history + [step]
 

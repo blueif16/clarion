@@ -36,6 +36,9 @@ retrieval = [
     "inferedge-moss-core==0.14.0",
     "google-genai>=1.0",
     "python-dotenv>=1.0",
+    # Local MiniLM (ONNX, no torch) for the semantic ContextRanker's in-process,
+    # keyless embeddings — moss-minilm's speed without the Moss cloud index.
+    "fastembed>=0.8",
 ]
 
 [build-system]
