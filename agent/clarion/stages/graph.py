@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Literal, Optional
+from typing import Awaitable, Callable, Literal, Optional
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
@@ -134,6 +134,30 @@ async def _paired_facts(actuator: Actuator) -> list[PairedFact]:
     return await read()
 
 
+# An injected, best-effort consult of the per-site STRUCTURE index (knowledge-layer
+# #4(a)). Takes (url, goal) → grounded structure Facts of OTHER pages on the site;
+# `None` (default) keeps the page-only planner. Duck-typed so `stages/` imports no
+# provider/app code — the real impl (`app.site_indexer.SiteKnowledge`) is injected
+# by the runtime. Always fail-open: a miss returns [] and the planner degrades.
+SiteContext = Callable[[str, str], Awaitable[list[Fact]]]
+
+
+def _with_site_map(orient: PageReadout, site_facts: list[Fact]) -> PageReadout:
+    """Return a COPY of the ORIENT readout whose summary carries a SITE MAP block
+    built from the per-site structure facts — for PLANNING only (which page to
+    navigate to). These are cross-page structure, NOT live current-page values, so
+    they never enter GROUND; the copy keeps the spoken readback path untouched."""
+    lines = "\n".join(
+        f"  - {f.value.replace(chr(10), ' · ')[:200]}" for f in site_facts
+    )
+    extra = (
+        "\n\nSITE MAP (other pages on this site, from prior structure indexing — "
+        "use ONLY to decide which page to navigate to; these are NOT grounded "
+        "current-page values):\n" + lines
+    )
+    return orient.model_copy(update={"summary": orient.summary + extra})
+
+
 async def _current_url(actuator: Actuator) -> Optional[str]:
     """The live page URL — the SEMANTIC ANCHOR substrate for the ``navigated``
     done-check. Both real actuators surface it on their ``describe_page`` readout
@@ -160,6 +184,7 @@ def build_stage_graph(
     *,
     mode: Literal["normal", "fast"] = "normal",
     max_replans: int = 2,
+    site_context: Optional[SiteContext] = None,
 ):
     """Compile the GENERIC EXECUTOR graph.
 
@@ -190,11 +215,27 @@ def build_stage_graph(
 
     # ---- planner ---------------------------------------------------------
     async def planner(state: _StageState) -> Command:
-        """Derive the goal-derived plan and route to the executor at subgoal 0."""
+        """Derive the goal-derived plan and route to the executor at subgoal 0.
+
+        When a ``site_context`` consult is injected, the planner first pulls the
+        per-site STRUCTURE map (other pages + affordances, from prior indexing) and
+        folds it into a COPY of the ORIENT readout so the Reasoner can plan WHICH
+        page to navigate to — knowledge-layer #4(a). Best-effort: a miss (no index
+        yet / no creds) yields no site facts and the planner runs page-only."""
         sm = state["page_index"]
         orient = await _orient(actuator, sm)
+        plan_orient = orient
+        n_site_facts = 0
+        if site_context is not None:
+            try:
+                site_facts = await site_context(orient.url, state["goal"])
+            except Exception:  # noqa: BLE001 - consult is optional; never break planning
+                site_facts = []
+            if site_facts:
+                n_site_facts = len(site_facts)
+                plan_orient = _with_site_map(orient, site_facts)
         subgoals = await plan_goal(
-            reasoner, state["goal"], orient, list(orient.affordances)
+            reasoner, state["goal"], plan_orient, list(orient.affordances)
         )
         return Command(
             update={
@@ -205,6 +246,7 @@ def build_stage_graph(
                         "PLANNER",
                         "exit",
                         n_subgoals=len(subgoals),
+                        n_site_facts=n_site_facts,
                         plan=[s.description for s in subgoals],
                         utterance=verbalize_subgoals(subgoals),
                     )

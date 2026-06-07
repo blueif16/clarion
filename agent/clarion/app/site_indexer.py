@@ -47,7 +47,7 @@ from dotenv import load_dotenv
 _AGENT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 load_dotenv(os.path.join(_AGENT_ROOT, ".env"))
 
-from clarion.contracts.state import Action, PageReadout  # noqa: E402
+from clarion.contracts.state import Action, Fact, PageReadout  # noqa: E402
 
 # URL substrings that signal a state-changing / destructive target. The crawl is
 # already GET-only, but we refuse to even fetch these (a GET /logout still mutates
@@ -173,6 +173,41 @@ async def crawl_and_index(
     log(f"  [done] indexed {len(result.pages)} pages → {result.chunks} chunks "
         f"into Moss index {index!r}.")
     return result
+
+
+class SiteKnowledge:
+    """Query-time consult of the per-site STRUCTURE index (the crawler's output) —
+    the read side of knowledge-layer item #4(a), injected into the planner.
+
+    Given the live page URL, it picks the matching `clarion-site-<host>` index and
+    returns grounded STRUCTURE facts (other pages + their affordances) to inform
+    PLANNING ("which page hosts this flow"). It is **best-effort and fail-open**:
+    any miss — index not built yet, no creds, network error — yields ``[]`` so the
+    planner silently degrades to page-only, never erroring. It NEVER feeds the
+    epistemic GROUND (these are cross-page structure facts, not live current-page
+    values), so the no-fact-without-a-live-source invariant is untouched.
+
+    One ``MossRetriever`` is memoised per index (lazy `load_index` on first query).
+    """
+
+    def __init__(self, *, k: int = 4) -> None:
+        self._k = k
+        self._by_index: dict[str, object] = {}
+
+    async def context_facts(self, url: str, goal: str) -> list[Fact]:
+        if not url:
+            return []
+        index = index_name_for(url)
+        try:
+            retriever = self._by_index.get(index)
+            if retriever is None:
+                from clarion.retrieval import MossRetriever
+
+                retriever = MossRetriever(index=index)
+                self._by_index[index] = retriever
+            return await retriever.query(goal, k=self._k)
+        except Exception:  # noqa: BLE001 - consult is optional; degrade to page-only
+            return []
 
 
 async def main() -> int:
