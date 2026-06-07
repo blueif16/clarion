@@ -111,7 +111,6 @@ def _step_schema(live_indices: list[int], fact_ids: list[str]) -> dict[str, Any]
             "alternatives",
             "value_ref",
             "irreversibility",
-            "irreversibility_rationale",
             "success_check",
             "say",
             "asserts_absence",
@@ -122,7 +121,6 @@ def _step_schema(live_indices: list[int], fact_ids: list[str]) -> dict[str, Any]
             "target_index",
             "value_ref",
             "irreversibility",
-            "irreversibility_rationale",
             "success_check",
             "say",
         ],
@@ -130,9 +128,10 @@ def _step_schema(live_indices: list[int], fact_ids: list[str]) -> dict[str, Any]
             "scratch_reasoning": {
                 "type": "STRING",
                 "description": (
-                    "Reason FIRST, before choosing an index: what the goal needs "
-                    "next, which numbered item serves it, and why it is reversible "
-                    "or not. Audit only; never spoken."
+                    "Reason FIRST, before choosing — but in ONE short clause "
+                    "(~15 words MAX): which numbered item serves the goal next and "
+                    "whether it is reversible. Audit only; never spoken. Do NOT write "
+                    "paragraphs — brevity here is a hard latency budget."
                 ),
             },
             "action_kind": {"type": "STRING", "enum": list(_ACTION_KINDS)},
@@ -165,7 +164,6 @@ def _step_schema(live_indices: list[int], fact_ids: list[str]) -> dict[str, Any]
                 ),
             },
             "irreversibility": {"type": "STRING", "enum": list(_IRREVERSIBILITY)},
-            "irreversibility_rationale": {"type": "STRING"},
             "success_check": {"type": "STRING", "enum": list(SUCCESS_CHECKS)},
             "say": {
                 "type": "STRING",
@@ -248,7 +246,8 @@ _DECIDE_SYSTEM = (
     "must move the page (click/navigate), not read. If WHAT JUST HAPPENED shows the "
     "previous step was a read and the subgoal is still not done, do NOT read again "
     "— act on the matching control.\n"
-    "Reason FIRST in scratch_reasoning, THEN choose. target_index must be one of "
+    "Reason FIRST in scratch_reasoning — but ONE short clause only, no paragraphs "
+    "(it is a latency budget) — THEN choose. target_index must be one of "
     "the numbered live items; value_ref must be one of the listed fact ids (or "
     "null). Pick success_check by name from the allowed set.\n"
     "If the goal plausibly matches MORE THAN ONE distinct control on the page, set "
