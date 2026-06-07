@@ -46,7 +46,7 @@ from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 from langgraph.types import interrupt
 
-from clarion.contracts.events import ConsentDecision, ConsentRequest
+from clarion.contracts.events import ConsentDecision, ConsentRequest, SourceRef
 from clarion.contracts.ports import Actuator, ContextRanker, Reasoner, Retriever
 from clarion.contracts.state import (
     Action,
@@ -181,6 +181,42 @@ def make_checkpointer() -> InMemorySaver:
 
 def _trace(node: str, event: str = "info", **data: object) -> TraceEvent:
     return TraceEvent(node=node, event=event, at=time.time(), data=dict(data))
+
+
+def _source_ref(state: ClarionState, proposal: "Proposal") -> Optional[SourceRef]:
+    """Build the source-node highlight payload for a consent step (the epistemic-
+    clause proof surface). The target field is the SAME live ``index`` the actuator
+    will click (``proposal.action.index``); its PROVEN paired label is the
+    ``PairedFact`` whose VALUE half is that field node — never reading-order, never a
+    stored ``bbox``. Returns ``None`` for a read-back / clarify (no actionable source
+    node) so a plain consent stays the unchanged shape. Pure projection over live
+    state; never raises into the node."""
+    action = getattr(proposal, "action", None)
+    if action is None or getattr(action, "kind", "") == "read":
+        return None
+    idx = getattr(action, "index", None)
+    if idx is None:
+        return None
+    page = state.get("page_index")
+    nodes = getattr(page, "nodes", None) or {}
+    node = nodes.get(idx)
+    if node is None:
+        return None
+    # The PROVEN label: a PairedFact whose VALUE half IS this field node.
+    label_text, method = "", ""
+    for pf in state.get("paired_facts") or []:  # type: ignore[attr-defined]
+        value_half = getattr(pf, "value", None)
+        if value_half is not None and getattr(value_half, "source_node_id", None) == node.node_id:
+            label_text = getattr(getattr(pf, "label", None), "value", "") or ""
+            method = getattr(pf, "method", "") or ""
+            break
+    return SourceRef(
+        index=idx,
+        node_id=node.node_id,
+        name=(node.name or "").strip(),
+        label_text=label_text.strip(),
+        method=method,
+    )
 
 
 def _already_acted(state: ClarionState, proposal_id: str) -> bool:
@@ -471,6 +507,28 @@ def build_kernel(
             for i in step.alternatives
             if i in page.nodes and i != step.target_index
         ]
+        # FALSE-AMBIGUITY GUARD (destination dedup): the page often exposes the SAME
+        # link twice — a nav/menu entry AND its content card, both pointing at one
+        # page (the live usa.gov "older adults" food-help give-up: the model honestly
+        # flagged the duplicate, abstained, and the silent clarify never recovered).
+        # Two controls that lead to the SAME destination are not a
+        # real choice, so drop any alternative whose href equals the target's; if none
+        # with a DISTINCT destination remain, fall through and just act on the chosen
+        # target. Structural (href IDENTITY via the actuator), never a lexical name
+        # match — and best-effort: an actuator that can't resolve hrefs returns {} →
+        # the current abstain behaviour, never a wrong action.
+        if (
+            alts
+            and step.action_kind in ("fill", "click", "navigate")
+            and step.target_index is not None
+        ):
+            try:
+                dests = await actuator.destinations([step.target_index] + alts)
+            except Exception:  # noqa: BLE001 - dedup is best-effort; never break the decision
+                dests = {}
+            tgt_dest = dests.get(step.target_index)
+            if tgt_dest:
+                alts = [i for i in alts if dests.get(i) != tgt_dest]
         if step.action_kind in ("fill", "click", "navigate") and alts:
             # Gather candidate names from the LIVE map (chosen target first), capped
             # to ~3, skipping empties — these are read off real perceived nodes.
@@ -536,6 +594,9 @@ def build_kernel(
 
         target_node = page.nodes.get(step.target_index) if step.target_index is not None else None
         node_name = target_node.name if target_node is not None else ""
+        # The grounded value the activity feed shows — always defined across the
+        # fill/click/navigate/read branches below (click/navigate carry no value).
+        say = ""
 
         if step.action_kind == "fill" and target_node is not None and value is not None:
             action = Action(kind="fill", index=step.target_index, value=value)
@@ -618,6 +679,13 @@ def build_kernel(
                     proposal_id=proposal.id,
                     action_kind=action.kind,
                     value_ref=step.value_ref,
+                    # The grounded value + target name + source the activity feed
+                    # shows — all REAL (extracted spans / live AX node), never
+                    # generated. ``source`` ties the action card back to the
+                    # epistemic source-node panel (both invariants, one record).
+                    say=say,
+                    target_name=node_name,
+                    source=(resolved.source_node_id or "") if resolved is not None else "",
                     decide_ms=getattr(reasoner, "last_decide_ms", None),
                     intent=ctx.user_intent,
                     phase=f"{ctx.subgoal_index + 1}/{ctx.subgoal_total}",
@@ -655,6 +723,10 @@ def build_kernel(
                     proposal_id=proposal.id,
                     classification=cls,
                     gates=cls != "reversible",
+                    # The WHY behind the reversibility call — the model's grounded
+                    # rationale (real, never fabricated). Drives the detail card +
+                    # the spoken history's reason for a hold.
+                    rationale=(step.irreversibility_rationale if step is not None else ""),
                 )
             ],
         }
@@ -702,7 +774,14 @@ def build_kernel(
         On ``Command(resume=ConsentDecision(...))`` this node re-executes from the
         top and ``interrupt()`` returns the decision payload. The node itself has
         no side-effect beyond appending to the consent_log (idempotent at the
-        actuator level — the real side-effect lives in ACT, which is guarded)."""
+        actuator level — the real side-effect lives in ACT, which is guarded).
+
+        The ``ConsentRequest`` also carries a ``SourceRef`` — the node-identity of
+        the field being acted on + its PROVEN paired label — so the voice plane can
+        outline the SAME node on the live page (the epistemic-clause proof surface).
+        It is built HERE, not from the parent snapshot: at this interrupt the stage
+        state is not yet committed (the executor node is suspended), but THIS node
+        holds the correct live ``page_index`` + ``paired_facts``."""
         proposal = state["pending_proposal"]
         assert proposal is not None
         decision_payload = interrupt(
@@ -710,6 +789,7 @@ def build_kernel(
                 proposal_id=proposal.id,
                 utterance=proposal.utterance,
                 irreversible=proposal.irreversible,
+                source=_source_ref(state, proposal),
             ).model_dump()
         )
         decision = ConsentDecision.model_validate(decision_payload)
@@ -725,7 +805,21 @@ def build_kernel(
                     at=time.time(),
                 )
             ],
-            "trace": [_trace("CONSENT", "exit", decision=decision.decision)],
+            "trace": [
+                _trace(
+                    "CONSENT",
+                    "exit",
+                    decision=decision.decision,
+                    # Carry the proposal's identity + irreversibility into the
+                    # glass-box trace so a parent (the stage executor) can
+                    # reconstruct ConsentRecords and tell a TRANSACTIONAL run (an
+                    # approved irreversible step) from a merely consented reversible
+                    # one — the consent_log Consent carries neither flag.
+                    proposal_id=proposal.id,
+                    irreversible=proposal.irreversible,
+                    utterance=proposal.utterance,
+                )
+            ],
         }
 
     # ---- ACT (IDEMPOTENT) ------------------------------------------------

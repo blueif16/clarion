@@ -313,6 +313,76 @@ async def test_ambiguous_goal_abstains_and_clarifies() -> None:
     assert abstain_ev.data["alternatives"] == [1]
 
 
+class _SameDestActuator(_TwoLinkActuator):
+    """Both links resolve to the SAME destination href — the live usa.gov duplicate
+    (a nav/menu entry + its content card pointing at one page). ``destinations``
+    reports the identical href for index 0 and 1."""
+
+    async def destinations(self, indices: list[int]) -> dict[int, str]:
+        same = "https://example.gov/older-adults"
+        return {i: same for i in indices if i in (0, 1)}
+
+
+@pytest.mark.asyncio
+async def test_same_destination_does_not_abstain() -> None:
+    """A model-reported alternative that leads to the SAME destination as the target
+    is a FALSE ambiguity (the same link rendered twice). The kernel must DEDUPE it
+    and act on the chosen target — a normal consequential navigate that gates at
+    CONSENT — never the silent abstain-and-clarify that gave up live."""
+    retriever = _ScriptedRetriever([])
+    actuator = _SameDestActuator()
+    graph = build_kernel(
+        _ambiguous_reasoner(alternatives=[1]), retriever, actuator, mode="normal"
+    )
+
+    seed = seed_state(goal="open older adults", mode="normal")
+    seed["page_index"] = await actuator.perceive()
+    config = _cfg()
+
+    result = await graph.ainvoke(seed, config)
+
+    # Acted-on: a consequential navigate that gates at CONSENT, NOT a clarify read.
+    assert "__interrupt__" in result
+    assert graph.get_state(config).next == ("consent",)
+    proposal = graph.get_state(config).values["pending_proposal"]
+    assert proposal.action is not None and proposal.action.kind == "navigate"
+    assert proposal.action.index == 0
+    # No abstain trace event — the false ambiguity was deduped by destination.
+    assert not any(
+        e.data.get("abstained") == "ambiguous"
+        for e in graph.get_state(config).values["trace"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_distinct_destinations_still_abstain() -> None:
+    """The guard is destination-SPECIFIC: when the alternatives lead to GENUINELY
+    different destinations, the abstain-and-clarify still fires (the hero beat is
+    preserved — only the same-href false positive is suppressed)."""
+
+    class _DistinctDestActuator(_TwoLinkActuator):
+        async def destinations(self, indices: list[int]) -> dict[int, str]:
+            urls = {0: "https://example.gov/bill", 1: "https://example.gov/ticket"}
+            return {i: urls[i] for i in indices if i in urls}
+
+    retriever = _ScriptedRetriever([])
+    actuator = _DistinctDestActuator()
+    graph = build_kernel(
+        _ambiguous_reasoner(alternatives=[1]), retriever, actuator, mode="normal"
+    )
+    seed = seed_state(goal="pay", mode="normal")
+    seed["page_index"] = await actuator.perceive()
+    final = await graph.ainvoke(seed, _cfg())
+
+    # Distinct destinations → still abstain (a safe read, no consequential act).
+    assert "__interrupt__" not in final
+    proposal = final["pending_proposal"]
+    assert proposal.action is not None and proposal.action.kind == "read"
+    assert any(
+        e.data.get("abstained") == "ambiguous" for e in final["trace"]
+    )
+
+
 @pytest.mark.asyncio
 async def test_no_alternatives_acts_normally() -> None:
     """Backward compat: with ``alternatives=[]`` a navigate proposal is formed as

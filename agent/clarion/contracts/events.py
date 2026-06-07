@@ -44,6 +44,32 @@ class AdvanceTaskRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class SourceRef(BaseModel):
+    """Node-IDENTITY payload for the source-node highlight (the epistemic-clause
+    proof surface — companion to the action-trace feed). Carried on a
+    ``ConsentRequest`` so the voice plane can outline, on the live page, the SAME
+    node the agent resolved to act, and mirror the PROVEN label pairing as a panel
+    row — all from real AX node identity, never ``bbox`` or LLM-printed text.
+
+    Populated by the kernel ``consent`` node, which holds the correct live
+    ``page_index`` + ``paired_facts`` at interrupt time (the parent stage state is
+    NOT yet committed there — the executor node is suspended). Additive + optional:
+    a plain consent without it is the unchanged shape; SIGHTED-observer-only, so the
+    product never depends on any field here."""
+
+    # The live SelectorMap index of the field/target node → ``actuator.highlight``
+    # resolves it index→backendDOMNodeId EXACTLY like the click. None → nothing to
+    # outline (a read-back / clarify).
+    index: Optional[int] = None
+    # The field's AX node_id + accessible name (the panel row).
+    node_id: str = ""
+    name: str = ""
+    # The PROVEN paired label (a ``PairedFact`` whose VALUE half IS this field) and
+    # HOW it was joined — never reading-order; empty when no pairing backs it.
+    label_text: str = ""
+    method: str = ""
+
+
 class ConsentRequest(BaseModel):
     """The value a LangGraph ``interrupt()`` surfaces at the consent gate. The
     voice plane speaks ``utterance`` and waits for a decision (execution §2.3,
@@ -54,6 +80,9 @@ class ConsentRequest(BaseModel):
     utterance: str
     irreversible: bool = False
     options: list[str] = Field(default_factory=lambda: ["yes", "no", "edit"])
+    # The source-node highlight payload (epistemic-clause proof surface). Additive +
+    # optional → a consent without it is the unchanged shape.
+    source: Optional[SourceRef] = None
 
 
 class ConsentDecision(BaseModel):
@@ -89,6 +118,7 @@ class PanelState(BaseModel):
 
 __all__ = [
     "AdvanceTaskRequest",
+    "SourceRef",
     "ConsentRequest",
     "ConsentDecision",
     "PanelState",

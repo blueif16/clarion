@@ -609,6 +609,7 @@ function _renderHud(payload) {
       if (c === "agent") return "agent";
       if (c === "tool") return "tool";
       if (c === "turn") return "turn";
+      if (c === "source") return "source";
       if (c === "error") return "error";
     }
     if (level === "err") return "error";
@@ -677,7 +678,7 @@ function _renderHud(payload) {
   --hair:rgba(40,24,60,.09);--hair-strong:rgba(40,24,60,.14);
   --stroke:rgba(255,255,255,.72);
   --ok:#1c9e6a;--warn:#c9821f;--err:#d6336c;
-  --c-asr:#b7458a;--c-agent:#7c3aed;--c-tool:#b45309;--c-turn:#5b6478;--c-error:#d6336c;
+  --c-asr:#b7458a;--c-agent:#7c3aed;--c-tool:#b45309;--c-turn:#5b6478;--c-source:#0ea5e9;--c-error:#d6336c;
   --bar:#b08fc4;
   position:fixed;top:14px;right:14px;z-index:2147483647;
   width:376px;max-width:calc(100vw - 28px);
@@ -761,6 +762,7 @@ function _renderHud(payload) {
 #${ID} .cl-phase[data-cat="agent"]{color:var(--c-agent);}
 #${ID} .cl-phase[data-cat="tool"]{color:var(--c-tool);}
 #${ID} .cl-phase[data-cat="turn"]{color:var(--c-turn);}
+#${ID} .cl-phase[data-cat="source"]{color:var(--c-source);font-weight:700;}
 #${ID} .cl-phase[data-cat="error"]{color:var(--c-error);}
 #${ID} .cl-detail{grid-column:3;color:var(--soft);word-break:break-word;min-width:0;}
 

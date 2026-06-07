@@ -79,6 +79,12 @@ class _StageState(_PlanState, total=False):
     # consent interrupt surfaced through the parent resumes on the SAME inner
     # thread after the parent resumes.
     _kernel_threads: dict[str, str]
+    # A per-run nonce (set once at seed) that namespaces the inner-kernel thread ids.
+    # The inner thread id is derived deterministically from (_run_id, subgoal idx,
+    # replan attempt) so a consent interrupt + resume of the SAME attempt RESUMES the
+    # parked child instead of re-seeding + re-deciding it (the wasted ~3s decode on
+    # every "yes"), while a replan / a fresh goal still gets a clean child thread.
+    _run_id: str
     # The SelectorMap BEFORE the current subgoal's kernel ran (the done-check diff
     # baseline) and the URL/anchor at that point.
     _before_map: Optional[SelectorMap]
@@ -370,6 +376,7 @@ def build_stage_graph(
                 recall = None
         prior_plan_hint = recall.plan_hint if recall else None
 
+        t_plan = time.time()
         subgoals = await plan_goal(
             reasoner,
             state["goal"],
@@ -377,6 +384,9 @@ def build_stage_graph(
             list(orient.affordances),
             prior_plan_hint=prior_plan_hint,
         )
+        # The planner LLM decode — one of the two serial decodes (plan then decide)
+        # that dominate the pre-consent wait, and the only one that was UNTIMED.
+        plan_ms = (time.time() - t_plan) * 1000.0
         update: dict = {
             "subgoals": subgoals,
             "stage_idx": 0,
@@ -388,6 +398,7 @@ def build_stage_graph(
                     n_site_facts=n_site_facts,
                     recalled=bool(prior_plan_hint),
                     plan=[s.description for s in subgoals],
+                    plan_ms=plan_ms,
                     utterance=verbalize_subgoals(subgoals),
                 )
             ],
@@ -411,7 +422,19 @@ def build_stage_graph(
         a parent resume reaches the same checkpoint."""
         threads = dict(state.get("_kernel_threads") or {})
         key = str(idx)
-        thread_id = threads.get(key) or f"kernel-{idx}-{uuid.uuid4()}"
+        # DETERMINISTIC inner-kernel thread id (the consent-resume latency fix). A
+        # random uuid here regenerated on every parent re-execution, and
+        # ``_kernel_threads`` never persists across a consent interrupt (the node
+        # raises inside ``interrupt()`` before it can return the dict), so on a resume
+        # the parked child was never found → ``child_parked`` was False → the kernel
+        # re-seeded and RE-DECIDED the already-approved step (a wasted ~3s decode).
+        # Deriving the id from (per-run nonce, subgoal idx, replan attempt) makes it
+        # STABLE across one attempt's interrupt+resume (→ resume the parked child) yet
+        # FRESH per replan (attempt++) and per goal (a new ``_run_id``), so no stale
+        # ended-thread is ever re-seeded.
+        run_id = str(state.get("_run_id") or "run")
+        attempt = int(state.get("_replan_attempts", 0) or 0)
+        thread_id = f"kernel-{run_id}-{idx}-a{attempt}"
         threads[key] = thread_id
         kernel_cfg = {"configurable": {"thread_id": thread_id}}
 
@@ -859,6 +882,10 @@ def seed_stage_state(
     state = seed_state(goal=goal, mode=mode)
     if page_index is not None:
         state["page_index"] = page_index
+    # Per-run nonce that namespaces the inner-kernel thread ids (see `_drive_kernel`):
+    # a fresh goal → a fresh `_run_id` → no collision with a prior run's parked/ended
+    # inner kernel (the kernel's checkpointer outlives a single goal).
+    state["_run_id"] = uuid.uuid4().hex  # type: ignore[typeddict-unknown-key]
     return state
 
 

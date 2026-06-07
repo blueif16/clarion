@@ -255,6 +255,124 @@ async def cdp_click_by_backend(send: CdpSend, backend_id: int) -> tuple[bool, st
         return False, f"click failed for node {backend_id}: {exc}"
 
 
+# --- source-node highlight (the epistemic-clause proof surface) --------------
+# A node-IDENTITY-driven outline drawn on the live page around the SAME node the
+# agent resolved for the action — never the stored ``bbox`` (which is document-
+# absolute and unreliable, the same trap ``cdp_click_by_backend`` documents).
+# Geometry is read LIVE from the resolved element (``getBoundingClientRect`` at
+# draw time), so the box always tracks the real node. Drawn over the SAME CDP
+# transport + the SAME ``backend_id`` as the click — shared by both actuators.
+_HIGHLIGHT_FN = """
+function(){
+  var R = this.getBoundingClientRect();
+  var ID = '__clarion_src_hi__';
+  var box = document.getElementById(ID);
+  if (!box) {
+    box = document.createElement('div');
+    box.id = ID;
+    box.setAttribute('aria-hidden', 'true');
+    box.setAttribute('role', 'presentation');
+    box.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;'
+      + 'border:3px solid #38bdf8;border-radius:6px;'
+      + 'box-shadow:0 0 0 2px rgba(56,189,248,.4),0 0 16px 4px rgba(56,189,248,.55);'
+      + 'transition:left .12s,top .12s,width .12s,height .12s;';
+    (document.body || document.documentElement).appendChild(box);
+  }
+  box.style.left = (R.left - 3) + 'px';
+  box.style.top = (R.top - 3) + 'px';
+  box.style.width = R.width + 'px';
+  box.style.height = R.height + 'px';
+  box.style.display = 'block';
+}
+"""
+
+# Remove the overlay (no node needed → a bare ``Runtime.evaluate``).
+_CLEAR_HIGHLIGHT_JS = (
+    "(function(){var b=document.getElementById('__clarion_src_hi__');"
+    "if(b)b.remove();})()"
+)
+
+
+async def cdp_highlight_by_backend(send: CdpSend, backend_id: int) -> tuple[bool, str]:
+    """Outline a node by its AX-tree ``backendDOMNodeId`` over any CDP transport —
+    the epistemic-clause visual proof (companion to ``cdp_click_by_backend``).
+
+    IDENTICAL resolution to the click: same ``send``, same ``backend_id``, same
+    ``DOM.resolveNode`` → ``Runtime.callFunctionOn`` chain. The injected function
+    reads the node's LIVE ``getBoundingClientRect`` (never a stored ``bbox``) and
+    positions an ``aria-hidden`` outline ``<div>`` (``role=presentation``, so it
+    never enters the interactive AXTree on the next perceive). ``position:fixed``
+    aligns to the viewport coords ``getBoundingClientRect`` returns — no scroll/DPR
+    math. Best-effort, fail-OPEN: the product never depends on the highlight.
+
+    Shared verbatim by ``PlaywrightActuator`` (``self._cdp.send``) and
+    ``ExtensionActuator`` (``self._relay.send``). Returns ``(ok, detail)``."""
+    # Bring the node into view first (parity with the click), so the judges see the
+    # box land on the actually-visible element.
+    try:
+        await send("DOM.scrollIntoViewIfNeeded", {"backendNodeId": backend_id})
+    except Exception:  # noqa: BLE001 - non-fatal; resolve/draw decide success
+        pass
+    try:
+        node = await send("DOM.resolveNode", {"backendNodeId": backend_id})
+        object_id = (node.get("object") or {}).get("objectId")
+        if not object_id:
+            return False, f"node {backend_id} unresolvable for highlight"
+        await send(
+            "Runtime.callFunctionOn",
+            {"objectId": object_id, "functionDeclaration": _HIGHLIGHT_FN},
+        )
+        return True, f"highlight node {backend_id}"
+    except Exception as exc:  # noqa: BLE001 - report the real reason, never guess
+        return False, f"highlight failed for node {backend_id}: {exc}"
+
+
+async def cdp_clear_highlight(send: CdpSend) -> None:
+    """Remove the source-node outline (idempotent, best-effort)."""
+    try:
+        await send("Runtime.evaluate", {"expression": _CLEAR_HIGHLIGHT_JS})
+    except Exception:  # noqa: BLE001 - clearing must never break a turn
+        pass
+
+
+async def cdp_hrefs_by_index(
+    send: CdpSend, index_to_backend: dict[int, int]
+) -> dict[int, str]:
+    """Resolve each ``index → backendDOMNodeId`` to its link DESTINATION (absolute
+    ``href``) over any CDP transport, for PROPOSE's false-ambiguity dedup. Per node:
+    ``DOM.resolveNode`` → ``Runtime.callFunctionOn`` reading ``this.href`` (the
+    browser resolves it to an ABSOLUTE url, so the same destination reached via a
+    nav link and a content card compares EQUAL). A node that is not a link (no
+    ``href``) or fails to resolve is OMITTED — never guessed. Best-effort and
+    structural: this is href IDENTITY, never a lexical name match (the de-hardcoding
+    thesis). Shared by both CDP actuators (``self._cdp.send`` / ``self._relay.send``).
+    """
+    out: dict[int, str] = {}
+    for index, backend_id in index_to_backend.items():
+        try:
+            node = await send("DOM.resolveNode", {"backendNodeId": backend_id})
+            object_id = (node.get("object") or {}).get("objectId")
+            if not object_id:
+                continue
+            res = await send(
+                "Runtime.callFunctionOn",
+                {
+                    "objectId": object_id,
+                    "functionDeclaration": (
+                        "function(){ return (this.href != null ? String(this.href) : "
+                        "(this.getAttribute ? (this.getAttribute('href') || '') : '')); }"
+                    ),
+                    "returnByValue": True,
+                },
+            )
+            href = ((res.get("result") or {}).get("value") or "").strip()
+            if href:
+                out[index] = href
+        except Exception:  # noqa: BLE001 - per-node best-effort; a miss just omits it
+            continue
+    return out
+
+
 class _LayoutRect:
     """A laid-out node's geometry + paint order (from DOMSnapshot)."""
 

@@ -193,6 +193,37 @@ class Actuator(ABC):
         """Page-diff to detect a silently-failed step (§4.3)."""
         ...
 
+    async def destinations(self, indices: list[int]) -> dict[int, str]:
+        """Best-effort: resolve each given live node index to its navigation
+        DESTINATION (a link's absolute href). Used by PROPOSE's abstain-and-clarify
+        to suppress a FALSE ambiguity — two controls that lead to the SAME
+        destination (a nav/menu entry + its content card pointing at one page) are
+        not a real choice, so the kernel acts instead of asking "which did you mean?".
+
+        CONCRETE no-op default (returns ``{}``), NOT an ``@abstractmethod``, so every
+        existing fake/adapter and any transport without DOM access stays valid and
+        the kernel simply keeps its current behaviour (abstain) when destinations are
+        unknown. Real CDP actuators override this. Returns ``{index: href}`` only for
+        nodes that resolve to a non-empty destination; a non-link / unresolved node
+        is omitted (never guessed)."""
+        return {}
+
+    async def highlight(self, source_index: int) -> None:
+        """Outline the node at ``source_index`` on the live page — the epistemic-
+        clause visual proof (the source / target node is shown on the page, synced
+        to the spoken readback). Driven by the SAME node identity the actuator
+        clicks (``index → backendDOMNodeId``), never a stored ``bbox``. Best-effort
+        and for SIGHTED observers only — the product never depends on it.
+
+        CONCRETE no-op default (like ``destinations``), NOT an ``@abstractmethod``,
+        so ``FakeActuator`` and any transport without a live page stay valid. Real
+        CDP actuators override this."""
+        return None
+
+    async def clear_highlight(self) -> None:
+        """Remove the source-node outline (idempotent). Default no-op."""
+        return None
+
 
 class Ingest(ABC):
     """Parse company docs → indexed passages (Unsiloed). ``doc`` is raw bytes

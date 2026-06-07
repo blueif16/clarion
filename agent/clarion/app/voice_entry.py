@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from typing import Optional
 
 from langgraph.types import Command
@@ -154,6 +155,18 @@ class StageGraphRunner:
         # emits the NEW ones each step (the PROPOSE/GATE/EXECUTOR/REPLANNER trace
         # surfaced to /tmp/clarion-worker.log for a debuggable live run).
         self._trace_logged = 0
+        # The (proposal_id, status) pairs already emitted to the activity feed, so
+        # each lifecycle TRANSITION (proposed → awaiting_yes → done) surfaces once.
+        # A fresh run clears it (see advance()).
+        self._activity_emitted: set = set()
+        # Injected sink for one new/changed ActivityItem (the HUD toast feed,
+        # Feature A). None = no-op (every headless test). Wired in entrypoint to the
+        # `clarion-log` room-data path. Never raises into a turn.
+        self._activity_sink = None
+        # Injected ``(phase, detail, level)`` HUD-line sink for the source-node
+        # proof surface (the panel row mirroring the live-page highlight). None =
+        # no-op (headless tests). Wired in entrypoint to the same `hud()` path.
+        self._hud_sink = None
 
     @property
     def ready(self) -> bool:
@@ -273,6 +286,128 @@ class StageGraphRunner:
         except Exception:  # noqa: BLE001 - trace logging must never break a turn
             pass
 
+    def turn_summary(self) -> str:
+        """A compact per-turn latency breakdown read from the last run's trace —
+        the planner decode, every step decode (sum + count), and how many replans
+        were spent. Pairs with the end-to-end ``advance_ms`` the tool logs so a
+        live run shows WHICH leg dominated the consent wait. Best-effort: returns
+        ``''`` if the trace can't be read (never breaks a turn)."""
+        try:
+            events = (self._last_values or {}).get("trace", []) or []
+            plan_ms = 0.0
+            decide_total = 0.0
+            decide_n = 0
+            replans = 0
+            for event in events:
+                node = getattr(event, "node", "")
+                data = getattr(event, "data", None) or {}
+                if node == "PLANNER" and data.get("plan_ms") is not None:
+                    plan_ms = float(data["plan_ms"])
+                elif node == "PROPOSE" and data.get("decide_ms") is not None:
+                    decide_total += float(data["decide_ms"])
+                    decide_n += 1
+                elif node == "REPLANNER":
+                    replans = max(replans, int(data.get("attempts", 0) or 0))
+            return (
+                f"plan={plan_ms:.0f}ms decide={decide_total:.0f}ms(x{decide_n}) "
+                f"replans={replans}"
+            )
+        except Exception:  # noqa: BLE001 - a summary read must never break a turn
+            return ""
+
+    def activity_items(self) -> list:
+        """The live ACTIVITY projection — one record per decided action, folded
+        from the real ``trace`` + ``consent_log`` (the action-side analog of the
+        source-node panel). This is the GROUNDED source ``read_history`` speaks
+        from; it is never the voice LLM's free recollection. Best-effort: any read
+        error yields ``[]`` (an honest empty history, never a guess)."""
+        try:
+            from clarion.instrument.publisher import activity_items
+
+            return activity_items(self._last_values or {})
+        except Exception:  # noqa: BLE001 - never crash a turn on a projection read
+            return []
+
+    def _emit_activity(self) -> None:
+        """Surface each NEW/CHANGED decided action to the injected activity sink
+        (the HUD toast feed). Diffs by ``(proposal_id, status)`` so a single action
+        emits once per lifecycle transition (proposed → awaiting_yes → done), and a
+        consent re-execution can't double-emit. Best-effort — never breaks a turn."""
+        if self._activity_sink is None:
+            return
+        try:
+            for item in self.activity_items():
+                key = (item.proposal_id, item.status)
+                if key in self._activity_emitted:
+                    continue
+                self._activity_emitted.add(key)
+                self._activity_sink(item)
+        except Exception:  # noqa: BLE001 - the feed must never break a turn
+            pass
+
+    # ---- source-node highlight (the epistemic-clause proof surface) ---------
+    # Outlines, on the live page, the SAME node the agent resolved to act — synced
+    # to the per-step consent readback (the form-fill Q&A pair is the hero). For
+    # SIGHTED observers only: the blind user's channel is the spoken citation, so
+    # every call is best-effort / fail-open and the product NEVER depends on it.
+
+    def _hud(self, phase: str, detail: str = "", level: str = "info") -> None:
+        """Emit one panel line to the injected HUD sink (no-op if unset)."""
+        if self._hud_sink is None:
+            return
+        try:
+            self._hud_sink(phase, detail, level)
+        except Exception:  # noqa: BLE001 - the proof surface must never break a turn
+            pass
+
+    async def _safe_clear(self) -> None:
+        if not self.ready:
+            return
+        clear = getattr(self._runtime.actuator, "clear_highlight", None)
+        if clear is None:
+            return
+        try:
+            await clear()
+        except Exception:  # noqa: BLE001 - clearing must never break a turn
+            pass
+
+    async def clear_highlight(self) -> None:
+        """Remove the live-page outline (idempotent, best-effort)."""
+        await self._safe_clear()
+
+    async def _apply_highlight(self, req: ConsentRequest) -> None:
+        """A step PARKED at consent: outline its field node on the live page (the
+        SAME index the actuator clicks) and mirror the PROVEN field⟷label pairing as
+        a HUD panel row. Clears any prior box first (fade-on-next-step). ``req.source``
+        is the kernel-built node identity; absent → nothing to point at."""
+        await self._safe_clear()
+        src = getattr(req, "source", None)
+        if src is None or src.index is None or not self.ready:
+            return
+        hl = getattr(self._runtime.actuator, "highlight", None)
+        if hl is not None:
+            try:
+                await hl(src.index)
+            except Exception:  # noqa: BLE001 - the product never depends on the box
+                pass
+        name = (src.name or "field").strip()
+        nid = src.node_id or "?"
+        if src.label_text and src.method:
+            row = f'{name} (node {nid}) ⟷ "{src.label_text}" via {src.method}'
+        else:
+            row = f"{name} (node {nid})"
+        self._hud("[source]", row, "ok")
+
+    async def _apply_highlight_end(self) -> None:
+        """The run reached END: clear any box. For a verified ABSENCE (the two-sided
+        proof — the move a screenshot agent can't copy) show the empty-state row.
+        Read from the now-committed snapshot (valid at END, unlike at the parked
+        interrupt)."""
+        await self._safe_clear()
+        step = (self._last_values or {}).get("pending_step")
+        if step is not None and bool(getattr(step, "asserts_absence", False)):
+            self._hud("[source]", "verified absent — nothing to point at", "warn")
+
     async def advance(self) -> Optional[ConsentRequest]:
         """Run the stage graph to the next consent interrupt. Returns the surfaced
         `ConsentRequest` the agent must speak, or None when the run reaches END."""
@@ -292,6 +427,7 @@ class StageGraphRunner:
             self._seed = None
             self._trace_logged = 0
             self._last_values = None
+            self._activity_emitted = set()
 
         if self._seed is None:
             page = await self._runtime.actuator.perceive()
@@ -309,10 +445,14 @@ class StageGraphRunner:
         await self._publish()
         self._capture_state()
         self._log_trace()
+        self._emit_activity()
         if "__interrupt__" not in result:
+            await self._apply_highlight_end()
             return None
         (intr,) = result["__interrupt__"]
-        return ConsentRequest.model_validate(intr.value)
+        req = ConsentRequest.model_validate(intr.value)
+        await self._apply_highlight(req)
+        return req
 
     async def resume(self, decision: ConsentDecision) -> Optional[ConsentRequest]:
         """Deliver the consent decision; continue to the next interrupt or END.
@@ -324,10 +464,14 @@ class StageGraphRunner:
         await self._publish()
         self._capture_state()
         self._log_trace()
+        self._emit_activity()
         if "__interrupt__" not in result:
+            await self._apply_highlight_end()
             return None
         (intr,) = result["__interrupt__"]
-        return ConsentRequest.model_validate(intr.value)
+        req = ConsentRequest.model_validate(intr.value)
+        await self._apply_highlight(req)
+        return req
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +507,24 @@ def build_voice_tools(runner: StageGraphRunner):
         return readout.summary
 
     @function_tool()
+    async def read_history(context: RunContext, n: int = 3) -> str:
+        """Read back the last `n` steps we've actually taken — what was read,
+        filled, selected, or is awaiting the user's yes. Call this when the user
+        asks what you've done so far, the last few steps, or where they are in the
+        task. Pass how many steps they asked for as `n` (default 3). Speak the
+        returned summary VERBATIM; it is built from the real recorded trace — add
+        NOTHING that isn't in it."""
+        from clarion.instrument.publisher import format_history_say
+
+        try:
+            count = int(n) if n else 3
+        except (TypeError, ValueError):
+            count = 3
+        # GROUNDED from the recorded trace, never the LLM's recollection — the
+        # history has a real source, so it is structurally speakable.
+        return format_history_say(runner.activity_items(), count)
+
+    @function_tool()
     async def advance_task(context: RunContext, user_intent: str = "") -> str:
         """Drive the user's CONFIRMED goal one consequential step. Only call this
         AFTER the user has told you what they want and confirmed it. Pass their goal
@@ -383,10 +545,20 @@ def build_voice_tools(runner: StageGraphRunner):
                 "and I'll read it back to confirm before I start."
             )
         runner.set_goal(goal)
+        _t0 = time.time()
         consent_req = await advance_non_blocking(
             context.speech_handle,
             runner.advance,
             log=lambda m: print(f"  [advance_task] {m}", flush=True),
+        )
+        # End-to-end consent round-trip (tool-enter → consent-readback ready): the
+        # number the user feels as "waiting for consent". The per-leg breakdown
+        # (planner decode + step decode(s) + replans) rides alongside so a live run
+        # shows which leg dominated.
+        print(
+            f"  [lat] advance_ms={(time.time() - _t0) * 1000:.0f} "
+            f"{runner.turn_summary()}",
+            flush=True,
         )
         if consent_req is not None:
             return consent_req.utterance  # the agent speaks this; user answers yes/no
@@ -414,18 +586,31 @@ def build_voice_tools(runner: StageGraphRunner):
         # livekit-agents 1.5.x this is a plain call (sets allow_interruptions=False
         # on this function-call's speech handle), NOT a context manager.
         context.disallow_interruptions()
+        _t0 = time.time()
         next_req = await runner.resume(decision)
         if next_req is not None:
+            # Another consequential step surfaced — log this consent leg, then hand
+            # back its readback.
+            print(
+                f"  [lat] consent_ms={(time.time() - _t0) * 1000:.0f} "
+                f"{runner.turn_summary()}",
+                flush=True,
+            )
             return next_req.utterance  # next consequential step's readback
         # END. If this step navigated to a NEW page, auto-inject that page's grounded
         # readout so the page content rides the consent completion (no extra
         # read_screen call). No navigation → the plain terminal line.
+        print(
+            f"  [lat] consent_ms={(time.time() - _t0) * 1000:.0f} "
+            f"{runner.turn_summary()}",
+            flush=True,
+        )
         readout = await runner.navigated_readout()
         if readout is not None:
             return readout
         return "Done."
 
-    return [read_screen, advance_task, confirm_consent]
+    return [read_screen, read_history, advance_task, confirm_consent]
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +635,11 @@ _INSTRUCTIONS = (
     "call confirm_consent with approved=true for yes or approved=false for no. NEVER "
     "take an irreversible step (like a payment) without an explicit yes.\n\n"
     "Read grounded facts (amount, payee, due date, fees) and cite what you read. "
-    "Be concise; no emojis or markdown."
+    "Be concise; no emojis or markdown.\n\n"
+    "HISTORY — When they ask what you've done, the last few steps, or where they "
+    "are in the task, call read_history and speak its summary VERBATIM. It is built "
+    "from the real recorded steps, so it's the truth of what happened — never "
+    "recount steps from your own memory."
 )
 
 
@@ -510,6 +699,37 @@ async def entrypoint(ctx) -> None:
     # the AgentSession below can greet + listen before the tab is up.
     runner = StageGraphRunner()
     tools = build_voice_tools(runner)
+
+    # Feature A — the action-trace feed. Each NEW/changed decided action is
+    # published over the SAME `clarion-log` room-data path the HUD already consumes;
+    # the offscreen doc routes frames carrying an `activity` payload to the on-page
+    # toast feed + the panel's Activity section. Fire-and-forget — never blocks a turn.
+    def _emit_activity_frame(item) -> None:
+        if getattr(ctx, "room", None) is None:
+            return
+        status = getattr(item, "status", "")
+        level = (
+            "err"
+            if status in ("failed", "rejected")
+            else "warn"
+            if (status == "awaiting_yes" or getattr(item, "persist", False))
+            else "ok"
+            if status == "done"
+            else "info"
+        )
+        frame = {
+            "phase": "[activity]",
+            "detail": (f"{item.kind} {item.target}".strip() or item.proposal_id),
+            "level": level,
+            "activity": item.model_dump(),
+        }
+        _spawn(_publish_hud(ctx.room, frame))
+
+    runner._activity_sink = _emit_activity_frame
+    # Source-node proof surface: the panel ROW mirroring the live-page highlight
+    # rides the SAME `hud()` → `clarion-log` path (the live-page box is drawn over
+    # the actuator relay, separately). Best-effort; never blocks a turn.
+    runner._hud_sink = hud
 
     # Contract-correct TTS the kernel sees (MiniMax Speech 2.6, streaming PCM);
     # constructed so the wiring is genuine even though the audio path uses the
@@ -599,10 +819,35 @@ async def entrypoint(ctx) -> None:
         for out in getattr(ev, "function_call_outputs", None) or []:
             hud("[tool] ←", str(getattr(out, "output", "")), "ok")
 
-    # Per-frame VAD/STT metrics (VADMetrics, STTMetrics duration=0.00, …) are the
-    # bulk of the log noise — silenced (handler left unregistered). When profiling
-    # the <800ms turn budget, re-add @session.on("metrics_collected") and log only
-    # the meaningful latency fields (ttft/ttfb/duration) so the spam stays gone.
+    # Voice-leg latency (the OTHER half of the consent wait, alongside the task
+    # plane's [lat] advance_ms/plan_ms/decide_ms): the LLM time-to-first-token, the
+    # TTS time-to-first-byte, and the end-of-utterance / transcription delay. We log
+    # ONLY these meaningful fields to /tmp via loop() — per-frame VADMetrics and the
+    # STTMetrics duration=0.00 spam stay silenced (they were the bulk of the noise).
+    @session.on("metrics_collected")
+    def _on_metrics(ev) -> None:  # noqa: ANN001 - loosely typed LiveKit metrics event
+        m = getattr(ev, "metrics", None)
+        if m is None:
+            return
+        kind = type(m).__name__
+
+        def _ms(attr: str) -> float:
+            v = getattr(m, attr, None)
+            try:
+                return float(v) * 1000.0 if v is not None else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        if kind == "LLMMetrics":  # voice-plane LLM (MiniMax-M3) decode
+            loop(f"[lat] voice-llm ttft={_ms('ttft'):.0f}ms dur={_ms('duration'):.0f}ms")
+        elif kind == "TTSMetrics":  # LiveKit Inference (Cartesia/Deepgram) synth
+            loop(f"[lat] voice-tts ttfb={_ms('ttfb'):.0f}ms dur={_ms('duration'):.0f}ms")
+        elif kind == "EOUMetrics":  # turn-detect + STT finalize before the LLM fires
+            loop(
+                f"[lat] turn-eou eou={_ms('end_of_utterance_delay'):.0f}ms "
+                f"stt={_ms('transcription_delay'):.0f}ms"
+            )
+        # STTMetrics / VADMetrics: per-frame spam — deliberately not logged.
 
     @session.on("error")
     def _on_error(ev) -> None:  # noqa: ANN001 - LLM/TTS/STT failures surface here

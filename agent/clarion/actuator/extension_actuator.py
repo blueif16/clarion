@@ -45,7 +45,10 @@ from clarion.actuator.pipeline import (
     _READ_JS,
     ax_node_geometry,
     build_candidates,
+    cdp_clear_highlight,
     cdp_click_by_backend,
+    cdp_highlight_by_backend,
+    cdp_hrefs_by_index,
     containment_filter,
     diff_maps,
     estimate_tokens,
@@ -269,6 +272,24 @@ class ExtensionActuator(Actuator):
         Playwright transport (``pipeline.diff_maps``)."""
         return diff_maps(before, after)
 
+    async def destinations(self, indices: list[int]) -> dict[int, str]:
+        """Resolve the given live indices to their link destinations (absolute href)
+        over the extension relay — the PROPOSE abstain false-ambiguity dedup. Maps
+        each index to its perceived ``backendDOMNodeId`` (from the last perceive),
+        then defers to the shared ``cdp_hrefs_by_index``. Best-effort: an
+        unmapped/boxless node is simply omitted (the kernel then keeps its abstain)."""
+        mapping = {
+            i: self._index_to_backend_id[i]
+            for i in indices
+            if i in self._index_to_backend_id
+        }
+        if not mapping:
+            return {}
+        try:
+            return await cdp_hrefs_by_index(self._relay.send, mapping)
+        except Exception:  # noqa: BLE001 - dedup is advisory; degrade to no dedup
+            return {}
+
     async def perceive_vision(self) -> SelectorMap:
         """Vision fallback for AX-blind widgets — deferred (execution §4.2)."""
         raise NotImplementedError("vision fallback — deferred")
@@ -347,6 +368,20 @@ class ExtensionActuator(Actuator):
             )
         await self._relay.send("Page.navigate", {"url": action.value})
         return Observation(selector_map=await self.perceive(), success=True)
+
+    async def highlight(self, source_index: int) -> None:
+        """Outline the live node at ``source_index`` — the epistemic-clause proof.
+        Resolves index→backend EXACTLY like ``_do_click`` and draws over the SAME
+        relay; best-effort (a missing index / relay hiccup is a silent no-op — the
+        product never depends on the highlight)."""
+        backend_id = self._index_to_backend_id.get(source_index)
+        if backend_id is None:
+            return
+        ok, detail = await cdp_highlight_by_backend(self._relay.send, backend_id)
+        print(f"  [highlight] idx={source_index} backend={backend_id} ok={ok} {detail}", flush=True)
+
+    async def clear_highlight(self) -> None:
+        await cdp_clear_highlight(self._relay.send)
 
     async def _do_read(self, action: Action) -> Observation:
         if action.index is None:
