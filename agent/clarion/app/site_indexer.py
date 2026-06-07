@@ -38,6 +38,7 @@ import asyncio
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 from urllib.parse import urlparse
@@ -48,6 +49,7 @@ _AGENT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__
 load_dotenv(os.path.join(_AGENT_ROOT, ".env"))
 
 from clarion.contracts.state import Action, Fact, PageReadout  # noqa: E402
+from clarion.app.structure_freshness import page_fingerprint  # noqa: E402
 
 # URL substrings that signal a state-changing / destructive target. The crawl is
 # already GET-only, but we refuse to even fetch these (a GET /logout still mutates
@@ -107,8 +109,12 @@ def page_block(readout: PageReadout) -> str:
         lines.append(f"Headings: {headings}")
     if actions:
         lines.append(f"Actions available: {actions}")
-    if readout.summary.strip():
-        lines.append(readout.summary.strip())
+    # Strip any leading '#' so a heading-like summary line can't open a second
+    # markdown chunk (the ingest splits a combined doc on '#'-prefixed lines, so
+    # each page block must stay exactly ONE chunk for the per-page id/fingerprint).
+    summary = re.sub(r"(?m)^\s*#+\s*", "", readout.summary.strip())
+    if summary:
+        lines.append(summary)
     return "\n".join(lines)
 
 
@@ -143,6 +149,7 @@ async def crawl_and_index(
 
     actuator = await PlaywrightActuator.create(start_url, headless=headless)
     blocks: list[str] = []
+    fingerprints: list[str] = []  # one structural fingerprint per indexed page
     try:
         # BFS frontier of (url, depth); the start page is already loaded by create.
         queue: list[tuple[str, int]] = [(start_url, 0)]
@@ -162,6 +169,7 @@ async def crawl_and_index(
 
             blocks.append(page_block(readout))
             result.pages.append(url)
+            fingerprints.append(page_fingerprint(readout))
             log(f"  [page {len(result.pages)}/{max_pages}] {url} "
                 f"({len(readout.headings)} headings, {len(readout.affordances)} actions)")
 
@@ -186,13 +194,28 @@ async def crawl_and_index(
     # single category index holds all sites, scoped at query time by a metadata
     # filter (docs/research/moss-index-design.md). Reuses the live Ingest adapter.
     doc = "\n\n".join(blocks)
+    # Per-page stamps for VERIFY-ON-USE: a structural FINGERPRINT (changes only on a
+    # real structure change — a control added/removed/renamed — never on a value) +
+    # the indexing time, keyed to a STABLE per-URL doc id so a re-crawl SUPERSEDES a
+    # changed page in place instead of orphaning a stale chunk. This is the
+    # knowledge-layer freshness best practice (CLAUDE.md / docs/clarion-status.md):
+    # the cache stays advisory, refreshed by re-perception, never expired on a TTL.
+    indexed_at = str(int(time.time()))
+    passage_metadata = [
+        {"url": u, "fingerprint": fp, "indexed_at": indexed_at}
+        for u, fp in zip(result.pages, fingerprints)
+    ]
     ingest = GeminiMossIngest(index=index)
     passages = await ingest.ingest(
-        doc, extra_metadata={"site": host, "category": "structure"}
+        doc,
+        extra_metadata={"site": host, "category": "structure"},
+        passage_metadata=passage_metadata,
+        id_basis=list(result.pages),
     )
     result.chunks = len(passages)
     log(f"  [done] indexed {len(result.pages)} pages → {result.chunks} chunks "
-        f"into Moss index {index!r} (site={host!r}).")
+        f"into Moss index {index!r} (site={host!r}); stable per-URL ids + "
+        f"fingerprints → a re-crawl supersedes a changed page in place.")
     return result
 
 

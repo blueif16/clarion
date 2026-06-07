@@ -170,7 +170,12 @@ class GeminiMossIngest(Ingest):
         return await asyncio.to_thread(_call)
 
     async def ingest(
-        self, doc: bytes | str, *, extra_metadata: Optional[dict] = None
+        self,
+        doc: bytes | str,
+        *,
+        extra_metadata: Optional[dict] = None,
+        passage_metadata: Optional[Sequence[dict]] = None,
+        id_basis: Optional[Sequence[str]] = None,
     ) -> list[Passage]:
         """Parse → chunk → Gemini-embed → upsert to Moss → return Passages.
 
@@ -181,7 +186,15 @@ class GeminiMossIngest(Ingest):
         ``docs/research/moss-index-design.md``). It is also folded into the
         content-derived doc id so two tenants with identical chunk text don't collide
         on one ref (while re-ingesting the SAME tenant's chunk still upserts in place).
-        """
+
+        ``passage_metadata`` (optional, one dict PER chunk, aligned 1:1) is merged
+        into that chunk's metadata on top of ``extra_metadata`` — e.g. a per-page
+        ``{"url", "fingerprint", "indexed_at"}`` for the structure cache's
+        verify-on-use. ``id_basis`` (optional, one string per chunk) makes the doc id
+        STABLE on that basis (e.g. the page URL) instead of the content hash, so
+        re-ingesting a CHANGED page **upserts in place** (supersede — no orphaned
+        stale chunk). Both are applied only when supplied 1:1 with the chunked
+        passages; a length mismatch falls back to the prior behaviour (fail-safe)."""
         text = await self._parse(doc)
         chunks = _chunk_text(text)
         if not chunks:
@@ -200,11 +213,28 @@ class GeminiMossIngest(Ingest):
         # Fold the partition metadata into the content hash so two tenants with the
         # same chunk text get distinct refs, while the SAME tenant's chunk stays stable.
         salt = "|".join(f"{k}={extra[k]}" for k in sorted(extra))
+        # Per-passage stamps + a STABLE id basis apply only when supplied 1:1 with the
+        # chunked passages; a length mismatch fails safe to base metadata + content ids.
+        pmeta = (
+            list(passage_metadata)
+            if passage_metadata is not None and len(passage_metadata) == len(chunks)
+            else None
+        )
+        ids = (
+            list(id_basis)
+            if id_basis is not None and len(id_basis) == len(chunks)
+            else None
+        )
         for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
-            digest = hashlib.sha1(f"{salt}|{chunk}".encode("utf-8")).hexdigest()[:12]
+            # A STABLE id basis (the page URL) makes re-ingesting a CHANGED page upsert
+            # in place (supersede — no orphaned stale chunk); else hash the content.
+            basis = ids[i] if ids and ids[i] else chunk
+            digest = hashlib.sha1(f"{salt}|{basis}".encode("utf-8")).hexdigest()[:12]
             ref = f"{self._index}::{digest}"
             heading = chunk.splitlines()[0][:80] if chunk.splitlines() else ""
             meta = {**extra, "chunk": str(i), "heading": heading}
+            if pmeta:
+                meta.update({str(k): str(v) for k, v in (pmeta[i] or {}).items()})
             moss_docs.append(MossDoc(id=ref, text=chunk, metadata=meta, embedding=vec))
             passages.append(Passage(text=chunk, ref=ref, score=1.0, metadata=meta))
 
