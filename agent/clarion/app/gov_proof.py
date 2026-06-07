@@ -39,6 +39,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -49,11 +50,13 @@ from clarion.app.runtime import HeroRuntime  # noqa: E402
 from clarion.contracts.events import ConsentDecision, ConsentRequest  # noqa: E402
 from clarion.contracts.ports import Reasoner  # noqa: E402
 from clarion.contracts.state import (  # noqa: E402
+    ConsentRecord,
     Fact,
     PageReadout,
     SelectorMap,
     StepProposal,
     Subgoal,
+    WorkflowEpisode,
 )
 from clarion.stages.graph import seed_stage_state  # noqa: E402
 
@@ -277,6 +280,38 @@ class ProofResult:
 
 
 # ---------------------------------------------------------------------------
+# User-memory projection — turn a finished ProofResult into the episode record
+# (the knowledge-layer write-back). Pure helpers; never raise.
+# ---------------------------------------------------------------------------
+
+
+def _episode_outcome(res: ProofResult) -> str:
+    """``completed`` (clean read-only finish) / ``declined`` (a hard-stop fired —
+    a first-class success: the gate did its job) / ``error`` (a real crash; the
+    consent-turn-bound case is the expected Goal-B reject loop, NOT an error)."""
+    if res.error and "consent-turn bound" not in res.error:
+        return "error"
+    if res.hard_stops > 0:
+        return "declined"
+    return "completed"
+
+
+def _mean(xs: list[float]) -> float:
+    vals = [x for x in (xs or []) if x is not None]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def _remembered(c: "ConsentEvent") -> ConsentRecord:
+    """ConsentEvent (app dataclass) → ConsentRecord (frozen value object)."""
+    return ConsentRecord(
+        proposal_id=c.proposal_id,
+        utterance=c.utterance,
+        irreversible=c.irreversible,
+        decision=c.decision,
+    )
+
+
+# ---------------------------------------------------------------------------
 # The GENERIC driver — runs ONE goal on ONE site, no site-specific logic.
 # ---------------------------------------------------------------------------
 
@@ -412,6 +447,39 @@ class GovProofDriver:
             if e.node == "PLANNER" and e.data.get("utterance"):
                 self.result.plan_utterance = str(e.data["utterance"])
                 break
+
+        # User-memory write-back (the knowledge layer): persist this finished run as
+        # an EPISODE so the NEXT run on the same goal plans faster. Stores the plan
+        # SHAPE + consent decisions + timings — NEVER grounded_values. Opt-in via
+        # CLARION_MEMORY=1, fire-and-forget, and never fails the run (a memory miss
+        # is logged, not raised). Skipped on a crashed (error) outcome.
+        outcome = _episode_outcome(self.result)
+        if (
+            getattr(self.rt, "memory", None) is not None
+            and os.environ.get("CLARION_MEMORY") == "1"
+            and outcome != "error"
+        ):
+            try:
+                await self.rt.memory.write_episode(
+                    self.rt.user_id,
+                    WorkflowEpisode(
+                        goal=self.goal,
+                        url_host=(urlparse(self.url).hostname or ""),
+                        subgoals=self.result.subgoals,
+                        plan_utterance=self.result.plan_utterance,
+                        outcome=outcome,  # type: ignore[arg-type]
+                        consent=[_remembered(c) for c in self.result.consent_events],
+                        hard_stops=self.result.hard_stops,
+                        approvals=self.result.approvals,
+                        decide_ms_mean=_mean(self.result.decide_ms),
+                        perceive_ms_mean=_mean(self.result.perceive_ms),
+                        completed_at=time.time(),
+                    ),
+                )
+                _p(f"  [memory] episode saved (outcome={outcome})")
+            except Exception as exc:  # noqa: BLE001 — never fail a run on a memory miss.
+                _p(f"  [memory] episode write skipped: {exc}")
+
         return self._finalize()
 
     def _finalize(self) -> ProofResult:
