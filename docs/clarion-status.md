@@ -3,7 +3,18 @@
 _Last updated: 2026-06-06 · branch `feat/clarion-extension`._
 _Latest: provider swap → **MiniMax** (MiniMax-M3 brain + Speech 2.6-turbo voice),
 wired through LiveKit; Deepgram STT + Gemini retrieval embeddings unchanged. Tests
-green; live-verify pending the MiniMax key (`scripts/set-minimax-key.sh`)._
+green; live-verify pending the MiniMax key (`scripts/set-minimax-key.sh`).
+**Voice-LLM resilience:** M3's endpoint intermittently 5xx'd ("unknown error (1000)")
+under load and the agent went SILENT — now `_build_llm()` wraps M3 (primary) +
+`MiniMax-M2.7` in `llm.FallbackAdapter` (`MINIMAX_LLM_MODEL_FALLBACK`, `off` to
+disable; verified: forced-fail primary → M2.7 answers, `reasoning_split` clean on both).
+**Logging:** per-frame VAD/STT + `[asr] user` spam silenced; worker HUD lines no longer
+double-POST to `ext.log` (SW skips sink on `fromWorker`); `clarion-up` reaps orphan tails.
+**Knowledge layer (spike):** a read-only same-origin STRUCTURE crawler
+(`app/site_indexer.py`) injects page affordances (headings + controls, NEVER live
+values) into a per-site Moss index (`clarion-site-<host>`) — proven live on usa.gov
+with round-trip retrieval. Active Moss project set to a clean dedicated one;
+`clarion-kb` (re)built + smoke-verified there (Gemini custom embeds, ~1ms in-mem)._
 
 This is the single source of truth for **where we are and what's left**. Keep it
 current: when you finish or change something, edit this file in the same commit.
@@ -34,8 +45,8 @@ never the `web/demo-site` clone.
 
 | Piece | State | Evidence / location |
 |---|---|---|
-| Voice: LiveKit · Deepgram STT · **MiniMax-M3 LLM · MiniMax Speech 2.6-turbo TTS** | **REAL, wired (live-verify pending key)** | `app/voice_entry.py` — MiniMax via the LiveKit `minimax` plugin; STT stays Deepgram. **Plugin needs `MINIMAX_GROUP_ID` + `voice_id` (not `voice`); model/voice enums differ from the raw t2a_v2 synth → reads `MINIMAX_PLUGIN_TTS_MODEL/_VOICE`** |
-| Voice-conversation observability (ASR heard · agent state · tool calls · errors · metrics) | **REAL — on the HUD panel + unified log** | `voice_entry.py` `hud()` → LiveKit room-data (`clarion-log` topic) → `offscreen.js` `DataReceived` → SW `pushHud`; also POSTs the worker log to the sink so `/tmp/clarion-ext.log` is ONE stream |
+| Voice: LiveKit · Deepgram STT · **MiniMax-M3 LLM (M2.7 failover) · MiniMax Speech 2.6-turbo TTS** | **REAL, wired (live-verify pending key)** | `app/voice_entry.py` — MiniMax via the LiveKit `minimax` plugin; STT stays Deepgram. **`_build_llm()` = `llm.FallbackAdapter([M3, MiniMax-M2.7])`** so an M3 5xx fails OVER instead of going silent (both share the `reasoning_split`-wrapped client). **Plugin needs `MINIMAX_GROUP_ID` + `voice_id` (not `voice`); model/voice enums differ from the raw t2a_v2 synth → reads `MINIMAX_PLUGIN_TTS_MODEL/_VOICE`** |
+| Voice-conversation observability (ASR heard · agent state · tool calls · errors) | **REAL — on the HUD panel + unified log; deduped** | `voice_entry.py` `hud()` → LiveKit room-data (`clarion-log` topic) → `offscreen.js` `DataReceived` → SW `pushHud`; the worker also POSTs to the sink so `/tmp/clarion-ext.log` is ONE stream — and the HUD round-trip now skips the sink (`fromWorker`) so worker lines aren't double-logged. **Per-frame VAD/STT metrics + `[asr] user` state are silenced** (re-enable in `voice_entry.py` for profiling) |
 | Perception (CDP AXTree → numbered map), lazy-stamp | **REAL, cheap** | `actuator/pipeline.py`, `actuator/*actuator.py` (perceive 0 stamp round-trips; `reperceive_node`) |
 | Actuator act (click/fill/navigate over CDP) + `filled` record | **REAL** | native-setter fills stamp `state["filled"]` by node_id |
 | Kernel loop GROUND→VERIFY→PROPOSE→⟨GATE⟩→CONSENT→ACT→CONFIRM | **REAL** | `kernel/graph.py` |
@@ -48,7 +59,8 @@ never the `web/demo-site` clone.
 | **Epistemic fences** | **✅ REAL** | `kernel/policy.py` membership (`is_speakable_value`) + pairing (`pairing_backs`); `NegativeVerifier` hedge |
 | **Irreversibility gate** | **✅ REAL — dual-signal** | `kernel/irreversibility.py` (structural pre-screen escalate-only; UNKNOWN-on-no-undo gates Fast) |
 | **Done-check** | **✅ REAL — code-selected, anchored** | `stages/checks.py` 5 generic checks + URL anchor; hardcoded registry DELETED |
-| Retrieval (Moss, KB) | **embedding path config-gated; built-in BLOCKED** | `retrieval/`; `MOSS_EMBED_MODEL` selects **Gemini custom** (working — custom vectors bypass the model host) or **built-in `moss-minilm`/`moss-mediumlm`** (wired but DEAD: `models.moss.link` still can't serve the model to the moss runtime — `load_index` fails on `.../config.json`, verified 2 ways 2026-06-06). **Also: this Moss project has NO `clarion-kb` — 3-index cap full of unrelated `vet_*` indexes.** To run Clarion retrieval here: free a slot + build `clarion-kb` with CUSTOM embeddings (Gemini, or a `MinimaxEmbedder`) |
+| Retrieval (Moss, KB) | **embedding path config-gated; built-in BLOCKED** | `retrieval/`; `MOSS_EMBED_MODEL` selects **Gemini custom** (working — custom vectors bypass the model host) or **built-in `moss-minilm`/`moss-mediumlm`** (wired but DEAD: `models.moss.link` still can't serve the model to the moss runtime — `load_index` fails on `.../config.json`, verified 2 ways 2026-06-06). **The active Moss project (in `agent/.env`) is now a clean dedicated one with `clarion-kb` built + smoke-verified** (Gemini custom embeds, ~1ms in-mem). NB the per-project index limit (was 3 → raised 2026-06-06); per-site STRUCTURE indexes live separately as `clarion-site-<host>` |
+| **Website STRUCTURE index** (knowledge layer a) | **SPIKE — built + proven live; NOT yet wired into decisions** | `app/site_indexer.py`: read-only same-origin crawl → `describe_page` affordances (no values) → per-site Moss `clarion-site-<host>`; `PlaywrightActuator.collect_links`. Proven on usa.gov |
 | User profile/traits store | **port exists, unused** | `Memory`/`Profile` ports (knowledge layer — next) |
 
 ---
@@ -109,8 +121,12 @@ behavior on a real site with `load_dotenv` keys, never an exit code.
    `irreversible` (not merely `unknown`) without a name match. TODO in
    `kernel/irreversibility.py::_structural_prescreen`.
 4. **Knowledge layer** (the user's vision): graphs + embedding DBs over
-   **(a) website functionalities** (seed = `PageReadout.affordances`),
-   **(b) task paths** (the subgoal plans we run), **(c) user profile/traits**
+   **(a) website functionalities** (seed = `PageReadout.affordances`) — ✅ a read-only
+   STRUCTURE crawler shipped as a SPIKE (`app/site_indexer.py`): same-origin BFS →
+   `describe_page` affordances (NEVER live values) → per-site Moss `clarion-site-<host>`,
+   proven on usa.gov. **NOT yet consulted by the kernel/Reasoner at task time — the
+   wiring into PLAN/PROPOSE (query the site map before navigating) is the next step.**
+   Then **(b) task paths** (the subgoal plans we run), **(c) user profile/traits**
    (the `Memory`/`Profile` port). Categorize + persist + reuse across sites.
 5. **Data-model simplification pass.** Audit `ClarionState`/`_PlanState` + value
    objects; keep only what we track (no bloat).
