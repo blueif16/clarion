@@ -167,16 +167,35 @@ fi
 
 cat <<NEXT
 
-== ready ==
-  • The tab bridge (broker) is ALREADY listening on :8771 — press Ctrl/Cmd+Shift+Y
-    on the tab to attach (no need to wait for voice/mic; that's the whole point).
-  • Grant the mic if 'request-mic' opens (voice only — the relay works without it).
+== ready — now STREAMING all logs in this window (Ctrl-C stops EVERYTHING) ==
+  • On the tab: press Ctrl/Cmd+Shift+Y to attach, grant the mic, then TALK.
   • If the extension didn't auto-load: chrome://extensions → Developer mode → Load unpacked → $EXT
-  • Observe login state:      Playwright connect_over_cdp("http://localhost:$CDP_PORT")
-                              — ONLY while the extension is idle (before the shortcut).
-  • Watch the broker:         tail -f $BROKER_LOG
-  • Watch the agent attach:   tail -f $WORKER_LOG
-  • Watch the browser side:   tail -f /tmp/clarion-ext.log
-  • Stop everything:          scripts/clarion-down.sh
+  • Lines below are tagged [worker] (agent/STT/LLM/TTS/tools/errors), [broker] (relay),
+    [ext] (browser mic + HUD). The worker's voice lines also appear under [ext] (unified).
+  • Ctrl-C in THIS window tears the whole stack down (same as scripts/clarion-down.sh).
   Read-only up to the auth wall — no credentials, no submit.
 NEXT
+
+# Stay in the FOREGROUND and stream every log, tagged + colored by source, until
+# Ctrl-C — which tears the stack down (clean up/down semantics). errexit is off so a
+# log rotation under tail can never kill the cockpit.
+set +e
+: >>"$WORKER_LOG"; : >>"$BROKER_LOG"; : >>/tmp/clarion-ext.log
+_tail_tagged() { tail -n 8 -F "$1" 2>/dev/null | while IFS= read -r l; do printf '%s %s\n' "$2" "$l"; done; }
+cleanup() {
+  trap - INT TERM
+  echo; echo "== Ctrl-C — shutting the Clarion stack down =="
+  kill $(jobs -p) 2>/dev/null || true
+  "$ROOT/scripts/clarion-down.sh" || true
+  exit 0
+}
+trap cleanup INT TERM
+# Kill orphaned cockpit tails from a prior `clarion-up`: clarion-down replaces the
+# worker/broker, but `tail -F` survives the truncation and keeps re-emitting the
+# SAME file — so without this every line would stream TWICE (once per stale tail).
+# Drop them so each line streams exactly ONCE.
+pkill -f "tail -n 8 -F /tmp/clarion-" 2>/dev/null || true
+_tail_tagged "$WORKER_LOG"        "$(printf '\033[36m[worker]\033[0m')" &
+_tail_tagged "$BROKER_LOG"        "$(printf '\033[33m[broker]\033[0m')" &
+_tail_tagged /tmp/clarion-ext.log "$(printf '\033[32m[ext]\033[0m   ')" &
+wait

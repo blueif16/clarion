@@ -51,7 +51,7 @@ function reportState(state, detail) {
  * Forward a diagnostic line to the service worker so it lands on the on-page HUD
  * and /tmp/clarion-ext.log. Best-effort: a sleeping worker just drops it.
  */
-function swLog(phase, detail, level) {
+function swLog(phase, detail, level, fromWorker) {
   try {
     chrome.runtime.sendMessage({
       type: "voice.log",
@@ -59,6 +59,10 @@ function swLog(phase, detail, level) {
       phase,
       detail: detail == null ? "" : String(detail),
       level: level || "info",
+      // Worker-originated lines (forwarded off the clarion-log topic) are ALREADY in
+      // /tmp/clarion-ext.log via the worker's own POST — flag them so the SW renders
+      // them on the HUD but does NOT re-POST to the sink (which double-logged them).
+      fromWorker: !!fromWorker,
     });
   } catch {
     /* no receiver — non-fatal */
@@ -221,6 +225,22 @@ async function connect(cfg) {
   r.on(LK.RoomEvent.Disconnected, (reason) => {
     room = null;
     reportState("disconnected", reason == null ? "" : String(reason));
+  });
+  // Worker → HUD: the Python voice worker publishes diagnostic lines as room data
+  // on the `clarion-log` topic. Forward them through the SAME swLog → SW → HUD
+  // path the browser-side voice lines use, so the WHOLE conversation (mic, STT,
+  // agent thinking/speaking, tool calls, errors) shows on the on-page panel.
+  r.on(LK.RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
+    if (topic && topic !== "clarion-log") return;
+    try {
+      const entry = JSON.parse(new TextDecoder().decode(payload));
+      if (entry && entry.phase) {
+        // fromWorker=true: HUD-render only, no sink re-POST (already in ext.log).
+        swLog(entry.phase, entry.detail || "", entry.level || "info", true);
+      }
+    } catch {
+      /* not a clarion-log frame — ignore */
+    }
   });
 
   try {

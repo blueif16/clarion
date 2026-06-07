@@ -24,7 +24,7 @@ import {
 // DEBUG-ONLY visual feedback (toolbar badge + on-page HUD) + a file log sink so
 // the logs are readable directly (tail /tmp/clarion-ext.log), not copy-pasted.
 // Remove this import and the setBadge/pushHud/sinkLog call sites to strip it all.
-import { setBadge, pushHud, sinkLog } from "./hud.js";
+import { setBadge, pushHud, setHudStatus, sinkLog } from "./hud.js";
 
 // --- configuration ----------------------------------------------------------
 
@@ -107,6 +107,7 @@ async function startClarion() {
     title: tab.title || "",
   };
 
+  setHudStatus(tabId, "linking");
   pushHud(tabId, { phase: "attaching debugger…", detail: session.url });
   try {
     await chrome.debugger.attach({ tabId }, CDP_VERSION);
@@ -116,6 +117,7 @@ async function startClarion() {
     const msg = errorToMessage(err);
     console.error("[clarion] debugger attach failed:", msg);
     setBadge("ERR", "err");
+    setHudStatus(tabId, "error");
     pushHud(tabId, {
       phase: "attach FAILED",
       detail: /already attached|DevTools/i.test(msg)
@@ -172,10 +174,14 @@ function connectRelay() {
   s.ws = ws;
 
   ws.addEventListener("open", () => {
-    if (session !== s) return;
+    // Bail if this socket was superseded by a reconnect (s.ws reassigned to a new
+    // CONNECTING/null socket) or the session ended — sending on s.ws then throws
+    // "Cannot read properties of null" / "Still in CONNECTING state". Use the local
+    // `ws`, which is the socket whose open just fired (guaranteed OPEN).
+    if (session !== s || s.ws !== ws) return;
     s.reconnectAttempts = 0;
     // Announce the live tab — tabId/url/title are TOP-LEVEL per the frozen wire.
-    s.ws.send(
+    ws.send(
       encodeSessionStart({ tabId: s.tabId, url: s.url, title: s.title })
     );
     console.log("[clarion] relay connected:", RELAY_URL);
@@ -332,6 +338,7 @@ async function teardown(reason) {
     s.attached = false;
   }
 
+  setHudStatus(s.tabId, "ended");
   pushHud(s.tabId, { phase: "session ended", detail: reason, level: "warn" });
   setBadge("·", "info");
   session = null;
@@ -398,6 +405,17 @@ const VOICE_MSG = {
 };
 const OFFSCREEN_TARGET = "offscreen-voice";
 const SW_VOICE_TARGET = "service-worker-voice";
+
+// Browser-side LiveKit connection state → HUD orb status. The agent's own state
+// machine (listening/thinking/speaking) then takes over via the worker's
+// `[agent]` log lines once the room is live; this covers the connect/teardown
+// edges that machine doesn't.
+const VOICE_ORB_STATUS = {
+  connecting: "linking",
+  connected: "listening",
+  error: "error",
+  disconnected: "ended",
+};
 
 /** Resolver for an in-flight mic-permission request, or null. */
 let micGrantResolver = null;
@@ -589,11 +607,18 @@ chrome.runtime.onMessage.addListener((msg) => {
       msg.state === "connected" ? "MIC" : msg.state === "error" ? "ERR" : "·",
       level
     );
+    // Reflect the voice connection on the on-page orb (best-effort; needs a tab).
+    const orb = VOICE_ORB_STATUS[msg.state];
+    if (orb && session && session.tabId != null) setHudStatus(session.tabId, orb);
   } else if (msg.type === VOICE_MSG.LOG) {
-    // Diagnostic line from the offscreen voice doc (mic device + signal). Route
-    // to the on-page HUD if a tab is attached, else just the file sink.
+    // Diagnostic line from the offscreen voice doc (mic device + signal) OR a
+    // worker line forwarded off the clarion-log topic. Route to the on-page HUD if
+    // a tab is attached, else the file sink. Worker lines (msg.fromWorker) are
+    // ALREADY in ext.log via the worker's own POST, so we skip the sink for them
+    // to avoid double-logging — they still render on the HUD.
     const entry = { phase: msg.phase || "voice", detail: msg.detail || "", level: msg.level || "info" };
-    if (session && session.tabId != null) pushHud(session.tabId, entry);
-    else sinkLog(entry);
+    const sink = !msg.fromWorker;
+    if (session && session.tabId != null) pushHud(session.tabId, entry, { sink });
+    else if (sink) sinkLog(entry);
   }
 });
