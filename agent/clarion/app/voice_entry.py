@@ -135,7 +135,13 @@ class StageGraphRunner:
         # starts PENDING (runtime=None) so the AgentSession can greet + listen
         # before the tab relay is up; `bind()` builds the graph once it attaches.
         self._graph = runtime.build_stage_graph() if runtime is not None else None
+        self._thread_base = thread_id
         self._thread_id = thread_id
+        # Bumped when a NEW goal starts a fresh run. A completed goal leaves its
+        # graph at END on its thread; the next goal needs a FRESH thread so the
+        # checkpointer restores nothing (re-seeding the same thread would replay the
+        # END state + concatenate the old audit log). 0 = the first run. See advance().
+        self._run_n = 0
         self._seed = None  # set on first advance
         # The user's CONFIRMED goal — NEVER a baked string. Set via set_goal() from
         # what the user told us and confirmed (the agentic clause, applied to
@@ -195,6 +201,35 @@ class StageGraphRunner:
         sm = await actuator.perceive()
         return readout_from_selector_map(sm)
 
+    def _last_navigation(self) -> Optional[tuple[str, str]]:
+        """``(url_before, url_after)`` of the most recent EXECUTOR step, read from
+        the captured trace (no extra perceive). ``None`` if there's no such entry."""
+        events = (self._last_values or {}).get("trace", []) or []
+        for event in reversed(events):
+            if getattr(event, "node", "") == "EXECUTOR" and getattr(event, "event", "") == "exit":
+                data = getattr(event, "data", None) or {}
+                before, after = data.get("url_before"), data.get("url_after")
+                if before is not None and after is not None:
+                    return (str(before), str(after))
+        return None
+
+    async def navigated_readout(self) -> Optional[str]:
+        """If the just-completed step changed the page URL, return the NEW page's
+        grounded readout — the same content ``read_screen`` would speak — so the
+        page content rides the action's completion instead of waiting for a separate
+        ``read_screen`` tool call. ``None`` when nothing navigated (the caller then
+        speaks its own terminal line). The readout is sourced to real AX nodes, so
+        nothing ungrounded is ever spoken (foundation §1). Best-effort: a read error
+        degrades to ``None`` rather than crashing the turn."""
+        nav = self._last_navigation()
+        if not nav or nav[0] == nav[1]:
+            return None
+        try:
+            readout = await self.describe_page()
+        except Exception:  # noqa: BLE001 - never crash the turn on a read
+            return None
+        return readout.summary or None
+
     @property
     def _cfg(self) -> dict:
         return {"configurable": {"thread_id": self._thread_id}}
@@ -243,6 +278,21 @@ class StageGraphRunner:
         `ConsentRequest` the agent must speak, or None when the run reaches END."""
         from clarion.stages.graph import seed_stage_state
 
+        # A NEW goal arriving while the graph is at END (the prior goal finished —
+        # whether completed or gave-up) must start a FRESH run on a FRESH thread.
+        # Otherwise `ainvoke(None)` below resumes a graph already at END (no pending
+        # work) → returns no interrupt → advance() returns None → a false "Done." and
+        # the new goal is never planned (the single-shot-runner bug). `.next` is the
+        # authoritative parked-vs-END signal (the same one `_drive_kernel` uses for
+        # the inner kernel): a graph PARKED at a consent interrupt has a non-empty
+        # `.next`, so the resume seam (advance → confirm_consent.resume) is untouched.
+        if self._seed is not None and not self._graph.get_state(self._cfg).next:
+            self._run_n += 1
+            self._thread_id = f"{self._thread_base}-{self._run_n}"
+            self._seed = None
+            self._trace_logged = 0
+            self._last_values = None
+
         if self._seed is None:
             page = await self._runtime.actuator.perceive()
             # The goal is the user's CONFIRMED intent (set via set_goal) — NOT a
@@ -252,8 +302,9 @@ class StageGraphRunner:
             )
             result = await self._graph.ainvoke(self._seed, self._cfg)
         else:
-            # An advance after a fresh turn with no pending interrupt is a no-op
-            # (the graph is parked at an interrupt awaiting resume).
+            # `_seed` set AND the graph is parked at a consent interrupt (`.next`
+            # non-empty): an advance() here re-surfaces the same interrupt (the
+            # resume itself goes through confirm_consent → resume()).
             result = await self._graph.ainvoke(None, self._cfg)
         await self._publish()
         self._capture_state()
@@ -352,7 +403,10 @@ def build_voice_tools(runner: StageGraphRunner):
     @function_tool()
     async def confirm_consent(context: RunContext, approved: bool) -> str:
         """Deliver the user's consent decision to the parked task graph. Wrapped in
-        disallow_interruptions so a stray 'um' can't fracture the act (execution §5)."""
+        disallow_interruptions so a stray 'um' can't fracture the act (execution §5).
+        When the approved step NAVIGATES to a new page, the new page's grounded
+        readout is returned (spoken) so the user immediately hears what's there —
+        no separate 'want me to read?' → read_screen round-trip."""
         if not runner.ready:
             return "I'm not connected to your tab yet — one moment."
         decision = ConsentDecision(decision="approve" if approved else "reject")
@@ -361,9 +415,15 @@ def build_voice_tools(runner: StageGraphRunner):
         # on this function-call's speech handle), NOT a context manager.
         context.disallow_interruptions()
         next_req = await runner.resume(decision)
-        if next_req is None:
-            return "Done."
-        return next_req.utterance  # next consequential step's readback
+        if next_req is not None:
+            return next_req.utterance  # next consequential step's readback
+        # END. If this step navigated to a NEW page, auto-inject that page's grounded
+        # readout so the page content rides the consent completion (no extra
+        # read_screen call). No navigation → the plain terminal line.
+        readout = await runner.navigated_readout()
+        if readout is not None:
+            return readout
+        return "Done."
 
     return [read_screen, advance_task, confirm_consent]
 
