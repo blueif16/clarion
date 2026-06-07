@@ -93,8 +93,16 @@ def index_name_for(url: str) -> str:
     return f"clarion-site-{slug}"
 
 
+def is_denied_url(url: str) -> bool:
+    """True if ``url`` matches the destructive/auth denylist (``_DENY``) — a seed or
+    link we refuse to even GET. Public so the auto-index trigger can skip a
+    denylisted SEED (e.g. a ``/logout`` or ``/login`` page the user happens to be on)
+    before starting a crawl."""
+    return any(d in url.lower() for d in _DENY)
+
+
 def _allowed(url: str, origin: str) -> bool:
-    return _same_origin(url, origin) and not any(d in url.lower() for d in _DENY)
+    return _same_origin(url, origin) and not is_denied_url(url)
 
 
 def page_block(readout: PageReadout) -> str:

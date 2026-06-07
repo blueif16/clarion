@@ -22,6 +22,7 @@ This module OWNS only ``clarion/stages/``; it imports kernel + contracts read-on
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from typing import Awaitable, Callable, Literal, Optional
@@ -35,7 +36,7 @@ from langgraph.types import Command, interrupt
 from urllib.parse import urlparse
 
 from clarion.actuator.pipeline import readout_from_selector_map
-from clarion.contracts.events import ConsentDecision
+from clarion.contracts.events import ConsentDecision, ConsentRequest
 from clarion.contracts.ports import Actuator, Memory, Reasoner, Retriever
 from clarion.contracts.state import (
     ClarionState,
@@ -84,12 +85,17 @@ class _StageState(_PlanState, total=False):
     # The recalled past consent decisions (the user-memory reuse hook) — surfaced as
     # an advisory spoken reminder at the gate; NEVER auto-consents.
     consent_recall: list[ConsentRecord]
+    # (node_id -> typed value) of the fields filled during the run — the end-of-flow
+    # "remember?" offer's candidate source (knowledge-layer #4c). Accumulated by the
+    # executor across subgoals/replans; consumed by the ``remember`` node.
+    _filled: dict[str, str]
 
 
 _PLANNER = "planner"
 _EXECUTOR = "executor"
 _RESCUE = "rescue"
 _REPLANNER = "replanner"
+_REMEMBER = "remember"
 
 
 def _trace(node: str, event: str = "info", **data: object) -> TraceEvent:
@@ -156,6 +162,30 @@ async def _paired_facts(actuator: Actuator) -> list[PairedFact]:
 # by the runtime. Always fail-open: a miss returns [] and the planner degrades.
 SiteContext = Callable[[str, str], Awaitable[list[Fact]]]
 
+# An injected, fire-and-forget hook handed the live ORIENT url at PLAN time — the app
+# layer SCHEDULES a background public-structure crawl of the host (the knowledge-layer
+# AUTO-INDEX trigger). Returns quickly, never raises; `None` (default) disables it.
+# Duck-typed so `stages/` imports zero app code (mirrors `SiteContext`); the real impl
+# is `app.auto_index.schedule_auto_index`.
+OrientHook = Callable[[str], object]
+
+# The end-of-flow "remember?" nominator (knowledge-layer #4c). Takes (filled,
+# page) → reusable ``(key, value)`` preference candidates with SECRETS ALREADY
+# SUPPRESSED. ``None`` (default) disables the offer entirely. Injected by the
+# runtime — duck-typed so ``stages/`` imports no ``app/`` code (the real impl wraps
+# ``app.remember.nominate_remember_candidates``, mirroring ``SiteContext``).
+RememberNominate = Callable[[dict[str, str], SelectorMap], list[tuple[str, str]]]
+
+
+def _remember_offer_utterance(candidates: list[tuple[str, str]]) -> str:
+    """Batch the kept candidates into ONE spoken offer (persona: in-command, no
+    banned words). Ends on an explicit yes/no so the consent is unambiguous."""
+    items = "; ".join(f"{k} as {v}" for k, v in candidates)
+    return (
+        f"Before we finish — I can remember {items} for next time. "
+        f"Say yes to keep, or no to forget."
+    )
+
 
 def _with_site_map(orient: PageReadout, site_facts: list[Fact]) -> PageReadout:
     """Return a COPY of the ORIENT readout whose summary carries a SITE MAP block
@@ -200,8 +230,10 @@ def build_stage_graph(
     mode: Literal["normal", "fast"] = "normal",
     max_replans: int = 2,
     site_context: Optional[SiteContext] = None,
+    on_orient: Optional[OrientHook] = None,
     memory: Optional[Memory] = None,
     user_id: str = "default",
+    remember_nominate: Optional[RememberNominate] = None,
 ):
     """Compile the GENERIC EXECUTOR graph.
 
@@ -241,6 +273,15 @@ def build_stage_graph(
         yet / no creds) yields no site facts and the planner runs page-only."""
         sm = state["page_index"]
         orient = await _orient(actuator, sm)
+        # Knowledge-layer AUTO-INDEX trigger: hand the REAL current-page url to the
+        # injected fire-and-forget hook (the app layer schedules a background public
+        # structure crawl of this host). Guarded so a hook error never touches
+        # planning; gated + throttled app-side.
+        if on_orient is not None:
+            try:
+                on_orient(orient.url)
+            except Exception:  # noqa: BLE001 - the warm-up hook is best-effort.
+                pass
         plan_orient = orient
         n_site_facts = 0
         if site_context is not None:
@@ -432,12 +473,41 @@ def build_stage_graph(
         if kernel_new_consent:
             update["consent_log"] = kernel_new_consent
 
+        # End-of-flow "remember?" bookkeeping — ONLY when the offer is active, so a
+        # memory-off run (every frozen test) keeps the executor byte-for-byte. Harvest
+        # the field THIS drive filled: node_id ← the before-map the fill index pointed
+        # into, value ← the acted Action; accumulate across subgoals/replans for the
+        # end-of-flow nominator. Gated on the ACT once-flag so an unacted/rejected
+        # fill is never captured.
+        if remember_nominate is not None:
+            new_filled = dict(state.get("_filled") or {})
+            pp = merged.get("pending_proposal")
+            if (
+                pp is not None
+                and pp.action is not None
+                and pp.action.kind == "fill"
+                and pp.action.index is not None
+                and pp.action.value
+                and any(
+                    e.node == "ACT" and e.data.get("acted_proposal_id") == pp.id
+                    for e in merged["trace"]
+                )
+            ):
+                node = before_map.nodes.get(pp.action.index)
+                if node is not None:
+                    new_filled[node.node_id] = pp.action.value
+            update["_filled"] = new_filled
+
         if advanced:
             update["stage_idx"] = idx + 1
             update["_replan_attempts"] = 0
             update["_rescue_done_for"] = None
-            # Next subgoal (or END if this was the last).
-            goto = _EXECUTOR if idx + 1 < len(subgoals) else END
+            # Next subgoal; on the LAST subgoal, route to the end-of-flow remember
+            # offer when active (no memory without a yes), else straight to END.
+            if idx + 1 < len(subgoals):
+                goto = _EXECUTOR
+            else:
+                goto = _REMEMBER if remember_nominate is not None else END
             return Command(update=update, goto=goto)
 
         # Done-check failed → the replanner (bounded retry).
@@ -501,12 +571,63 @@ def build_stage_graph(
             goto=_EXECUTOR,
         )
 
+    # ---- remember (end-of-flow "remember?" offer — no memory without a yes) ----
+    async def remember(state: _StageState) -> Command:
+        """The consent-gated, end-of-flow preference capture (the third invariant
+        clause). Reached ONLY on a COMPLETED flow when the offer is active. The
+        injected ``remember_nominate`` turns the filled fields into reusable
+        ``(key, value)`` candidates with SECRETS ALREADY SUPPRESSED (a password / OTP
+        / CVV is never even offered); the offer is surfaced as ONE batched
+        ``ConsentRequest`` via ``interrupt()`` — the voice plane speaks it and resumes
+        with the spoken yes/no through the SAME consent loop as every other gate — and
+        the kept candidates are written through the ``Memory`` port ONLY on an
+        explicit "yes" (never on reject/silence). Best-effort: a memory miss is
+        swallowed, never failing the finished run."""
+        candidates = (
+            remember_nominate(dict(state.get("_filled") or {}), state["page_index"])
+            if remember_nominate is not None
+            else []
+        )
+        if not candidates:
+            return Command(goto=END)
+        decision_payload = interrupt(
+            ConsentRequest(
+                proposal_id="remember",
+                utterance=_remember_offer_utterance(candidates),
+                irreversible=False,
+            ).model_dump()
+        )
+        decision = ConsentDecision.model_validate(decision_payload)
+        written = 0
+        if decision.decision == "approve" and memory is not None:
+            for key, value in candidates:
+                try:
+                    await memory.write_preference(user_id, key, value, origin="stated")
+                    written += 1
+                except Exception:  # noqa: BLE001 — a memory miss must never break the run.
+                    pass
+        return Command(
+            update={
+                "trace": [
+                    _trace(
+                        "REMEMBER",
+                        "exit",
+                        offered=len(candidates),
+                        kept=decision.decision == "approve",
+                        written=written,
+                    )
+                ]
+            },
+            goto=END,
+        )
+
     # ---- assemble --------------------------------------------------------
     builder = StateGraph(_StageState)
     builder.add_node(_PLANNER, planner)
     builder.add_node(_EXECUTOR, executor)
     builder.add_node(_RESCUE, rescue)
     builder.add_node(_REPLANNER, replanner)
+    builder.add_node(_REMEMBER, remember)
 
     builder.add_edge(START, _PLANNER)
     # All routing out of planner / executor / rescue / replanner is via Command(goto).

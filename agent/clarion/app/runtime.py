@@ -441,14 +441,42 @@ class HeroRuntime:
 
             site_context = SiteKnowledge().context_facts
 
+        # Knowledge-layer #4(c): the end-of-flow "remember?" offer's nominator —
+        # wraps app.remember's secret-suppressing nomination so stages/ stays app-free
+        # (mirrors site_context). Active ONLY when memory is on (CLARION_MEMORY=1 builds
+        # self.memory); default OFF → the stage graph never reaches the remember node.
+        remember_nominate = None
+        if self.memory is not None and os.environ.get("CLARION_MEMORY") == "1":
+            from clarion.app.remember import nominate_remember_candidates
+
+            def _nominate(filled, page):
+                return [
+                    (c.key, c.value) for c in nominate_remember_candidates(filled, page)
+                ]
+
+            remember_nominate = _nominate
+
+        # Knowledge-layer AUTO-INDEX: when opted in (CLARION_AUTO_INDEX=1, default
+        # OFF), hand the planner a fire-and-forget hook that schedules a background,
+        # read-only PUBLIC structure crawl of the current host (cookie-less → can't
+        # touch the user's private pages; throttled per host; fail-open). Default OFF
+        # keeps the no-network gate + the event-day live worker untouched.
+        on_orient = None
+        if os.environ.get("CLARION_AUTO_INDEX") == "1":
+            from clarion.app.auto_index import schedule_auto_index
+
+            on_orient = schedule_auto_index
+
         return build_stage_graph(
             self.reasoner,
             self.retriever,
             self.actuator,
             mode=self.mode,
             site_context=site_context,
+            on_orient=on_orient,
             memory=self.memory,
             user_id=self.user_id,
+            remember_nominate=remember_nominate,
         )
 
     async def close(self) -> None:
