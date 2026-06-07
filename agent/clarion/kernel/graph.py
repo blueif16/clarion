@@ -96,6 +96,12 @@ _ALLOWED_MSGPACK_MODULES = [
     ("clarion.contracts.state", "StepProposal"),
     ("clarion.contracts.state", "Subgoal"),
     ("clarion.contracts.state", "PairedFact"),
+    # Memory / knowledge-layer recall (the user-memory design): a recalled plan
+    # hint + the consent reminder may ride the executor's private state across a
+    # consent interrupt, so they round-trip through the checkpointer too.
+    ("clarion.contracts.state", "WorkflowEpisode"),
+    ("clarion.contracts.state", "ConsentRecord"),
+    ("clarion.contracts.state", "Recall"),
 ]
 
 Mode = Literal["normal", "fast"]
