@@ -261,10 +261,19 @@ class MossClient:
         top_k: int = 5,
         embedding: Optional[Sequence[float]] = None,
         alpha: float = 0.8,
+        filter: Optional[dict] = None,
     ) -> MossSearch:
         """Run a semantic search. If the index was ``load_index``-ed, this runs
         locally (~1-10 ms). When ``embedding`` is supplied (custom-embedding
-        index) the runtime never needs the moss-minilm model host."""
+        index) the runtime never needs the moss-minilm model host.
+
+        ``filter`` is a Moss metadata predicate (operators ``$eq``/``$ne``/``$gt``/
+        ``$gte``/``$lt``/``$lte``/``$in``/``$nin``/``$near``, composable with
+        ``$and``/``$or``) — e.g. ``{"field": "site", "condition": {"$eq": host}}`` —
+        used to partition ONE category index by metadata instead of one index per
+        tenant (see ``docs/research/moss-index-design.md``). Moss evaluates the
+        filter ONLY on a locally ``load_index``-ed index (the cloud query API drops
+        it with a warning); every Clarion query path loads first, so this holds."""
         from moss import QueryOptions
 
         sdk = self._ensure()
@@ -272,6 +281,7 @@ class MossClient:
             top_k=top_k,
             alpha=alpha,
             embedding=list(embedding) if embedding is not None else None,
+            filter=filter,
         )
         sr = await sdk.query(name, query, opts)
         hits = [
