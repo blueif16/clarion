@@ -15,11 +15,28 @@ from __future__ import annotations
 from clarion.contracts.state import (
     ConsentRecord,
     Fact,
+    PageReadout,
     Recall,
     Subgoal,
     WorkflowEpisode,
 )
 from clarion.fakes.adapters import FakeMemory
+from clarion.stages.planner import plan_goal
+
+
+class _RecordingReasoner:
+    """Captures the goal text ``plan_goal`` forwards, to prove the recalled hint
+    reaches the LLM via the goal (the Reasoner ABC stays unchanged)."""
+
+    def __init__(self) -> None:
+        self.seen_goal = ""
+
+    async def plan_goal(self, goal, orient, affordances):
+        self.seen_goal = goal
+        return [Subgoal(description="do it")]
+
+    async def decide_step(self, *args, **kwargs):  # unused here
+        raise NotImplementedError
 
 
 def _flatten_keys(obj: object) -> set:
@@ -111,3 +128,27 @@ async def test_default_memory_is_noop_when_unused():
     assert prof.facts == [] and prof.preferences == {} and prof.episodes == []
     r = await m.recall("nobody", goal="anything", url_host="x")
     assert r.plan_hint is None and r.preferences == {}
+
+
+async def test_prior_plan_hint_reaches_reasoner_via_goal():
+    # The reuse path: a recalled episode's plan is folded into the goal the
+    # Reasoner sees, WITHOUT changing the frozen Reasoner ABC.
+    reasoner = _RecordingReasoner()
+    hint = WorkflowEpisode(
+        goal="g",
+        url_host="www.usa.gov",
+        subgoals=[Subgoal(description="open the finder"), Subgoal(description="read the result")],
+    )
+    out = await plan_goal(
+        reasoner, "find my benefits", PageReadout(), [], prior_plan_hint=hint
+    )
+    assert out and out[0].description == "do it"
+    assert "find my benefits" in reasoner.seen_goal
+    assert "open the finder" in reasoner.seen_goal
+    assert "read the result" in reasoner.seen_goal
+
+
+async def test_no_hint_leaves_goal_unchanged():
+    reasoner = _RecordingReasoner()
+    await plan_goal(reasoner, "pay my bill", PageReadout(), [], prior_plan_hint=None)
+    assert reasoner.seen_goal == "pay my bill"

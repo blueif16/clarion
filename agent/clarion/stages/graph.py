@@ -32,12 +32,15 @@ from langgraph.constants import END, START
 from langgraph.graph import StateGraph
 from langgraph.types import Command, interrupt
 
+from urllib.parse import urlparse
+
 from clarion.actuator.pipeline import readout_from_selector_map
 from clarion.contracts.events import ConsentDecision
-from clarion.contracts.ports import Actuator, Reasoner, Retriever
+from clarion.contracts.ports import Actuator, Memory, Reasoner, Retriever
 from clarion.contracts.state import (
     ClarionState,
     Consent,
+    ConsentRecord,
     Fact,
     PageReadout,
     PairedFact,
@@ -78,6 +81,9 @@ class _StageState(_PlanState, total=False):
     # baseline) and the URL/anchor at that point.
     _before_map: Optional[SelectorMap]
     _anchor: Optional[str]
+    # The recalled past consent decisions (the user-memory reuse hook) — surfaced as
+    # an advisory spoken reminder at the gate; NEVER auto-consents.
+    consent_recall: list[ConsentRecord]
 
 
 _PLANNER = "planner"
@@ -98,6 +104,15 @@ def _trace_key(e: TraceEvent) -> tuple:
 
 def _consent_key(c: Consent) -> tuple:
     return (c.proposal_id, c.decision, c.value, c.at)
+
+
+def _host_of(url: Optional[str]) -> str:
+    """The registrable host of a URL (the episode recall scope key). Best-effort —
+    a blank/garbage URL just yields ``""`` (recall is by goal semantics anyway)."""
+    try:
+        return (urlparse(url or "").hostname or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def make_stage_checkpointer() -> InMemorySaver:
@@ -185,6 +200,8 @@ def build_stage_graph(
     mode: Literal["normal", "fast"] = "normal",
     max_replans: int = 2,
     site_context: Optional[SiteContext] = None,
+    memory: Optional[Memory] = None,
+    user_id: str = "default",
 ):
     """Compile the GENERIC EXECUTOR graph.
 
@@ -234,26 +251,47 @@ def build_stage_graph(
             if site_facts:
                 n_site_facts = len(site_facts)
                 plan_orient = _with_site_map(orient, site_facts)
+
+        # Knowledge-layer #4(c): RECALL the nearest past EPISODE on this goal to
+        # warm-start the plan (the user-memory reuse hook). Advisory ONLY — the hint
+        # rides into ``plan_goal`` as ``prior_plan_hint`` and the Reasoner re-grounds
+        # against the live page; a remembered value is never spoken without being
+        # re-grounded (``recall`` returns a ``Recall``, never a ``Fact``). Opt-in
+        # (live) via CLARION_MEMORY=1; fail-open so recall never breaks planning.
+        recall = None
+        if memory is not None and os.environ.get("CLARION_MEMORY") == "1":
+            try:
+                recall = await memory.recall(user_id, state["goal"], _host_of(orient.url))
+            except Exception:  # noqa: BLE001 — recall is advisory; never break planning.
+                recall = None
+        prior_plan_hint = recall.plan_hint if recall else None
+
         subgoals = await plan_goal(
-            reasoner, state["goal"], plan_orient, list(orient.affordances)
+            reasoner,
+            state["goal"],
+            plan_orient,
+            list(orient.affordances),
+            prior_plan_hint=prior_plan_hint,
         )
-        return Command(
-            update={
-                "subgoals": subgoals,
-                "stage_idx": 0,
-                "trace": [
-                    _trace(
-                        "PLANNER",
-                        "exit",
-                        n_subgoals=len(subgoals),
-                        n_site_facts=n_site_facts,
-                        plan=[s.description for s in subgoals],
-                        utterance=verbalize_subgoals(subgoals),
-                    )
-                ],
-            },
-            goto=_EXECUTOR,
-        )
+        update: dict = {
+            "subgoals": subgoals,
+            "stage_idx": 0,
+            "trace": [
+                _trace(
+                    "PLANNER",
+                    "exit",
+                    n_subgoals=len(subgoals),
+                    n_site_facts=n_site_facts,
+                    recalled=bool(prior_plan_hint),
+                    plan=[s.description for s in subgoals],
+                    utterance=verbalize_subgoals(subgoals),
+                )
+            ],
+        }
+        # Stash the recalled consent decisions for the gate's spoken reminder.
+        if recall is not None and recall.consent_recall:
+            update["consent_recall"] = list(recall.consent_recall)
+        return Command(update=update, goto=_EXECUTOR)
 
     async def _drive_kernel(state: _StageState, subgoal: Subgoal, idx: int) -> dict:
         """Run the K1 kernel loop for ONE subgoal over the shared state, driving it

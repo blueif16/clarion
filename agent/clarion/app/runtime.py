@@ -36,7 +36,7 @@ import os
 import time
 from typing import Any, Callable, Literal, Optional
 
-from clarion.contracts.ports import Actuator, Reasoner, Retriever
+from clarion.contracts.ports import Actuator, Memory, Reasoner, Retriever
 from clarion.contracts.state import ClarionState, Fact
 from clarion.instrument.baseline import COLD_RAG_BASELINE_MS
 from clarion.instrument.publisher import to_panel_state
@@ -301,6 +301,8 @@ class HeroRuntime:
         reasoner: Reasoner,
         kb_retriever: Optional[Retriever] = None,
         kb_live: bool = True,
+        memory: Optional[Memory] = None,
+        user_id: str = "default",
     ) -> None:
         self.actuator = actuator
         self.retriever = retriever
@@ -313,6 +315,10 @@ class HeroRuntime:
         # The Moss-backed KB retriever (live) or the offline cached replay (demo).
         self.kb_retriever = kb_retriever
         self.kb_live = kb_live
+        # The Moss-backed user-memory store (the knowledge layer): the run's
+        # episode write-back + the planner's recall. None when memory is off.
+        self.memory = memory
+        self.user_id = user_id
 
     @classmethod
     async def create(
@@ -327,6 +333,8 @@ class HeroRuntime:
         kb_retriever: Optional[Retriever] = None,
         actuator: Optional[Actuator] = None,
         reasoner: Optional[Reasoner] = None,
+        memory: Optional[Memory] = None,
+        user_id: str = "default",
     ) -> "HeroRuntime":
         """Build the runtime over the live demo site.
 
@@ -379,6 +387,13 @@ class HeroRuntime:
             from clarion.adapters.minimax_reasoner import MinimaxReasoner
 
             reasoner = MinimaxReasoner()
+        # The user-memory store (the knowledge layer). Opt-in (live) via
+        # CLARION_MEMORY=1 — default None keeps memory off and the no-network gate
+        # untouched. An explicit ``memory`` (tests inject FakeMemory) overrides.
+        if memory is None and os.environ.get("CLARION_MEMORY") == "1":
+            from clarion.retrieval.memory_moss import MossMemory
+
+            memory = MossMemory(user_id=user_id)
         publisher = PanelPublisher(room=room, retriever=timed, sink=panel_sink)
         return cls(
             actuator=actuator,
@@ -388,6 +403,8 @@ class HeroRuntime:
             reasoner=reasoner,
             kb_retriever=kb,
             kb_live=not demo,
+            memory=memory,
+            user_id=user_id,
         )
 
     async def kb_beat(self, *, page_late_fee_present: bool = False):
@@ -430,6 +447,8 @@ class HeroRuntime:
             self.actuator,
             mode=self.mode,
             site_context=site_context,
+            memory=self.memory,
+            user_id=self.user_id,
         )
 
     async def close(self) -> None:
