@@ -10,9 +10,10 @@ The point of this suite is to prove the §4 perception pipeline is
      into ``ExtensionActuator`` via a ``FakeRelay``, and assert an identical
      sequence of ``(index, role, name, bbox)``.
   C. **Act correctness** — ``FakeRelay`` records the exact CDP traffic each act
-     produces (native-setter ``Runtime.evaluate``; press+release
-     ``Input.dispatchMouseEvent``; ``Page.navigate``; read ``Runtime.evaluate``),
-     and ``perceive`` over the fake stays under the 2000-token budget.
+     produces (native-setter ``Runtime.evaluate``; click = scroll-into-view +
+     viewport-quad ``Input.dispatchMouseEvent`` press+release, by backend id;
+     ``Page.navigate``; read ``Runtime.evaluate``), and ``perceive`` over the fake
+     stays under the 2000-token budget.
   D. **Live wire round-trip** (``@pytest.mark.live``) — stand up the real
      ``WebSocketCdpRelay`` loopback server, connect a tiny in-test fake
      "extension" WS client that answers ``cdp`` requests per the FROZEN protocol,
@@ -130,6 +131,15 @@ def _make_replay_relay(captured: dict[str, dict]) -> FakeRelay:
         # reports ok so fill is observed as successful.
         if method == "Runtime.evaluate":
             return {"result": {"value": {"ok": True, "value": "x"}}}
+        if method == "DOM.scrollIntoViewIfNeeded":
+            return {}
+        if method == "DOM.getContentQuads":
+            # One quad whose centre is (60, 40) — the click target.
+            return {"quads": [[10.0, 20.0, 110.0, 20.0, 110.0, 60.0, 10.0, 60.0]]}
+        if method == "DOM.resolveNode":
+            return {"object": {"objectId": "obj-1"}}
+        if method == "Runtime.callFunctionOn":
+            return {}
         if method == "Input.dispatchMouseEvent":
             return {}
         if method == "Page.navigate":
@@ -247,22 +257,36 @@ async def test_act_fill_sends_native_setter(acted):
 
 
 @pytest.mark.asyncio
-async def test_act_click_sends_press_release_at_center(acted):
-    """(C) click issues mousePressed then mouseReleased at the node's bbox center."""
+async def test_act_click_scrolls_then_clicks_quad_centre(acted):
+    """(C) click is identity-targeted by AX backendDOMNodeId, never by a stored
+    bbox: it scrolls the node into view, asks the browser for its live viewport
+    quads, and presses+releases at the quad centre (the canned quad centres on
+    60, 40). This is the document-vs-viewport coordinate fix."""
     ext, relay, sm = acted
     idx = next(iter(sm.nodes))
-    bbox = sm.nodes[idx].bbox
-    cx = bbox[0] + bbox[2] / 2.0
-    cy = bbox[1] + bbox[3] / 2.0
+    backend_id = ext._index_to_backend_id[idx]
     relay.sent.clear()
     await ext.act(Action(kind="click", index=idx))
 
+    methods = [m for (m, _p) in relay.sent]
+    # Both the scroll-into-view and the quad query target the node by backend id —
+    # no absolute-layout coordinate is computed on our side.
+    assert "DOM.scrollIntoViewIfNeeded" in methods
+    scroll_p = next(p for (m, p) in relay.sent if m == "DOM.scrollIntoViewIfNeeded")
+    assert scroll_p["backendNodeId"] == backend_id
+    quads_p = next(p for (m, p) in relay.sent if m == "DOM.getContentQuads")
+    assert quads_p["backendNodeId"] == backend_id
+    # press THEN release at the browser-reported viewport quad centre.
     mouse = [p for (m, p) in relay.sent if m == "Input.dispatchMouseEvent"]
     assert len(mouse) >= 2, "click should press AND release"
     assert mouse[0]["type"] == "mousePressed"
     assert mouse[1]["type"] == "mouseReleased"
     for ev in mouse[:2]:
-        assert ev["x"] == cx and ev["y"] == cy
+        assert ev["x"] == 60.0 and ev["y"] == 40.0
+    # The scroll + quad query happen BEFORE the dispatch (scroll-then-measure).
+    assert methods.index("DOM.getContentQuads") < methods.index(
+        "Input.dispatchMouseEvent"
+    )
 
 
 @pytest.mark.asyncio

@@ -21,7 +21,8 @@ Pipeline (execution §4.1 — same as the Playwright transport):
 Acting (execution §4.3):
   - ``fill``     → ``Runtime.evaluate`` of the shared ``_NATIVE_SETTER_JS`` with
     ``{clarionId, value}`` (``returnByValue: true``).
-  - ``click``    → ``Input.dispatchMouseEvent`` press + release at the bbox center.
+  - ``click``    → ``cdp_click_by_backend`` (scroll into view → viewport quads →
+    trusted ``Input.dispatchMouseEvent`` press+release at the quad centre).
   - ``navigate`` → ``Page.navigate`` with the url.
   - ``read``     → ``Runtime.evaluate`` of the shared ``_READ_JS`` by clarion id.
   - After every act we re-perceive (CONFIRM reads the new tree).
@@ -44,6 +45,7 @@ from clarion.actuator.pipeline import (
     _READ_JS,
     ax_node_geometry,
     build_candidates,
+    cdp_click_by_backend,
     containment_filter,
     diff_maps,
     estimate_tokens,
@@ -88,7 +90,8 @@ class ExtensionActuator(Actuator):
         self._index_to_clarion_id: dict[int, str] = {}
         # index -> backend node id (in hand from perceive; the input to lazy stamp).
         self._index_to_backend_id: dict[int, int] = {}
-        # index -> bbox [x,y,w,h] for coordinate clicks.
+        # index -> bbox [x,y,w,h] for perception/readout + the DeliveryGate's
+        # freshness re-check. NOT a click target — clicks resolve by backend id.
         self._index_to_bbox: dict[int, list[float]] = {}
         # index -> stable node_id (so a fill can record WHICH node it filled).
         self._index_to_node_id: dict[int, str] = {}
@@ -316,25 +319,20 @@ class ExtensionActuator(Actuator):
                 success=False,
                 detail="click requires index",
             )
-        bbox = self._index_to_bbox.get(action.index)
-        if bbox is None:
+        backend_id = self._index_to_backend_id.get(action.index)
+        if backend_id is None:
             return Observation(
                 selector_map=await self.perceive(),
                 success=False,
                 detail=f"no element for index {action.index}",
             )
-        # Click the bbox center — a paint-order-honest, real user click (press +
-        # release), matching PlaywrightActuator's mouse.click but over raw CDP.
-        cx = bbox[0] + bbox[2] / 2.0
-        cy = bbox[1] + bbox[3] / 2.0
-        common = {"x": cx, "y": cy, "button": "left", "clickCount": 1}
-        await self._relay.send(
-            "Input.dispatchMouseEvent", {"type": "mousePressed", **common}
+        # Identity-targeted, coordinate-free: the browser scrolls the node into
+        # view and reports its live viewport quads — a real (trusted) click on the
+        # actually-visible element. Shared verbatim with PlaywrightActuator.
+        ok, detail = await cdp_click_by_backend(self._relay.send, backend_id)
+        return Observation(
+            selector_map=await self.perceive(), success=ok, detail=detail
         )
-        await self._relay.send(
-            "Input.dispatchMouseEvent", {"type": "mouseReleased", **common}
-        )
-        return Observation(selector_map=await self.perceive(), success=True)
 
     async def _do_navigate(self, action: Action) -> Observation:
         if not action.value:

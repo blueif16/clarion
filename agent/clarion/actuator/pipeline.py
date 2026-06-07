@@ -22,7 +22,7 @@ perception logic below is shared verbatim. No provider import lives here.
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from clarion.contracts.state import (
     AxNode,
@@ -171,6 +171,88 @@ _NODE_STATE_JS = """
   };
 }
 """
+
+
+# A CDP transport: send one command + params, get its result dict. Both real
+# Actuator transports expose this identical surface — Playwright's
+# ``CDPSession.send`` and the ``CdpRelay.send`` — so the click below is shared
+# verbatim (the kernel never sees it).
+CdpSend = Callable[[str, dict], Awaitable[dict]]
+
+
+async def cdp_click_by_backend(send: CdpSend, backend_id: int) -> tuple[bool, str]:
+    """Click a node by its AX-tree ``backendDOMNodeId`` over any CDP transport.
+
+    Identity-targeted and coordinate-free at OUR layer — we never compute a point
+    from a stored bbox (the old bug: DOMSnapshot ``bounds`` are document-absolute,
+    but ``Input.dispatchMouseEvent`` is viewport-relative, so an off-screen card
+    link was clicked at empty space). Instead the BROWSER does the work, in the
+    exact order Playwright's ``locator.click`` documents:
+
+      1. ``DOM.scrollIntoViewIfNeeded`` — bring the node into the viewport.
+      2. ``DOM.getContentQuads``        — its live quads, **relative to viewport**
+         (CDP's words) — the same space ``Input.dispatchMouseEvent`` wants, so no
+         scroll/DPR math is ever done here.
+      3. ``Input.dispatchMouseEvent`` press+release at the quad centre — a real,
+         trusted click on the actually-visible element.
+
+    Fallback (a node with no content box — zero-area but activable, SVG, etc.):
+    resolve it and call its own ``.click()`` after ``scrollIntoView`` — synthetic
+    but correct. Returns ``(ok, detail)``.
+
+    Shared verbatim by ``PlaywrightActuator`` (``self._cdp.send``) and
+    ``ExtensionActuator`` (``self._relay.send``), so the autonomous Playwright
+    proof exercises the SAME click path the extension product runs.
+    """
+    # (1) Scroll into view — best-effort; a node that can't scroll (detached) is
+    # caught by the empty-quads / unresolvable check below, never silently passed.
+    try:
+        await send("DOM.scrollIntoViewIfNeeded", {"backendNodeId": backend_id})
+    except Exception:  # noqa: BLE001 - non-fatal; quads/resolve decide success
+        pass
+
+    # (2) Trusted click at the browser-reported viewport centre.
+    quads: list = []
+    try:
+        res = await send("DOM.getContentQuads", {"backendNodeId": backend_id})
+        quads = res.get("quads") or []
+    except Exception:  # noqa: BLE001 - fall through to the .click() fallback
+        quads = []
+    if quads:
+        q = quads[0]  # [x1,y1,x2,y2,x3,y3,x4,y4], clockwise (DOM.Quad)
+        cx = (q[0] + q[2] + q[4] + q[6]) / 4.0
+        cy = (q[1] + q[3] + q[5] + q[7]) / 4.0
+        await send(
+            "Input.dispatchMouseEvent",
+            {"type": "mousePressed", "x": cx, "y": cy,
+             "button": "left", "buttons": 1, "clickCount": 1},
+        )
+        await send(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseReleased", "x": cx, "y": cy,
+             "button": "left", "buttons": 0, "clickCount": 1},
+        )
+        return True, ""
+
+    # (3) Fallback: the element has no content quads → activate it directly.
+    try:
+        node = await send("DOM.resolveNode", {"backendNodeId": backend_id})
+        object_id = (node.get("object") or {}).get("objectId")
+        if not object_id:
+            return False, f"node {backend_id} has no content box and is unresolvable"
+        await send(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": (
+                    "function(){ this.scrollIntoView({block:'center',"
+                    "inline:'center'}); this.click(); }"
+                ),
+            },
+        )
+        return True, "fallback:el.click()"
+    except Exception as exc:  # noqa: BLE001 - report the real reason, never guess
+        return False, f"click failed for node {backend_id}: {exc}"
 
 
 class _LayoutRect:
