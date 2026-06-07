@@ -26,6 +26,14 @@ built + verified (Gemini custom embeds, ~1ms in-mem). PyTorch advisory silenced
 This is the single source of truth for **where we are and what's left**. Keep it
 current: when you finish or change something, edit this file in the same commit.
 
+**Competitive landscape** (scanned 2026-06-06): the exact niche — a blind-first voice
+co-pilot *extension* — has **no product with traction** (closest rivals are single-digit-
+install demos: Phantom 6, YourVoice 28). Real alternatives are apps/services (Be My Eyes
+~1M, Aira) and agentic browsers (Comet/Atlas/Neon — which already ship *soft* consent +
+citation). Clarion's edge = those as a **hard invariant**, AXTree-first (rivals are
+vision/coordinate-first → can't cite their source). Full scan + install counts:
+`research/chrome-extension-competitors-2026-06-06.md`.
+
 ---
 
 ## TL;DR (the one paragraph)
