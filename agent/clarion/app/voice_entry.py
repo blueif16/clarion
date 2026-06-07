@@ -41,7 +41,9 @@ Run:  .venv/bin/python -m clarion.app.voice_entry console   (LiveKit text/voice 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import urllib.request
 from typing import Optional
 
 from langgraph.types import Command
@@ -52,6 +54,43 @@ from clarion.contracts.events import ConsentDecision, ConsentRequest
 from clarion.contracts.state import PageReadout
 
 _AGENT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# --- unified voice-log fan-out -------------------------------------------------
+# Worker voice logs go three places so BOTH a human and an agent can debug live
+# without copy-pasting out of DevTools:
+#   1. stdout            → /tmp/clarion-worker.log (the worker's own log)
+#   2. the browser sink  → /tmp/clarion-ext.log    (the SAME file the extension
+#                          POSTs to — one unified `tail -f` stream)
+#   3. LiveKit room data → the offscreen doc → service worker → on-page HUD panel
+# All three are best-effort and never block or break a turn.
+_SINK_URL = os.environ.get("CLARION_LOGSINK", "http://127.0.0.1:8772/log")
+
+
+def _sink_post(line: str) -> None:
+    """Blocking POST to the browser-log sink (run in an executor — NEVER on the
+    event loop). Mirrors hud.js `sinkLog` so worker + extension logs share one
+    file. Silent on any failure (the sink may simply be down)."""
+    try:
+        req = urllib.request.Request(
+            _SINK_URL,
+            data=line.encode("utf-8"),
+            headers={"Content-Type": "text/plain"},
+        )
+        urllib.request.urlopen(req, timeout=0.5).close()
+    except Exception:  # noqa: BLE001 - logging must never raise
+        pass
+
+
+async def _publish_hud(room, entry: dict) -> None:
+    """Publish one log entry as LiveKit room data on the `clarion-log` topic. The
+    offscreen voice doc forwards it to the service worker, which renders it on the
+    on-page HUD (the same path the browser's own `voice.log` lines take)."""
+    try:
+        await room.local_participant.publish_data(
+            json.dumps(entry), reliable=True, topic="clarion-log"
+        )
+    except Exception:  # noqa: BLE001 - HUD mirroring must never break a turn
+        pass
 
 # LiveKit plugins register their Plugin singletons at import on the MAIN thread
 # (the worker forks jobs onto other threads and rejects off-main-thread
@@ -363,16 +402,32 @@ async def entrypoint(ctx) -> None:
         Agent,
         AgentSession,
         UserInputTranscribedEvent,
-        UserStateChangedEvent,
     )
 
     from clarion.adapters.minimax_synthesizer import MinimaxSynthesizer
     from clarion.app.extension_runtime import extension_actuator_selected
     from clarion.app.runtime import HeroRuntime
 
+    def _fanout(line: str) -> None:
+        """stdout (worker.log) + the browser sink (ext.log), offloaded so the
+        event loop never blocks on the HTTP POST."""
+        print(f"  {line}", flush=True)
+        try:
+            asyncio.get_running_loop().run_in_executor(None, _sink_post, line)
+        except RuntimeError:  # no running loop (shouldn't happen inside entrypoint)
+            pass
+
     def loop(msg: str) -> None:
-        """One observable line per loop phase — tail /tmp/clarion-worker.log."""
-        print(f"  [loop] {msg}", flush=True)
+        """One observable line per loop phase → worker.log + the unified ext.log."""
+        _fanout(f"[loop] {msg}")
+
+    def hud(phase: str, detail: str = "", level: str = "info") -> None:
+        """An IMPORTANT voice-conversation line: worker.log + the unified ext.log
+        AND the on-page extension HUD panel (room data → offscreen → service
+        worker → overlay), so the whole turn is visible without DevTools."""
+        _fanout(f"{level.upper()} | {phase}" + (f" | {detail}" if detail else ""))
+        if getattr(ctx, "room", None) is not None:
+            _spawn(_publish_hud(ctx.room, {"phase": phase, "detail": detail, "level": level}))
 
     await ctx.connect()
     loop("dispatched + connected to the room")
@@ -391,30 +446,85 @@ async def entrypoint(ctx) -> None:
     session = AgentSession(
         stt=_deepgram.STT(
             model=os.environ.get("STT_MODEL", "nova-3"),
-            language="en-US",
+            # Single-stream Deepgram can't code-switch EN+Chinese: `multi` excludes
+            # Chinese, Chinese needs a dedicated `zh-*` model. So language is a knob —
+            # default en-US (the demo language); set STT_LANGUAGE=zh-CN to capture
+            # Mandarin (English then degrades), or =multi for EN+EU/JA code-switching.
+            language=os.environ.get("STT_LANGUAGE", "en-US"),
+            # smart_format = punctuation + dates/numbers/currency formatting (the
+            # gov-form domain: amounts, SSNs, dates) — cleaner text for the LLM.
+            smart_format=True,
+            # endpointing = ms of trailing silence before a segment is finalized. The
+            # plugin default (25ms) finalizes on micro-pauses, so halting speech split
+            # mid-word ("the s" / "r model") into many tiny finals. Raising it keeps a
+            # brief mid-sentence pause from cutting the utterance; the EOU turn detector
+            # still decides the real end of turn. Tune via STT_ENDPOINTING_MS.
+            endpointing_ms=int(os.environ.get("STT_ENDPOINTING_MS", "300")),
             api_key=os.environ["DEEPGRAM_API_KEY"],
         ),
-        # MiniMax-M3 via the LiveKit minimax plugin (reads MINIMAX_API_KEY /
-        # MINIMAX_GROUP_ID from env — no explicit api_key kwarg needed).
-        llm=_minimax.LLM(model=os.environ.get("MINIMAX_LLM_MODEL", "MiniMax-M3")),
+        # MiniMax-M3 via the LiveKit minimax plugin, pinned to the io-region host.
+        llm=_build_llm(),
         tts=_build_audio_tts(),
         vad=vad or _silero.VAD.load(),
         turn_detection=_MultilingualModel() if _MultilingualModel else None,
     )
     agent = Agent(instructions=_INSTRUCTIONS, tools=tools)
 
-    # ASR observability: log EXACTLY what the STT heard (and when the user is
-    # detected speaking at all), so a dead/wrong mic is obvious in the worker log
-    # — these are the [asr] lines to grep when "the panel shows nothing heard".
+    # ───────────────────────── voice-conversation observability ─────────────────
+    # The WHOLE turn is logged: what the mic/STT HEARD, the agent's state machine
+    # (listening → thinking[LLM] → speaking[TTS]), each conversation item, every
+    # tool call + output, latency metrics, and errors. IMPORTANT lines go to the
+    # on-page HUD panel via hud(); high-frequency lines (partials, metrics) stay in
+    # the files via loop(). Grep [asr]/[agent]/[tool]/[error] in the worker log or
+    # the unified /tmp/clarion-ext.log.
+
     @session.on("user_input_transcribed")
     def _on_heard(ev: UserInputTranscribedEvent) -> None:
-        tag = "HEARD ✓ final" if getattr(ev, "is_final", False) else "heard… partial"
-        loop(f"[asr] {tag}: {ev.transcript!r}")
+        if getattr(ev, "is_final", False):
+            hud("[asr] HEARD ✓", repr(ev.transcript), "ok")  # mic → STT confirmed
+        # else: partial transcripts are high-frequency noise — silenced. Re-enable
+        # `loop(f"[asr] heard… partial: {ev.transcript!r}")` here for STT debugging.
 
-    @session.on("user_state_changed")
-    def _on_user_state(ev: UserStateChangedEvent) -> None:
-        # 'speaking' = mic audio is reaching the agent's VAD (independent of STT).
-        loop(f"[asr] user {ev.new_state}")
+    # 'speaking'/'listening' toggles fire on every VAD edge — high-frequency noise.
+    # Silenced (handler left unregistered). Re-enable by re-adding the @session.on
+    # below and `hud("[asr] user", ev.new_state)` for VAD-vs-STT debugging.
+
+    @session.on("agent_state_changed")
+    def _on_agent_state(ev) -> None:  # noqa: ANN001 - loosely typed LiveKit event
+        # initializing → listening → thinking (LLM decode) → speaking (TTS).
+        old, new = getattr(ev, "old_state", "?"), getattr(ev, "new_state", "?")
+        hud("[agent]", f"{old} → {new}", "info")
+
+    @session.on("conversation_item_added")
+    def _on_item(ev) -> None:  # noqa: ANN001
+        item = getattr(ev, "item", None)
+        role = getattr(item, "role", "?")
+        text = (getattr(item, "text_content", "") or "").strip()
+        if text:
+            hud(f"[turn] {role}", text[:240], "info")
+
+    @session.on("function_tools_executed")
+    def _on_tools(ev) -> None:  # noqa: ANN001 - the LLM's tool decisions this turn
+        for fc in getattr(ev, "function_calls", None) or []:
+            name = getattr(fc, "name", "?")
+            args = getattr(fc, "arguments", "")
+            hud("[tool] →", f"{name}({args})"[:240], "info")
+        for out in getattr(ev, "function_call_outputs", None) or []:
+            hud("[tool] ←", str(getattr(out, "output", ""))[:240], "ok")
+
+    # Per-frame VAD/STT metrics (VADMetrics, STTMetrics duration=0.00, …) are the
+    # bulk of the log noise — silenced (handler left unregistered). When profiling
+    # the <800ms turn budget, re-add @session.on("metrics_collected") and log only
+    # the meaningful latency fields (ttft/ttfb/duration) so the spam stays gone.
+
+    @session.on("error")
+    def _on_error(ev) -> None:  # noqa: ANN001 - LLM/TTS/STT failures surface here
+        src = getattr(ev, "source", "")
+        hud("[error]", f"{src}: {getattr(ev, 'error', ev)!r}"[:240], "err")
+
+    @session.on("close")
+    def _on_close(ev) -> None:  # noqa: ANN001
+        hud("[close]", f"reason={getattr(ev, 'reason', None)}", "warn")
 
     # *** The agent's ears turn ON here — BEFORE the tab relay. Speak → heard. ***
     await session.start(agent=agent, room=ctx.room)
@@ -486,15 +596,140 @@ async def entrypoint(ctx) -> None:
     _spawn(greet_then_sim())
 
 
-def _build_audio_tts():
-    """The LiveKit audio-output TTS plugin: MiniMax Speech 2.6-turbo (reads
-    MINIMAX_API_KEY / MINIMAX_GROUP_ID from env). The kernel-facing live TTS is the
-    streaming `MinimaxSynthesizer`. Model + voice come from env (no swaps)."""
-    from livekit.plugins import minimax
+def _build_llm():
+    """The voice LLM: MiniMax M-series via the **Anthropic-compatible gateway**
+    (`https://api.minimax.io/anthropic`), using the LiveKit `anthropic` plugin.
 
-    return minimax.TTS(
-        model=os.environ.get("MINIMAX_TTS_MODEL", "speech-2.6-turbo"),
-        voice=os.environ.get("MINIMAX_TTS_VOICE", "Friendly_Person"),
+    Why the Anthropic gateway, not the OpenAI `/v1` one:
+    - NATIVE THINKING: `MiniMax-M3` is a reasoning model. On the OpenAI gateway its
+      reasoning leaks as `<think>…</think>` into `content`, and the `reasoning_split`
+      workaround returned EMPTY spoken content. The Anthropic Messages API returns
+      reasoning as first-class `thinking` blocks; the plugin's stream parser only
+      emits `text_delta` (the answer) + tool calls and drops `thinking_delta`, so the
+      reasoning is NEVER spoken — no monkeypatch, no empty-content edge.
+    - The intermittent `500 "unknown error (1000)"` is a MiniMax-side 5xx under load
+      (both gateways front the same models). `FallbackAdapter` cushions a single-model
+      blip; a whole-backend wobble still needs a real provider fallback (future).
+
+    Env: MINIMAX_API_KEY (auth) · MINIMAX_ANTHROPIC_BASE_URL (gateway) ·
+    MINIMAX_LLM_MODEL (default `MiniMax-M3`) · MINIMAX_LLM_MODEL_FALLBACK
+    (default `MiniMax-M2.7`, `off` to disable) · MINIMAX_LLM_MAX_TOKENS (default 2048
+    — the plugin's 1024 default is shared with M3's thinking budget and can truncate
+    answers) · MINIMAX_LLM_ATTEMPT_TIMEOUT."""
+    from livekit.plugins import anthropic
+
+    api_key = os.environ["MINIMAX_API_KEY"]
+    base_url = os.environ.get("MINIMAX_ANTHROPIC_BASE_URL", "https://api.minimax.io/anthropic")
+    max_tokens = int(os.environ.get("MINIMAX_LLM_MAX_TOKENS", "2048"))
+
+    def _mk(model: str):
+        return anthropic.LLM(
+            model=model, api_key=api_key, base_url=base_url, max_tokens=max_tokens
+        )
+
+    primary_model = os.environ.get("MINIMAX_LLM_MODEL", "MiniMax-M3")
+    primary = _mk(primary_model)
+
+    # RESILIENCE: M3's endpoint intermittently 5xx's under load; fail a hard,
+    # pre-stream M3 failure OVER to a sibling model so the agent never goes silent.
+    # Failover only fires before the first token (retry_on_chunk_sent defaults False),
+    # so a mid-sentence M3 is never restarted. Disable with MINIMAX_LLM_MODEL_FALLBACK=off.
+    fb_model = os.environ.get("MINIMAX_LLM_MODEL_FALLBACK", "MiniMax-M2.7").strip()
+    if not fb_model or fb_model.lower() in ("off", "none") or fb_model == primary_model:
+        return primary
+
+    from livekit.agents import llm as _llm
+
+    attempt_timeout = float(os.environ.get("MINIMAX_LLM_ATTEMPT_TIMEOUT", "12"))
+    return _llm.FallbackAdapter([primary, _mk(fb_model)], attempt_timeout=attempt_timeout)
+
+
+def _build_audio_tts():
+    """The LiveKit audio-output TTS plugin (MiniMax Speech).
+
+    The plugin REQUIRES both MINIMAX_API_KEY and MINIMAX_GROUP_ID, and its
+    model/voice enums DIFFER from the raw `/v1/t2a_v2` API the kernel-facing
+    `MinimaxSynthesizer` uses — the plugin rejects `speech-2.6-turbo` and the
+    `Friendly_Person` voice. So it reads its OWN env (MINIMAX_PLUGIN_TTS_MODEL /
+    MINIMAX_PLUGIN_TTS_VOICE) with plugin-valid defaults, never the raw-API
+    MINIMAX_TTS_MODEL/_VOICE. The plugin kwarg is `voice_id`, not `voice`.
+
+    BUGFIX — multi-sentence TTS crash (plugin 1.2.9 × livekit-agents 1.5.15):
+    the plugin's `SynthesizeStream._run` opens a NEW emitter segment per sentence
+    (`start_segment`/`end_segment` inside its loop). agents 1.5.15 forbids a second
+    `start_segment()` before the prior `end_segment()` ("start_segment() called
+    before the previous segment was ended"), so ANY reply past the first sentence
+    crashed the TTS task (greeting died after "Hello. I'm Clarion,"). No plugin
+    version is compatible with agents 1.5.15 (latest 1.3.0 *pins* agents 1.2.9 and
+    downgrading breaks the deepgram/anthropic/turn-detector 1.5.15 plugins), and the
+    plugin's `synthesize()` raises NotImplementedError so `StreamAdapter` is out.
+    Fix without a downgrade: run the plugin's `_run` against a PROXY emitter that
+    collapses its per-sentence segments into ONE segment per utterance — let the
+    first `start_segment` through, swallow the rest and the per-sentence
+    `end_segment`s, then close the single segment once when `_run` finishes. Audio
+    still streams sentence-by-sentence; the MiniMax voice is unchanged."""
+    from livekit.plugins import minimax
+    from livekit.plugins.minimax import tts as _mx_tts
+
+    api_key = os.environ.get("MINIMAX_API_KEY")
+    group_id = os.environ.get("MINIMAX_GROUP_ID")
+    if not api_key or not group_id:
+        raise RuntimeError(
+            "MiniMax voice needs MINIMAX_API_KEY and MINIMAX_GROUP_ID in agent/.env. "
+            "Run: scripts/set-minimax-key.sh <API_KEY> <GROUP_ID>"
+        )
+
+    class _OneSegmentEmitter:
+        """Forwards everything to the real AudioEmitter but coalesces the plugin's
+        per-sentence segments into one: first `start_segment` opens it, later ones +
+        every `end_segment` are dropped; `finish()` closes it exactly once."""
+
+        def __init__(self, real):
+            self._real = real
+            self._opened = False
+
+        def start_segment(self, *a, **k):
+            if self._opened:
+                return None
+            self._opened = True
+            return self._real.start_segment(*a, **k)
+
+        def end_segment(self, *a, **k):
+            return None  # defer to finish()
+
+        def finish(self):
+            if self._opened:
+                self._opened = False
+                self._real.end_segment()
+
+        def __getattr__(self, name):  # initialize/push/flush/… → real emitter
+            return getattr(self._real, name)
+
+    class _OneSegmentStream(_mx_tts.SynthesizeStream):
+        async def _run(self, emitter) -> None:
+            proxy = _OneSegmentEmitter(emitter)
+            try:
+                await super()._run(proxy)
+            finally:
+                try:
+                    proxy.finish()  # close the single segment (no-op if barge-in cancelled pre-open)
+                except Exception:  # noqa: BLE001 - emitter may already be closing
+                    pass
+
+    class _OneSegmentTTS(minimax.TTS):
+        def stream(self, *, conn_options=_mx_tts.DEFAULT_API_CONNECT_OPTIONS):
+            return _OneSegmentStream(
+                tts=self,
+                conn_options=conn_options,
+                opts=self._opts,
+                session=self._ensure_session(),
+            )
+
+    return _OneSegmentTTS(
+        api_key=api_key,
+        group_id=group_id,
+        model=os.environ.get("MINIMAX_PLUGIN_TTS_MODEL", "speech-02-turbo"),
+        voice_id=os.environ.get("MINIMAX_PLUGIN_TTS_VOICE", "Serene_Woman"),
     )
 
 

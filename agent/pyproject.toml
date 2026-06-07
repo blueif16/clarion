@@ -18,6 +18,7 @@ test = [
 spike = [
     "livekit-agents>=1.0",
     "livekit-plugins-minimax",
+    "livekit-plugins-anthropic",  # MiniMax M-series via its Anthropic-compatible gateway (native thinking blocks)
     "livekit-plugins-deepgram",
     "livekit-plugins-silero",
     "livekit-plugins-turn-detector",

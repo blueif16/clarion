@@ -315,15 +315,27 @@ _FILLERS = {
 
 
 def _build_audio_tts() -> Any:
-    """The LiveKit audio-output TTS: MiniMax Speech 2.6-turbo via the minimax
-    plugin (reads MINIMAX_API_KEY / MINIMAX_GROUP_ID from env). The kernel-facing
-    Synthesizer is our streaming `MinimaxSynthesizer`; this is the session's audio
-    output. Model + voice come from env (no swaps)."""
+    """The LiveKit audio-output TTS: MiniMax Speech via the minimax plugin.
+
+    The plugin REQUIRES both MINIMAX_API_KEY and MINIMAX_GROUP_ID, and its
+    model/voice enums DIFFER from the raw `/v1/t2a_v2` API the kernel-facing
+    `MinimaxSynthesizer` uses (the plugin rejects `speech-2.6-turbo` /
+    `Friendly_Person`). So it reads its OWN env (MINIMAX_PLUGIN_TTS_MODEL /
+    MINIMAX_PLUGIN_TTS_VOICE) with plugin-valid defaults; the kwarg is `voice_id`."""
     from livekit.plugins import minimax
 
+    api_key = os.environ.get("MINIMAX_API_KEY")
+    group_id = os.environ.get("MINIMAX_GROUP_ID")
+    if not api_key or not group_id:
+        raise RuntimeError(
+            "MiniMax voice needs MINIMAX_API_KEY and MINIMAX_GROUP_ID in agent/.env. "
+            "Run: scripts/set-minimax-key.sh <API_KEY> <GROUP_ID>"
+        )
     return minimax.TTS(
-        model=os.environ.get("MINIMAX_TTS_MODEL", "speech-2.6-turbo"),
-        voice=os.environ.get("MINIMAX_TTS_VOICE", "Friendly_Person"),
+        api_key=api_key,
+        group_id=group_id,
+        model=os.environ.get("MINIMAX_PLUGIN_TTS_MODEL", "speech-02-turbo"),
+        voice_id=os.environ.get("MINIMAX_PLUGIN_TTS_VOICE", "Serene_Woman"),
     )
 
 
