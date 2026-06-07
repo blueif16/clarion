@@ -330,6 +330,10 @@ class ExtensionActuator(Actuator):
         # view and reports its live viewport quads — a real (trusted) click on the
         # actually-visible element. Shared verbatim with PlaywrightActuator.
         ok, detail = await cdp_click_by_backend(self._relay.send, backend_id)
+        print(
+            f"  [click] idx={action.index} backend={backend_id} ok={ok} {detail}",
+            flush=True,
+        )
         return Observation(
             selector_map=await self.perceive(), success=ok, detail=detail
         )

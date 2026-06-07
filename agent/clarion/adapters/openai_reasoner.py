@@ -43,9 +43,11 @@ from clarion.adapters.gemini_reasoner import (
     SUCCESS_CHECKS,
     ReasonerError,
     _decide_prompt,
+    _PROMPT_LOG_PATH,
     _decode_step,
     _ground_say,
     _log_decide,
+    _log_prompt,
     _plan_prompt,
     _plan_schema,
     _step_schema,
@@ -240,10 +242,15 @@ class OpenAIReasoner(Reasoner):
             {"role": "user", "content": user},
         ]
 
-    async def _generate_json(self, system: str, prompt: str, schema: dict) -> Any:
+    async def _generate_json(
+        self, system: str, prompt: str, schema: dict, *, kind: str = "llm", seq: int = 0
+    ) -> Any:
         """One structured-output round-trip → parsed JSON. Tries strict
         json_schema; falls back ONCE to json_object on an unsupported-format 4xx
-        and caches the fallback. The blocking call runs in a worker thread."""
+        and caches the fallback. The blocking call runs in a worker thread.
+
+        ``kind``/``seq`` only label the exact-prompt dump (``_log_prompt``) so you
+        can read what THIS call received + how its context was composed."""
         client = self._ensure_client()
         model = self._model
 
@@ -282,6 +289,15 @@ class OpenAIReasoner(Reasoner):
                 self._use_json_object_fallback = True
                 text, used = await asyncio.to_thread(_call, True)
         self.last_used_fallback = used
+        # Observability: dump the EXACT system+composed-user prompt and the raw
+        # response to the prompt log, and drop a one-line pointer in the worker log.
+        written, n = _log_prompt(kind, seq, system, prompt, text, embedded_schema=used)
+        if written:
+            print(
+                f"  [prompt] {kind} #{seq} → {_PROMPT_LOG_PATH} "
+                f"(sys+user {n} chars{', schema embedded' if used else ''})",
+                flush=True,
+            )
         return json.loads(_strip_fence(_strip_think(text)))
 
     async def plan_goal(
@@ -292,7 +308,11 @@ class OpenAIReasoner(Reasoner):
     ) -> list[Subgoal]:
         self.plan_calls.append(goal)
         data = await self._generate_json(
-            _PLAN_SYSTEM, _plan_prompt(goal, orient, affordances), _plan_schema()
+            _PLAN_SYSTEM,
+            _plan_prompt(goal, orient, affordances),
+            _plan_schema(),
+            kind="plan",
+            seq=len(self.plan_calls),
         )
         # json_object mode may wrap an array in an object — accept either.
         if isinstance(data, dict):
@@ -325,6 +345,7 @@ class OpenAIReasoner(Reasoner):
         guard fence → single re-ask on reject → fail-closed (``ReasonerError``).
         ``context`` is the rich situational frame the decision is made inside."""
         self.decide_calls.append(goal)
+        seq = len(self.decide_calls)
         live_indices = sorted(ranked_slice.nodes)
         fact_ids = [f.id for f in facts]
         schema = _step_schema(live_indices, fact_ids)
@@ -334,6 +355,8 @@ class OpenAIReasoner(Reasoner):
             _DECIDE_SYSTEM,
             _decide_prompt(goal, ranked_slice, facts, history, context=context),
             schema,
+            kind="decide",
+            seq=seq,
         )
         proposal = _ground_say(_decode_step(data), facts)
         verdict = validate_step_proposal(proposal, ranked_slice, facts)
@@ -349,6 +372,8 @@ class OpenAIReasoner(Reasoner):
                     context=context,
                 ),
                 schema,
+                kind="decide-reask",
+                seq=seq,
             )
             proposal = _ground_say(_decode_step(data), facts)
             verdict = validate_step_proposal(proposal, ranked_slice, facts)

@@ -395,11 +395,17 @@ class PlaywrightActuator(Actuator):
         # actually-visible element. Shared verbatim with ExtensionActuator, so this
         # proof path exercises the SAME click the extension product runs.
         ok, detail = await cdp_click_by_backend(self._cdp.send, backend_id)
+        url_before = self._page.url
         # Let any resulting navigation / DOM mutation settle.
         try:
             await self._page.wait_for_load_state("networkidle", timeout=1000)
         except Exception:
             pass
+        print(
+            f"  [click] idx={action.index} backend={backend_id} ok={ok} {detail} "
+            f"url={url_before!r}→{self._page.url!r}",
+            flush=True,
+        )
         return Observation(
             selector_map=await self.perceive(), success=ok, detail=detail
         )

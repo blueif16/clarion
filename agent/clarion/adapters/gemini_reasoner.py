@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from typing import Any, Optional
 
 from clarion.contracts.ports import Reasoner
@@ -489,6 +490,57 @@ def _ground_say(proposal: StepProposal, facts: list[Fact]) -> StepProposal:
             return proposal  # a verbatim substring of a grounded span — allowed.
     # Ungrounded restatement — clear it (the kernel speaks nothing, never a guess).
     return proposal.model_copy(update={"say": ""})
+
+
+# The exact-prompt dump goes to its OWN file (default /tmp/clarion-prompts.log) so
+# the full system + composed-context message per LLM call is easy to read without
+# burying the worker log. Set CLARION_PROMPT_LOG='' to disable.
+_PROMPT_LOG_PATH = os.environ.get("CLARION_PROMPT_LOG", "/tmp/clarion-prompts.log")
+
+
+def _log_prompt(
+    kind: str,
+    seq: int,
+    system: str,
+    user: str,
+    response: Optional[str] = None,
+    *,
+    embedded_schema: bool = False,
+) -> tuple[bool, int]:
+    """Append the EXACT prompt one LLM call received — the system prompt + the
+    fully-composed user/context message (and its raw response) — to a dedicated,
+    human-readable file (``CLARION_PROMPT_LOG``). This is the "show me what the
+    model actually got + how the context was composed" log: full fidelity, clearly
+    delimited, kept OUT of the worker log so neither clutters the other. Returns
+    ``(written, sys+user char count)`` so the caller can drop a one-line pointer
+    into the worker log. Best-effort — never raises, never blocks a decision."""
+    if not _PROMPT_LOG_PATH:
+        return (False, 0)
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        bar = "=" * 80
+        tag = f"[{ts}] {kind.upper()} #{seq}"
+        if embedded_schema:
+            tag += "  (schema embedded in user msg)"
+        block = [
+            bar,
+            tag,
+            "---------------------------------- SYSTEM ----------------------------------",
+            system,
+            "-------------------------- USER (composed context) -------------------------",
+            user,
+        ]
+        if response is not None:
+            block += [
+                "----------------------------- RESPONSE (raw) -------------------------------",
+                response,
+            ]
+        block += [bar, ""]
+        with open(_PROMPT_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(block) + "\n")
+        return (True, len(system) + len(user))
+    except Exception:  # noqa: BLE001 - observability must never break a decision
+        return (False, 0)
 
 
 def _log_decide(

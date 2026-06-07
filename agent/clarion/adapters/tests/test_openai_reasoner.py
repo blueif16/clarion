@@ -80,7 +80,7 @@ async def test_decide_step_clean_decode_grounds_say_verbatim() -> None:
     facts = _facts()
     fid = facts[0].id
 
-    async def fake_gen(system, prompt, schema):  # noqa: ARG001
+    async def fake_gen(system, prompt, schema, **kwargs):  # noqa: ARG001
         return {
             "scratch_reasoning": "amount-due answers the goal",
             "action_kind": "read",
@@ -113,7 +113,7 @@ async def test_offpage_index_triggers_reask_then_recovers() -> None:
     fid = facts[0].id
     calls = {"n": 0}
 
-    async def fake_gen(system, prompt, schema):  # noqa: ARG001
+    async def fake_gen(system, prompt, schema, **kwargs):  # noqa: ARG001
         calls["n"] += 1
         if calls["n"] == 1:
             return {
@@ -149,7 +149,7 @@ async def test_offpage_index_triggers_reask_then_recovers() -> None:
 async def test_persistent_dangling_ref_fails_closed() -> None:
     facts = _facts()
 
-    async def fake_gen(system, prompt, schema):  # noqa: ARG001
+    async def fake_gen(system, prompt, schema, **kwargs):  # noqa: ARG001
         return {
             "scratch_reasoning": "fabricated",
             "action_kind": "fill",

@@ -232,7 +232,7 @@ async def cdp_click_by_backend(send: CdpSend, backend_id: int) -> tuple[bool, st
             {"type": "mouseReleased", "x": cx, "y": cy,
              "button": "left", "buttons": 0, "clickCount": 1},
         )
-        return True, ""
+        return True, f"quad-centre ({cx:.0f},{cy:.0f})"
 
     # (3) Fallback: the element has no content quads → activate it directly.
     try:
