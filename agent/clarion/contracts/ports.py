@@ -13,6 +13,7 @@ from typing import AsyncIterator, Callable, Protocol, runtime_checkable
 
 from clarion.contracts.state import (
     Action,
+    DecideContext,
     Fact,
     Observation,
     PageDiff,
@@ -132,11 +133,18 @@ class Reasoner(ABC):
         ranked_slice: SelectorMap,
         facts: list[Fact],
         history: list[StepProposal],
+        context: DecideContext | None = None,
     ) -> StepProposal:
         """Decide the single next grounded action as a ``StepProposal``. The
         returned ``target_index`` / ``value_ref`` are then code-side validated by
         ``kernel.reasoner_guard`` against the live map + Fact ids (structured
-        output is not a logit mask)."""
+        output is not a logit mask).
+
+        ``context`` is the rich situational frame (the user's VERBATIM intent, the
+        plan phase, the live page, what just happened) — the step-decider is the
+        most consequential agent in the loop, so it is given the most context. It
+        is optional only so a bare unit-test fake can omit it; the live kernel
+        always supplies it."""
         ...
 
 

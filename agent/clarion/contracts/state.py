@@ -277,6 +277,60 @@ class StepProposal(BaseModel):
     # The verbatim grounded string the voice plane speaks — extracted from grounded
     # spans, never generated. Empty for a silent step.
     say: str = ""
+    # Other live target indices the goal ALSO plausibly matches (besides
+    # ``target_index``). The model self-reports its own ambiguity here: a non-empty
+    # list means "I see more than one distinct control this goal could mean" — the
+    # kernel MUST clarify (a safe read-back-and-ask), never act on a guess. Additive,
+    # default-empty (backward-compatible): an unset value is the unambiguous case.
+    alternatives: list[int] = Field(default_factory=list)
+    # The model's self-reported polarity metacognition: True when the proposed
+    # ``say`` ASSERTS AN ABSENCE / negative ("no late fee", "no autopay enrolled")
+    # instead of reading back a present value. The kernel routes ONLY a flagged
+    # negative through the closed-world ``NegativeVerifier`` (honest-decline, fence
+    # #5); an unflagged say is a positive read-back, already fenced by membership.
+    # Additive, default-False (backward-compatible). This replaces the banned
+    # lexical ``is_negative_claim`` keyword list — the model does the metacognition,
+    # not a stopword table (the de-hardcoding thesis). SAFE either way: the
+    # membership fence (#2) already bars speaking any non-grounded line, so this
+    # flag only selects the hedge / sourced-negative UX, never whether a false
+    # negative could be spoken.
+    asserts_absence: bool = False
+
+
+class DecideContext(BaseModel):
+    """The rich, situational context handed to ``Reasoner.decide_step`` — the
+    single most important agent in the loop is the step-decider, so it must be the
+    MOST informed: it gets the user's VERBATIM intent (never genericized), where we
+    are in the plan, what the live page is, and what just happened.
+
+    The de-hardcoding thesis is intact: this carries MEANING (the real goal, the
+    real page), never a keyword/topology table — the model still does all the
+    judgement. Pure model; ZERO SDK. Built transiently in PROPOSE and passed to
+    ``decide_step``; it is NOT a checkpointed state channel.
+    """
+
+    # The user's confirmed request, VERBATIM — what they actually asked for. Never
+    # the planner's genericized restatement (that loss is what made the reasoner
+    # read "Food assistance" instead of navigating to it).
+    user_intent: str = ""
+    # Where we are in the plan (the "current phase").
+    subgoal_index: int = 0
+    subgoal_total: int = 1
+    subgoal_description: str = ""
+    # The registered code-checkable milestone this subgoal completes on.
+    subgoal_done_check: str = ""
+    # The whole plan (subgoal descriptions), for situational awareness.
+    plan: list[str] = Field(default_factory=list)
+    # The CURRENT live page at the moment of the decision (fresh ORIENT).
+    page_title: str = ""
+    page_url: str = ""
+    page_summary: str = ""
+    # What happened on the prior loop / why this subgoal is not done yet (the
+    # replan signal — so a retry changes strategy instead of repeating itself).
+    last_outcome: str = ""
+    # Advisory recalled hint (knowledge layer). NEVER binding — re-ground on the
+    # live page; a recalled value is never spoken without being re-grounded.
+    recall_hint: str = ""
 
 
 # ---------------------------------------------------------------------------

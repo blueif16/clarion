@@ -52,6 +52,7 @@ from clarion.contracts.state import (
     Action,
     ClarionState,
     Consent,
+    DecideContext,
     Fact,
     PairedFact,
     Proposal,
@@ -66,7 +67,6 @@ from clarion.kernel.policy import (
     assert_consented,
     assert_grounded,
     is_consented,
-    is_negative_claim,
     is_speakable_value,
     speakable,
 )
@@ -136,6 +136,18 @@ class _PlanState(ClarionState, total=False):
 
     # The Reasoner's pending next-step decision (validated, pre-Proposal).
     pending_step: Optional[StepProposal]
+    # The user's confirmed VERBATIM intent for the whole task (NOT the per-subgoal
+    # goal). Threaded from the stage so PROPOSE can build the rich DecideContext —
+    # the loss of this is what made the reasoner read a label instead of acting.
+    user_intent: str
+    # The accumulated decided steps this run (the full trajectory the reasoner sees
+    # as history). Last-value-wins — PROPOSE returns the full list each pass.
+    step_history: list[StepProposal]
+    # What happened on the prior loop / why the current subgoal is not done yet (the
+    # replan signal; set by the stage executor, surfaced into DecideContext).
+    last_outcome: str
+    # Advisory recalled plan hint (knowledge layer), surfaced into DecideContext.
+    recall_hint: str
     # The geometric label↔value pairings harvested THIS perceive cycle (the
     # pairing-correctness fence #3 supply). Last-value-wins (re-read each cycle).
     paired_facts: list[PairedFact]
@@ -181,7 +193,12 @@ def _already_acted(state: ClarionState, proposal_id: str) -> bool:
 
 
 def _topk_slice(page: SelectorMap, facts: list[Fact], top_k: int) -> SelectorMap:
-    """Build the top-K hint SUB-map the Reasoner decides over — the latency trim.
+    """SUPERSEDED (no longer on the PROPOSE path): a meaning-based ContextRanker is
+    the intended successor; this lexical pre-rank was removed from ``propose()`` so
+    the LLM decides over the full live map. Kept defined for the future
+    semantic-ranker revival — do NOT re-wire it onto the hot path.
+
+    Build the top-K hint SUB-map the Reasoner decides over — the latency trim.
 
     The Reasoner must NOT be fed all ~48 live ids (the 4.7s full-map baseline); we
     hand it the top-K most goal-relevant candidates as a real ``SelectorMap`` keyed
@@ -218,6 +235,48 @@ _INTERACTIVE_ROLES = {
     "textbox", "searchbox", "combobox", "spinbutton", "textarea",
     "button", "link", "checkbox", "radio", "switch", "menuitem", "tab",
 }
+
+
+async def _page_readout(actuator: Actuator):
+    """The FRESH live page at the decision moment (title/url/screen-reader summary)
+    for the rich DecideContext. Prefers the actuator's ``describe_page``; degrades
+    to ``None`` for a fake/replay transport without it. Best-effort — a blocked
+    read never breaks the decision."""
+    describe = getattr(actuator, "describe_page", None)
+    if describe is None:
+        return None
+    try:
+        return await describe()
+    except Exception:  # noqa: BLE001 - context is best-effort; degrade, don't crash
+        return None
+
+
+async def _build_decide_context(
+    state: "_PlanState", actuator: Actuator
+) -> DecideContext:
+    """Assemble the rich situational frame the step-decider reasons inside: the
+    user's VERBATIM intent, the plan phase (subgoal i/N + its done-check), the whole
+    plan, the FRESH live page, and what just happened. This is the de-hardcoded
+    'most-informed agent' input — meaning, never a keyword table."""
+    subgoals = list(state.get("subgoals") or [])
+    idx = int(state.get("stage_idx", 0) or 0)
+    cur = subgoals[idx] if 0 <= idx < len(subgoals) else None
+    readout = await _page_readout(actuator)
+    return DecideContext(
+        user_intent=(state.get("user_intent") or state.get("goal") or ""),
+        subgoal_index=idx,
+        subgoal_total=max(len(subgoals), 1),
+        subgoal_description=(cur.description if cur else state.get("goal", "")),
+        subgoal_done_check=(
+            (cur.done_check if cur else "") or state.get("success_check", "")
+        ),
+        plan=[s.description for s in subgoals],
+        page_title=(readout.title if readout else ""),
+        page_url=(readout.url if readout else ""),
+        page_summary=(readout.summary if readout else ""),
+        last_outcome=(state.get("last_outcome") or ""),
+        recall_hint=(state.get("recall_hint") or ""),
+    )
 
 
 def build_kernel(
@@ -293,12 +352,18 @@ def build_kernel(
 
     # ---- PROPOSE (Reasoner-driven) --------------------------------------
     async def propose(state: _PlanState) -> dict:
-        """Ask the Reasoner for the next grounded step over the top-K HINT slice,
+        """Ask the Reasoner for the next grounded step over the FULL live map,
         validate it (``reasoner_guard``), and form the grounded ``Proposal``.
 
         The LLM decides (architecture Thesis); the kernel only ENFORCES. Pipeline:
-          1. Slice the live map to the top-K candidates (the latency trim) and
-             call ``reasoner.decide_step(goal, slice, facts, history)``.
+          1. Call ``reasoner.decide_step(goal, page, facts, history)`` over the
+             FULL live ``SelectorMap`` — the model is the SEMANTIC decider, so
+             ``target_index`` may resolve to ANY live control, including a
+             goal-relevant one the grounded facts never lexically mention. The old
+             lexical ``_topk_slice`` pre-rank is REMOVED (it pruned ~46→12 by
+             string-overlap and made unmentioned controls untargetable — a banned
+             keyword heuristic). A meaning-based ``ContextRanker`` may reintroduce a
+             trim later behind a port; that is NOT built here.
           2. Validate the ``StepProposal`` against the FULL live map + Fact ids
              (``validate_step_proposal``). An off-page index / dangling value_ref
              is discarded → a safe read-back, never acted on.
@@ -315,13 +380,20 @@ def build_kernel(
         sayable = speakable(facts)
         k, _n = state["step"]
         proposal_id = f"prop-{state['stage_idx']}-{k}"
-        history = list(state.get("pending_step") and [state["pending_step"]] or [])
+        # The FULL decided-step trajectory this run (the history the reasoner reasons
+        # over), not just the last step — so a replan can see it already tried a read.
+        history = list(state.get("step_history") or [])
 
-        # (1) Reasoner decides over the top-K hint slice.
-        hint = _topk_slice(page, sayable, top_k)
+        # The RICH decision context: the user's VERBATIM intent, the plan phase, the
+        # FRESH live page, what just happened. The step-decider is the most
+        # consequential agent in the loop, so it gets the most context.
+        ctx = await _build_decide_context(state, actuator)
+
+        # (1) Reasoner decides over the FULL live map (LLM is the semantic decider).
         step: StepProposal = await reasoner.decide_step(
-            state["goal"], hint, sayable, history
+            state["goal"], page, sayable, history, context=ctx
         )
+        new_history = history + [step]
 
         # (2) Code-side post-decode fence against the FULL live map + facts.
         verdict = validate_step_proposal(step, page, sayable)
@@ -337,10 +409,79 @@ def build_kernel(
             return {
                 "pending_proposal": proposal,
                 "pending_step": step,
+                "step_history": new_history,
                 "success_check": step.success_check,
                 "trace": [
                     _trace(
                         "PROPOSE", "info", rejected=verdict.reason, proposal_id=proposal_id
+                    ),
+                    _trace(
+                        "PROPOSE", "exit", proposal_id=proposal_id, irreversible=False
+                    ),
+                ],
+            }
+
+        # (2b) ABSTAIN-AND-CLARIFY (the hero beat). The Reasoner self-reports its own
+        # ambiguity: a non-empty ``alternatives`` means the goal plausibly matched
+        # MORE THAN ONE distinct live control. Rather than guess at a consequential
+        # target, the kernel emits a SAFE read-back-and-ask that NAMES the rival
+        # controls (by their live AX node names) and asks which the user meant. This
+        # is a ``read`` action — no side-effect — so it routes straight to the user
+        # as a spoken question and never acts on an ambiguous target. Filtered
+        # defensively to valid live indices that are not the chosen target.
+        alts = [
+            i
+            for i in step.alternatives
+            if i in page.nodes and i != step.target_index
+        ]
+        if step.action_kind in ("fill", "click", "navigate") and alts:
+            # Gather candidate names from the LIVE map (chosen target first), capped
+            # to ~3, skipping empties — these are read off real perceived nodes.
+            names: list[str] = []
+            chosen_node = (
+                page.nodes.get(step.target_index)
+                if step.target_index is not None
+                else None
+            )
+            if chosen_node is not None and chosen_node.name.strip():
+                names.append(chosen_node.name.strip())
+            for i in alts:
+                nm = page.nodes[i].name.strip()
+                if nm:
+                    names.append(nm)
+                if len(names) >= 3:
+                    break
+            if len(names) >= 2:
+                named = ", or ".join([", ".join(names[:-1]), names[-1]]) if len(
+                    names
+                ) > 2 else " or ".join(names)
+                utterance = (
+                    f"I can act on more than one thing that matches — {named}. "
+                    f"Which did you mean?"
+                )
+            else:
+                utterance = (
+                    "I found more than one control that could match — which did "
+                    "you mean?"
+                )
+            proposal = Proposal(
+                id=proposal_id,
+                utterance=utterance,
+                action=Action(kind="read", index=None, irreversible=False),
+                irreversible=False,
+            )
+            return {
+                "pending_proposal": proposal,
+                "pending_step": step,
+                "step_history": new_history,
+                "success_check": step.success_check,
+                "trace": [
+                    _trace(
+                        "PROPOSE",
+                        "info",
+                        abstained="ambiguous",
+                        alternatives=alts,
+                        proposal_id=proposal_id,
                     ),
                     _trace(
                         "PROPOSE", "exit", proposal_id=proposal_id, irreversible=False
@@ -381,8 +522,9 @@ def build_kernel(
             # image (invisible to the AXTree) must NEVER become a confident "no late
             # fee" (architecture migration Step 5 killer acceptance). The positive
             # read-back path is already fenced by membership (#2); only an asserted
-            # negative routes through the verifier.
-            negative_topic = step.say if (step.say and is_negative_claim(step.say)) else ""
+            # negative routes through the verifier — and the polarity is the model's
+            # OWN self-report (``asserts_absence``), never a lexical keyword list.
+            negative_topic = step.say if (step.say and step.asserts_absence) else ""
             if negative_topic:
                 verdict = verify_negative(negative_topic, facts)
                 if not verdict.speak:
@@ -399,6 +541,7 @@ def build_kernel(
                     return {
                         "pending_proposal": proposal,
                         "pending_step": step,
+                        "step_history": new_history,
                         "success_check": step.success_check,
                         "trace": [
                             _trace(
@@ -429,6 +572,7 @@ def build_kernel(
         return {
             "pending_proposal": proposal,
             "pending_step": step,
+            "step_history": new_history,
             "success_check": step.success_check,
             "trace": [
                 _trace(
@@ -438,6 +582,10 @@ def build_kernel(
                     action_kind=action.kind,
                     value_ref=step.value_ref,
                     decide_ms=getattr(reasoner, "last_decide_ms", None),
+                    intent=ctx.user_intent,
+                    phase=f"{ctx.subgoal_index + 1}/{ctx.subgoal_total}",
+                    done_check=ctx.subgoal_done_check,
+                    scratch=step.scratch_reasoning,
                 )
             ],
         }

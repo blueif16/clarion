@@ -332,6 +332,12 @@ def build_stage_graph(
         # Stash the recalled consent decisions for the gate's spoken reminder.
         if recall is not None and recall.consent_recall:
             update["consent_recall"] = list(recall.consent_recall)
+        # Surface the recalled prior plan as an advisory hint into DecideContext
+        # (never binding — the reasoner re-grounds on the live page).
+        if prior_plan_hint is not None and prior_plan_hint.subgoals:
+            update["recall_hint"] = "; ".join(
+                s.description for s in prior_plan_hint.subgoals if s.description
+            )
         return Command(update=update, goto=_EXECUTOR)
 
     async def _drive_kernel(state: _StageState, subgoal: Subgoal, idx: int) -> dict:
@@ -350,8 +356,17 @@ def build_stage_graph(
         # subgoal's sub-goal. Pass the live paired_facts (the fence #3 supply).
         seed: _PlanState = {
             "goal": subgoal.description or state["goal"],
+            # The user's VERBATIM intent for the whole task (the stage-level goal),
+            # threaded so PROPOSE's DecideContext carries it un-genericized.
+            "user_intent": state.get("goal", ""),
             "mode": state["mode"],
             "plan": state.get("plan", []),
+            # The full plan + phase + trajectory + replan signal the step-decider
+            # reasons inside (the rich-context build).
+            "subgoals": state.get("subgoals", []),
+            "step_history": state.get("step_history", []),
+            "last_outcome": state.get("last_outcome", ""),
+            "recall_hint": state.get("recall_hint", ""),
             "stage_idx": idx,
             "step": state["step"],
             "page_index": state["page_index"],
@@ -452,6 +467,9 @@ def build_stage_graph(
             "grounded_facts": merged["grounded_facts"],
             "pending_proposal": merged["pending_proposal"],
             "pending_step": merged.get("pending_step"),
+            # Carry the accumulated decided-step trajectory across subgoals/replans
+            # so the reasoner's history is the WHOLE run, not just this drive.
+            "step_history": merged.get("step_history", state.get("step_history", [])),
             "success_check": merged.get("success_check", ""),
             "paired_facts": paired,
             "_kernel_threads": merged.get("_kernel_threads", {}),
@@ -472,6 +490,24 @@ def build_stage_graph(
         }
         if kernel_new_consent:
             update["consent_log"] = kernel_new_consent
+
+        # The replan signal the NEXT decision sees (DecideContext.last_outcome): on a
+        # failed subgoal, tell the reasoner what it just tried + why it isn't done, so
+        # a retry changes strategy (e.g. act instead of re-reading) rather than
+        # repeating itself. Cleared on success so a fresh subgoal starts clean.
+        if advanced:
+            update["last_outcome"] = ""
+        else:
+            pp = merged.get("pending_proposal")
+            last_kind = pp.action.kind if (pp is not None and pp.action is not None) else "?"
+            attempts = int(state.get("_replan_attempts", 0) or 0)
+            update["last_outcome"] = (
+                f"Subgoal {idx} ('{subgoal.description}') is NOT done yet — the last "
+                f"action was a '{last_kind}' and the check '{check_name}' did not pass "
+                f"(attempt {attempts + 1}). Choose a DIFFERENT action this time; if the "
+                f"goal is to open/navigate, click or navigate the matching control "
+                f"instead of reading it."
+            )
 
         # End-of-flow "remember?" bookkeeping — ONLY when the offer is active, so a
         # memory-off run (every frozen test) keeps the executor byte-for-byte. Harvest

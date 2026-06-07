@@ -23,7 +23,8 @@ import uuid
 import pytest
 from langgraph.types import Command
 
-from clarion.contracts.events import ConsentDecision
+from clarion.app.remember import nominate_remember_candidates
+from clarion.contracts.events import ConsentDecision, ConsentRequest
 from clarion.contracts.ports import Actuator
 from clarion.contracts.state import (
     Action,
@@ -35,7 +36,7 @@ from clarion.contracts.state import (
     StepProposal,
     Subgoal,
 )
-from clarion.fakes import FakeActuator, FakeReasoner, FakeRetriever
+from clarion.fakes import FakeActuator, FakeMemory, FakeReasoner, FakeRetriever
 from clarion.stages.checks import evaluate_success_check, make_anchor
 from clarion.stages.graph import build_stage_graph, seed_stage_state
 from clarion.stages.planner import plan_goal, verbalize_subgoals
@@ -99,7 +100,7 @@ class _FillReasoner:
         self.plan_calls.append(goal)
         return [Subgoal(description="enter the amount", done_check="field_nonempty")]
 
-    async def decide_step(self, goal, ranked_slice, facts, history):  # noqa: ANN001, ARG002
+    async def decide_step(self, goal, ranked_slice, facts, history, context=None):  # noqa: ANN001, ARG002
         self.decide_calls.append(goal)
         target = next(iter(sorted(ranked_slice.nodes)), None)
         return StepProposal(
@@ -238,6 +239,101 @@ async def test_executor_gates_consequential_step_in_normal_mode() -> None:
     assert "__interrupt__" not in final
     assert any(a.kind == "fill" for a in actuator.act_calls)
     assert any(c.decision == "approve" for c in final["consent_log"])
+
+
+# ---------------------------------------------------------------------------
+# (3b) the end-of-flow "remember?" offer — wired, consent-gated (no memory
+#      without a yes). The injected nominator wraps app.remember (secret-
+#      suppression); a completed flow surfaces ONE batched ConsentRequest and
+#      writes the kept candidate through the Memory port ONLY on an explicit yes.
+# ---------------------------------------------------------------------------
+
+
+def _nominate(filled, page):  # noqa: ANN001 — the injected RememberNominate seam.
+    return [(c.key, c.value) for c in nominate_remember_candidates(filled, page)]
+
+
+@pytest.mark.asyncio
+async def test_remember_offer_fires_and_writes_on_yes() -> None:
+    reasoner = _fill_then_done_reasoner()
+    actuator = _FormActuator()
+    mem = FakeMemory()
+    graph = build_stage_graph(
+        reasoner, _page_facts_retriever(), actuator, mode="fast", max_replans=1,
+        memory=mem, remember_nominate=_nominate,
+    )
+    config = _cfg()
+    seed = seed_stage_state(
+        goal="enter the amount", mode="fast", page_index=await actuator.perceive()
+    )
+    # The completed flow reaches the end-of-flow remember offer and pauses ON it
+    # (the reversible fill auto-proceeded in fast mode; the only interrupt is the
+    # batched "remember?" consent).
+    paused = await graph.ainvoke(seed, config)
+    assert any(a.kind == "fill" for a in actuator.act_calls)
+    assert "__interrupt__" in paused
+    (intr,) = paused["__interrupt__"]
+    req = ConsentRequest.model_validate(intr.value)
+    assert req.proposal_id == "remember"
+    assert "remember" in req.utterance.lower()
+    # Nothing persisted before the yes (no memory without a yes).
+    assert mem._prefs.get("default", {}) == {}
+
+    # Say yes → the kept candidate is written through the Memory port.
+    final = await graph.ainvoke(
+        Command(resume=ConsentDecision(decision="approve").model_dump()), config
+    )
+    assert "__interrupt__" not in final
+    prefs = (await mem.read_profile("default")).preferences
+    assert prefs, "a preference should have been written on yes"
+    assert "$42.00" in prefs.values()
+    rem = [e for e in final["trace"] if e.node == "REMEMBER" and e.event == "exit"]
+    assert rem and rem[-1].data["kept"] is True and rem[-1].data["written"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_remember_offer_persists_nothing_on_no() -> None:
+    reasoner = _fill_then_done_reasoner()
+    actuator = _FormActuator()
+    mem = FakeMemory()
+    graph = build_stage_graph(
+        reasoner, _page_facts_retriever(), actuator, mode="fast", max_replans=1,
+        memory=mem, remember_nominate=_nominate,
+    )
+    config = _cfg()
+    seed = seed_stage_state(
+        goal="enter the amount", mode="fast", page_index=await actuator.perceive()
+    )
+    paused = await graph.ainvoke(seed, config)
+    assert "__interrupt__" in paused
+    # Say no → NOTHING persists (the third invariant clause, mechanized).
+    final = await graph.ainvoke(
+        Command(resume=ConsentDecision(decision="reject").model_dump()), config
+    )
+    assert "__interrupt__" not in final
+    assert (await mem.read_profile("default")).preferences == {}
+    rem = [e for e in final["trace"] if e.node == "REMEMBER" and e.event == "exit"]
+    assert rem and rem[-1].data["kept"] is False and rem[-1].data["written"] == 0
+
+
+@pytest.mark.asyncio
+async def test_no_remember_node_when_offer_inactive() -> None:
+    """Default (no injected nominator) → the completed flow goes straight to END,
+    never reaching the remember node. Proves the wiring is inert when off (every
+    memory-off run / frozen test path)."""
+    reasoner = _fill_then_done_reasoner()
+    actuator = _FormActuator()
+    graph = build_stage_graph(
+        reasoner, _page_facts_retriever(), actuator, mode="fast", max_replans=1
+    )
+    final = await graph.ainvoke(
+        seed_stage_state(
+            goal="enter the amount", mode="fast", page_index=await actuator.perceive()
+        ),
+        _cfg(),
+    )
+    assert "__interrupt__" not in final
+    assert not any(e.node == "REMEMBER" for e in final["trace"])
 
 
 # ---------------------------------------------------------------------------

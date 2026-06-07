@@ -255,6 +255,7 @@ class FakeReasoner(Reasoner):
         ranked_slice: SelectorMap,
         facts: list[Fact],
         history: list[StepProposal],  # noqa: ARG002 - part of the port surface
+        context=None,  # noqa: ANN001, ARG002 - part of the port surface
     ) -> StepProposal:
         self.decide_calls.append(goal)
         if self._steps:

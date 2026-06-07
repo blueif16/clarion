@@ -45,12 +45,14 @@ from clarion.adapters.gemini_reasoner import (
     _decide_prompt,
     _decode_step,
     _ground_say,
+    _log_decide,
     _plan_prompt,
     _plan_schema,
     _step_schema,
 )
 from clarion.contracts.ports import Reasoner
 from clarion.contracts.state import (
+    DecideContext,
     Fact,
     PageReadout,
     SelectorMap,
@@ -74,18 +76,47 @@ _DECIDE_SYSTEM = (
     "paraphrase a value; if nothing grounded answers, leave 'say' empty.\n"
     "  2. NO ACTION WITHOUT A YES. Judge irreversibility honestly; never downgrade "
     "a risky control (submit/send/pay/confirm/off-site nav) to 'reversible'.\n"
+    "CHOOSE THE action_kind BY WHAT THE STEP ACTUALLY NEEDS:\n"
+    "  - 'read': ONLY when the user wants to KNOW something the grounded facts / "
+    "current page already answer, or you must report what is there. A read NEVER "
+    "changes the page.\n"
+    "  - 'navigate' / 'click': when the user wants to GO somewhere or OPEN / SELECT "
+    "a control (a link, button, tab). If the request is to open / go to / show / "
+    "find a section and a matching link or button is in the numbered items, you "
+    "MUST click or navigate it — do NOT merely read its label back. Reading the "
+    "name of the thing they asked to open does NOT satisfy the goal.\n"
+    "  - 'fill': to enter a value into an input field.\n"
+    "Use the CURRENT PHASE's done-check as your target: if it is 'navigated' you "
+    "must move the page, not read. If WHAT JUST HAPPENED shows the previous step "
+    "was a read and the subgoal is still not done, do NOT read again — act on the "
+    "matching control.\n"
     "Put scratch_reasoning FIRST, then choose. target_index MUST be one of the "
     "numbered live items; value_ref MUST be one of the listed fact ids (or the "
-    "string 'null'). Pick success_check by name from the allowed set. Output ONLY "
-    "the JSON object — no prose, no markdown fence."
+    "string 'null'). Pick success_check by name from the allowed set. "
+    "If the goal plausibly matches MORE THAN ONE distinct control on the page, set "
+    "'alternatives' to the OTHER plausible target indices (besides target_index) "
+    "and PREFER ASKING the user which they meant over guessing; otherwise leave "
+    "'alternatives' empty. "
+    "Set 'asserts_absence' TRUE only when your 'say' asserts that something is NOT "
+    "present / a negative ('no late fee', 'no autopay enrolled'); FALSE for any "
+    "positive read-back — a flagged negative is hedged unless the absence was "
+    "actually read off the page, so report this polarity honestly. "
+    "Output ONLY the JSON object — no prose, no markdown fence."
 )
 
 _PLAN_SYSTEM = (
     "You are the planning core of a voice co-pilot for blind users on the open web. "
-    "Given a goal and what a screen reader sees on the CURRENT page, produce a "
-    "short, GENERIC, site-agnostic plan as a STRICT JSON array of subgoals. No "
-    "site-specific names. Each subgoal names a registered done_check from the "
-    "allowed set. Output ONLY the JSON array — no prose, no markdown fence."
+    "Given the user's ACTUAL request and what a screen reader sees on the CURRENT "
+    "page, produce the SPECIFIC plan to accomplish exactly what they asked, as a "
+    "STRICT JSON array of subgoals. Be concrete: name the real target the user "
+    "referred to and the real controls/sections you can see (e.g. 'open the Food "
+    "assistance section'), not a vague paraphrase; do not strip the user's "
+    "specifics. Stay generic ONLY about page structure you have not seen yet — "
+    "never invent steps for a page you cannot observe. RIGHT-SIZE the plan: a "
+    "question answerable from the current page is ONE read subgoal; a form is ONE "
+    "subgoal (its fields are steps, not subgoals) unless a field itself needs "
+    "multiple steps. Each subgoal names a registered done_check from the allowed "
+    "set. Output ONLY the JSON array — no prose, no markdown fence."
 )
 
 
@@ -287,9 +318,11 @@ class OpenAIReasoner(Reasoner):
         ranked_slice: SelectorMap,
         facts: list[Fact],
         history: list[StepProposal],
+        context: DecideContext | None = None,
     ) -> StepProposal:
         """Decide the next grounded step. Structured output → SAME post-decode
-        guard fence → single re-ask on reject → fail-closed (``ReasonerError``)."""
+        guard fence → single re-ask on reject → fail-closed (``ReasonerError``).
+        ``context`` is the rich situational frame the decision is made inside."""
         self.decide_calls.append(goal)
         live_indices = sorted(ranked_slice.nodes)
         fact_ids = [f.id for f in facts]
@@ -298,7 +331,7 @@ class OpenAIReasoner(Reasoner):
         t0 = time.perf_counter()
         data = await self._generate_json(
             _DECIDE_SYSTEM,
-            _decide_prompt(goal, ranked_slice, facts, history),
+            _decide_prompt(goal, ranked_slice, facts, history, context=context),
             schema,
         )
         proposal = _ground_say(_decode_step(data), facts)
@@ -307,7 +340,12 @@ class OpenAIReasoner(Reasoner):
             data = await self._generate_json(
                 _DECIDE_SYSTEM,
                 _decide_prompt(
-                    goal, ranked_slice, facts, history, retry_error=verdict.reason
+                    goal,
+                    ranked_slice,
+                    facts,
+                    history,
+                    retry_error=verdict.reason,
+                    context=context,
                 ),
                 schema,
             )
@@ -320,6 +358,7 @@ class OpenAIReasoner(Reasoner):
                     f"re-ask: {verdict.reason}"
                 )
         self.last_decide_ms = (time.perf_counter() - t0) * 1000.0
+        _log_decide(context, proposal, len(ranked_slice.nodes), len(facts), self.last_decide_ms)
         return proposal
 
 

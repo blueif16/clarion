@@ -45,6 +45,7 @@ from typing import Any, Optional
 
 from clarion.contracts.ports import Reasoner
 from clarion.contracts.state import (
+    DecideContext,
     Fact,
     PageReadout,
     SelectorMap,
@@ -107,11 +108,13 @@ def _step_schema(live_indices: list[int], fact_ids: list[str]) -> dict[str, Any]
             "scratch_reasoning",
             "action_kind",
             "target_index",
+            "alternatives",
             "value_ref",
             "irreversibility",
             "irreversibility_rationale",
             "success_check",
             "say",
+            "asserts_absence",
         ],
         "required": [
             "scratch_reasoning",
@@ -141,6 +144,17 @@ def _step_schema(live_indices: list[int], fact_ids: list[str]) -> dict[str, Any]
                     "indices, or 'null' for an action that needs no node."
                 ),
             },
+            "alternatives": {
+                "type": "ARRAY",
+                "items": {"type": "STRING", "enum": [str(i) for i in live_indices]},
+                "description": (
+                    "OTHER live numbered items (besides target_index) the goal ALSO "
+                    "plausibly matches — each MUST be one of the listed live indices. "
+                    "Leave EMPTY when only one control fits; list the rivals when the "
+                    "goal could mean more than one distinct control, so the user can "
+                    "be asked which they meant rather than guessed at."
+                ),
+            },
             "value_ref": {
                 "type": "STRING",
                 "enum": value_enum,
@@ -158,6 +172,17 @@ def _step_schema(live_indices: list[int], fact_ids: list[str]) -> dict[str, Any]
                 "description": (
                     "What the voice plane speaks — copied VERBATIM from a grounded "
                     "fact value, or empty for a silent step. Never paraphrase."
+                ),
+            },
+            "asserts_absence": {
+                "type": "BOOLEAN",
+                "description": (
+                    "TRUE only when 'say' ASSERTS THAT SOMETHING IS ABSENT / a "
+                    "negative ('no late fee', 'no autopay enrolled', 'nothing is "
+                    "due') rather than reading back a present value. Such a claim "
+                    "is routed through a closed-world check that hedges unless the "
+                    "absence was actually read off the page — so flag it honestly. "
+                    "FALSE for any positive read-back."
                 ),
             },
         },
@@ -209,17 +234,53 @@ _DECIDE_SYSTEM = (
     "might submit, send, pay, confirm, or navigate off-site and you are not sure it "
     "is undoable, mark it 'irreversible' or 'unknown' — never downgrade a risky "
     "control to 'reversible'.\n"
+    "CHOOSE THE action_kind BY WHAT THE STEP ACTUALLY NEEDS:\n"
+    "  - 'read': ONLY when the user wants to KNOW something that the grounded facts "
+    "/ current page already answer, or you must report what is there. A read NEVER "
+    "changes the page.\n"
+    "  - 'navigate' / 'click': when the user wants to GO somewhere or OPEN / SELECT "
+    "a control (a link, button, or tab). If the user's request is to open / go to / "
+    "show / find a section and a matching link or button is in the numbered items, "
+    "you MUST click or navigate it — do NOT merely read its name back. Reading the "
+    "label of the thing they asked to open does NOT satisfy the goal.\n"
+    "  - 'fill': to enter a value into an input field.\n"
+    "Use the CURRENT PHASE's done-check as your target: if it is 'navigated' you "
+    "must move the page (click/navigate), not read. If WHAT JUST HAPPENED shows the "
+    "previous step was a read and the subgoal is still not done, do NOT read again "
+    "— act on the matching control.\n"
     "Reason FIRST in scratch_reasoning, THEN choose. target_index must be one of "
     "the numbered live items; value_ref must be one of the listed fact ids (or "
-    "null). Pick success_check by name from the allowed set."
+    "null). Pick success_check by name from the allowed set.\n"
+    "If the goal plausibly matches MORE THAN ONE distinct control on the page, set "
+    "'alternatives' to the OTHER plausible target indices (besides target_index) "
+    "and PREFER ASKING the user which they meant over guessing; otherwise leave "
+    "'alternatives' empty.\n"
+    "Set 'asserts_absence' TRUE only when your 'say' asserts that something is NOT "
+    "present / a negative ('no late fee', 'no autopay enrolled'); FALSE for any "
+    "positive read-back. A flagged negative is hedged unless the absence was "
+    "actually read off the page, so report this polarity honestly."
 )
 
 _PLAN_SYSTEM = (
     "You are the planning core of a voice co-pilot for blind users on the open web. "
-    "Given a goal and what a screen reader sees on the CURRENT page, produce a "
-    "short, GENERIC, site-agnostic plan: an ordered list of subgoals. No "
-    "site-specific names, no assumptions about a page you haven't seen. Each "
-    "subgoal names a registered done_check from the allowed set."
+    "Given the user's ACTUAL request and what a screen reader sees on the CURRENT "
+    "page, produce the SPECIFIC plan to accomplish exactly what they asked — an "
+    "ordered list of subgoals. Be concrete: name the real target the user referred "
+    "to and the real controls/sections you can see on the page (e.g. 'open the Food "
+    "assistance section'), not a vague paraphrase. Do not strip the user's "
+    "specifics. The only thing to stay generic about is page structure you have NOT "
+    "seen yet — never invent steps for a page you cannot observe.\n"
+    "RIGHT-SIZE THE PLAN to the request:\n"
+    "  - A question you can answer from the current page → ONE subgoal that reads "
+    "the answer.\n"
+    "  - A request to go to / open something → one subgoal per real navigation "
+    "milestone.\n"
+    "  - Filling a form → ONE subgoal for the whole form ('complete the form'); the "
+    "individual fields are steps inside it, NOT separate subgoals. Only split out a "
+    "field that itself needs multiple steps (a date-picker, a searchable dropdown, a "
+    "multi-page wizard).\n"
+    "Each subgoal names a registered done_check from the allowed set — the "
+    "code-checkable milestone that proves it is done."
 )
 
 
@@ -254,6 +315,39 @@ def _render_history(history: list[StepProposal]) -> str:
     return "\n".join(lines)
 
 
+def _render_context(ctx: Optional[DecideContext]) -> str:
+    """Render the rich situational frame the step-decider reasons inside: the
+    user's VERBATIM request, the plan phase, the live page, and what just happened.
+    Empty string when no context is supplied (a bare unit-test fake)."""
+    if ctx is None:
+        return ""
+    lines = [
+        f"THE USER ACTUALLY ASKED (verbatim — this is the real intent): "
+        f"{ctx.user_intent!r}",
+    ]
+    if ctx.plan:
+        plan = "; ".join(f"{i + 1}. {d}" for i, d in enumerate(ctx.plan))
+        lines.append(f"FULL PLAN: {plan}")
+    lines.append(
+        f"CURRENT PHASE: subgoal {ctx.subgoal_index + 1} of {ctx.subgoal_total} — "
+        f"{ctx.subgoal_description!r} "
+        f"(this subgoal is DONE when the check '{ctx.subgoal_done_check or 'n/a'}' "
+        f"passes)"
+    )
+    if ctx.last_outcome:
+        lines.append(f"WHAT JUST HAPPENED: {ctx.last_outcome}")
+    if ctx.page_title or ctx.page_url:
+        lines.append(f"CURRENT PAGE: {ctx.page_title!r} ({ctx.page_url})")
+    if ctx.page_summary:
+        lines.append(f"WHAT A SCREEN READER SEES NOW: {ctx.page_summary}")
+    if ctx.recall_hint:
+        lines.append(
+            f"MEMORY (advisory only — re-ground on the live page, never trust "
+            f"blindly): {ctx.recall_hint}"
+        )
+    return "\n".join(lines)
+
+
 def _decide_prompt(
     goal: str,
     ranked_slice: SelectorMap,
@@ -261,9 +355,14 @@ def _decide_prompt(
     history: list[StepProposal],
     *,
     retry_error: str | None = None,
+    context: Optional[DecideContext] = None,
 ) -> str:
-    parts = [
-        f"GOAL: {goal}",
+    parts: list[str] = []
+    ctx_block = _render_context(context)
+    if ctx_block:
+        parts += [ctx_block, ""]
+    parts += [
+        f"IMMEDIATE STEP GOAL: {goal}",
         "",
         "NUMBERED ITEMS YOU CAN ACT ON (target_index MUST be one of these):",
         _render_slice(ranked_slice),
@@ -329,6 +428,20 @@ def _coerce_ref(raw: Any) -> Optional[str]:
     return str(raw)
 
 
+def _coerce_alternatives(raw: Any) -> list[int]:
+    """Coerce the model's ``alternatives`` (a JSON array of string-encoded live
+    indices) back to a list of ints, dropping anything that isn't an int. Liberal —
+    the kernel re-filters against the live map; this only shapes."""
+    if not isinstance(raw, list):
+        return []
+    out: list[int] = []
+    for item in raw:
+        coerced = _coerce_index(item)
+        if coerced is not None:
+            out.append(coerced)
+    return out
+
+
 def _decode_step(payload: dict[str, Any]) -> StepProposal:
     """Build a ``StepProposal`` from the decoded JSON, coercing the string enums
     (index, value_ref) back to their contract types. Liberal on unknown enum
@@ -351,6 +464,12 @@ def _decode_step(payload: dict[str, Any]) -> StepProposal:
         irreversibility_rationale=str(payload.get("irreversibility_rationale", "")),
         success_check=success_check,
         say=str(payload.get("say", "")),
+        # The model's self-reported ambiguity: other plausible target indices.
+        # Default empty (the unambiguous case); the kernel re-filters to live ids.
+        alternatives=_coerce_alternatives(payload.get("alternatives")),
+        # The model's self-reported polarity: does 'say' assert an absence/negative?
+        # Default False (a positive read-back); routes negatives to the verifier.
+        asserts_absence=bool(payload.get("asserts_absence", False)),
     )
 
 
@@ -371,6 +490,46 @@ def _ground_say(proposal: StepProposal, facts: list[Fact]) -> StepProposal:
             return proposal  # a verbatim substring of a grounded span — allowed.
     # Ungrounded restatement — clear it (the kernel speaks nothing, never a guess).
     return proposal.model_copy(update={"say": ""})
+
+
+def _log_decide(
+    ctx: Optional[DecideContext],
+    proposal: StepProposal,
+    n_items: int,
+    n_facts: int,
+    ms: Optional[float],
+) -> None:
+    """Print the FULL decide trace to stdout (→ /tmp/clarion-worker.log): exactly
+    what the step-decider was given and what it chose. This is the no-truncation
+    behavioural trace — the worker log is the dev log, so it is always on. The
+    adapters only run live (tests use ``FakeReasoner``), so this never touches the
+    network-free gate. Best-effort — never breaks a decision."""
+    try:
+        intent = (ctx.user_intent if ctx else "") or ""
+        phase = (
+            f"{ctx.subgoal_index + 1}/{ctx.subgoal_total}:{ctx.subgoal_description}"
+            if ctx
+            else ""
+        )
+        page = (ctx.page_title if ctx else "") or ""
+        check = (ctx.subgoal_done_check if ctx else "") or ""
+        ms_s = f"{ms:.0f}" if ms is not None else "?"
+        print(
+            f"  [decide-ctx] intent={intent!r} phase={phase!r} "
+            f"done_check={check!r} page={page!r} items={n_items} facts={n_facts}",
+            flush=True,
+        )
+        print(
+            f"  [decide-out] action={proposal.action_kind} "
+            f"target={proposal.target_index} value_ref={proposal.value_ref} "
+            f"check={proposal.success_check} irrev={proposal.irreversibility} "
+            f"ms={ms_s}",
+            flush=True,
+        )
+        if proposal.scratch_reasoning:
+            print(f"  [decide-why] {proposal.scratch_reasoning}", flush=True)
+    except Exception:  # noqa: BLE001 - tracing must never break a decision
+        pass
 
 
 class GeminiReasoner(Reasoner):
@@ -484,10 +643,12 @@ class GeminiReasoner(Reasoner):
         ranked_slice: SelectorMap,
         facts: list[Fact],
         history: list[StepProposal],
+        context: DecideContext | None = None,
     ) -> StepProposal:
         """Decide the next grounded step. Structured output → post-decode guard →
         single re-ask on reject → fail-closed (``ReasonerError``). NEVER returns an
-        invalid (off-page / dangling) proposal."""
+        invalid (off-page / dangling) proposal. ``context`` is the rich situational
+        frame (verbatim intent, plan phase, live page) the decision is made inside."""
         self.decide_calls.append(goal)
         import time
 
@@ -498,7 +659,7 @@ class GeminiReasoner(Reasoner):
         t0 = time.perf_counter()
         data = await self._generate_json(
             _DECIDE_SYSTEM,
-            _decide_prompt(goal, ranked_slice, facts, history),
+            _decide_prompt(goal, ranked_slice, facts, history, context=context),
             schema,
         )
         proposal = _ground_say(_decode_step(data), facts)
@@ -509,7 +670,12 @@ class GeminiReasoner(Reasoner):
             data = await self._generate_json(
                 _DECIDE_SYSTEM,
                 _decide_prompt(
-                    goal, ranked_slice, facts, history, retry_error=verdict.reason
+                    goal,
+                    ranked_slice,
+                    facts,
+                    history,
+                    retry_error=verdict.reason,
+                    context=context,
                 ),
                 schema,
             )
@@ -522,6 +688,7 @@ class GeminiReasoner(Reasoner):
                     f"a re-ask: {verdict.reason}"
                 )
         self.last_decide_ms = (time.perf_counter() - t0) * 1000.0
+        _log_decide(context, proposal, len(ranked_slice.nodes), len(facts), self.last_decide_ms)
         return proposal
 
 

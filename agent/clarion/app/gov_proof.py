@@ -217,9 +217,10 @@ class ResilientReasoner(Reasoner):
         ranked_slice: SelectorMap,
         facts: list[Fact],
         history: list[StepProposal],
+        context=None,  # noqa: ANN001 - forwarded verbatim to the wrapped reasoner
     ) -> StepProposal:
         return await self._with_failover(
-            "decide_step", goal, ranked_slice, facts, history
+            "decide_step", goal, ranked_slice, facts, history, context
         )
 
 

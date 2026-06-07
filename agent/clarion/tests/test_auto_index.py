@@ -164,7 +164,7 @@ class _FillReasoner:
     async def plan_goal(self, goal, orient, affordances):  # noqa: ANN001, ARG002
         return [Subgoal(description="enter the amount", done_check="field_nonempty")]
 
-    async def decide_step(self, goal, ranked_slice, facts, history):  # noqa: ANN001, ARG002
+    async def decide_step(self, goal, ranked_slice, facts, history, context=None):  # noqa: ANN001, ARG002
         target = next(iter(sorted(ranked_slice.nodes)), None)
         return StepProposal(
             scratch_reasoning="fill the amount field",

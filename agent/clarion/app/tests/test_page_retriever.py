@@ -210,7 +210,7 @@ class _FillTopRankedReasoner:
         from clarion.contracts.state import Subgoal
         return [Subgoal(description=goal, done_check="field_nonempty")]
 
-    async def decide_step(self, goal, ranked_slice, facts, history):  # noqa: ANN001, ARG002
+    async def decide_step(self, goal, ranked_slice, facts, history, context=None):  # noqa: ANN001, ARG002
         from clarion.contracts.state import StepProposal
         target = next(iter(sorted(ranked_slice.nodes)), None)
         return StepProposal(

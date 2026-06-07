@@ -144,6 +144,10 @@ class StageGraphRunner:
         # Last graph-state snapshot, so advance_task can speak an HONEST terminal
         # line (completed vs couldn't-complete) instead of a blanket "task complete".
         self._last_values: Optional[dict] = None
+        # How many `trace` events have already been logged, so `_log_trace` only
+        # emits the NEW ones each step (the PROPOSE/GATE/EXECUTOR/REPLANNER trace
+        # surfaced to /tmp/clarion-worker.log for a debuggable live run).
+        self._trace_logged = 0
 
     @property
     def ready(self) -> bool:
@@ -212,6 +216,28 @@ class StageGraphRunner:
         except Exception:  # noqa: BLE001
             self._last_values = None
 
+    def _log_trace(self) -> None:
+        """Surface each NEW `trace` event since the last step to stdout (which the
+        worker pipes to /tmp/clarion-worker.log), so the PLANNER/PROPOSE/GATE/
+        EXECUTOR/REPLANNER decisions are FULLY visible in a live run.
+
+        FULL TRACING (no whitelist, no clipping): every `data` field is printed —
+        the whole plan, the decide context (verbatim intent + phase + done_check),
+        and the model's own `scratch` reasoning — so the behaviour is completely
+        traceable. The worker log IS the dev log. Best-effort — never breaks a turn
+        (matches the HUD/publish `# noqa: BLE001` pattern)."""
+        try:
+            events = (self._last_values or {}).get("trace", []) or []
+            for event in events[self._trace_logged :]:
+                node = getattr(event, "node", "?")
+                ev = getattr(event, "event", "info")
+                data = getattr(event, "data", None) or {}
+                compact = " ".join(f"{k}={v}" for k, v in sorted(data.items()))
+                print(f"  [task] {node}.{ev} {compact}".rstrip(), flush=True)
+            self._trace_logged = len(events)
+        except Exception:  # noqa: BLE001 - trace logging must never break a turn
+            pass
+
     async def advance(self) -> Optional[ConsentRequest]:
         """Run the stage graph to the next consent interrupt. Returns the surfaced
         `ConsentRequest` the agent must speak, or None when the run reaches END."""
@@ -231,6 +257,7 @@ class StageGraphRunner:
             result = await self._graph.ainvoke(None, self._cfg)
         await self._publish()
         self._capture_state()
+        self._log_trace()
         if "__interrupt__" not in result:
             return None
         (intr,) = result["__interrupt__"]
@@ -245,6 +272,7 @@ class StageGraphRunner:
         )
         await self._publish()
         self._capture_state()
+        self._log_trace()
         if "__interrupt__" not in result:
             return None
         (intr,) = result["__interrupt__"]
@@ -495,16 +523,18 @@ async def entrypoint(ctx) -> None:
         role = getattr(item, "role", "?")
         text = (getattr(item, "text_content", "") or "").strip()
         if text:
-            hud(f"[turn] {role}", text[:240], "info")
+            # Full tracing: don't clip the spoken turn (the worker log is the dev log).
+            hud(f"[turn] {role}", text, "info")
 
     @session.on("function_tools_executed")
     def _on_tools(ev) -> None:  # noqa: ANN001 - the LLM's tool decisions this turn
         for fc in getattr(ev, "function_calls", None) or []:
             name = getattr(fc, "name", "?")
             args = getattr(fc, "arguments", "")
-            hud("[tool] →", f"{name}({args})"[:240], "info")
+            # Full tracing: the whole tool call + its whole result, un-clipped.
+            hud("[tool] →", f"{name}({args})", "info")
         for out in getattr(ev, "function_call_outputs", None) or []:
-            hud("[tool] ←", str(getattr(out, "output", ""))[:240], "ok")
+            hud("[tool] ←", str(getattr(out, "output", "")), "ok")
 
     # Per-frame VAD/STT metrics (VADMetrics, STTMetrics duration=0.00, …) are the
     # bulk of the log noise — silenced (handler left unregistered). When profiling
@@ -532,7 +562,7 @@ async def entrypoint(ctx) -> None:
             if extension_actuator_selected():
                 from clarion.app.extension_runtime import ExtensionRuntime
 
-                ext = ExtensionRuntime(demo_url=demo_url, mode="fast", room=ctx.room)
+                ext = ExtensionRuntime(demo_url=demo_url, mode="normal", room=ctx.room)
                 # The tab bridge is the ALWAYS-ON broker (started by clarion-up),
                 # NOT a port we bind here — that's what decouples it from voice.
                 # We dial the broker as a client and wait for the tab to attach.
@@ -543,7 +573,7 @@ async def entrypoint(ctx) -> None:
                 runtime = await ext.build_runtime()
             else:
                 runtime = await HeroRuntime.create(
-                    demo_url, mode="fast", room=ctx.room, headless=True
+                    demo_url, mode="normal", room=ctx.room, headless=True
                 )
             runner.bind(runtime)
             loop("stage-graph runner READY — tab actions enabled")
