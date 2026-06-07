@@ -178,11 +178,20 @@ class Passage(BaseModel):
 
 
 class Profile(BaseModel):
-    """User profile read back from Memory (Moss/Atlas write-back)."""
+    """User profile read back from Memory (Moss/Atlas write-back).
+
+    ``preferences`` and ``episodes`` are the de-hardcoded knowledge layer's
+    additions (the memory design): remembered standing traits and completed-
+    workflow records. Both default-empty, so every existing ``Profile(...)`` call is
+    unchanged. NEITHER is a ``Fact`` — a recalled preference/episode carries no
+    ``source_node_id`` and is never spoken as a fresh grounded fact.
+    """
 
     user_id: str
     facts: list[Fact] = Field(default_factory=list)
     attributes: dict[str, str] = Field(default_factory=dict)
+    preferences: dict[str, str] = Field(default_factory=dict)
+    episodes: list["WorkflowEpisode"] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +277,67 @@ class StepProposal(BaseModel):
     # The verbatim grounded string the voice plane speaks — extracted from grounded
     # spans, never generated. Empty for a silent step.
     say: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Memory / knowledge-layer value objects (the user-memory design — backlog #4).
+# Pure models; ZERO SDK. The INVARIANT FIREWALL lives in ``Recall``: it is NOT a
+# ``Fact`` and has NO ``source_node_id`` field, so the VERIFY membership fence
+# cannot admit a remembered value as speakable — a recalled plan/preference must
+# be re-grounded on the live page before anything is spoken or acted on.
+# ---------------------------------------------------------------------------
+
+
+class ConsentRecord(BaseModel):
+    """A lean, contract-pure projection of one consent decision, for the episode
+    record — what was proposed, whether it was irreversible, and how it was
+    decided. (``gov_proof``'s ``ConsentEvent`` is an app-layer dataclass; THIS is
+    the frozen value object the memory layer persists and recalls.) Advisory only:
+    a recalled decision NEVER auto-consents — every irreversible step still hits a
+    fresh live ``interrupt()`` and a fresh per-step "yes" (foundation §1)."""
+
+    proposal_id: str = ""
+    utterance: str = ""
+    irreversible: bool = False
+    decision: str = ""
+
+
+class WorkflowEpisode(BaseModel):
+    """A persisted completed-workflow record — the reasoned ``Subgoal`` plan +
+    consent decisions + timings of a finished run. Stored by the ``Memory`` port
+    and recalled to warm-start the NEXT run's plan on the same/similar goal.
+
+    It carries the PLAN and the consent SHAPE, never a grounded page value: there
+    is no ``Fact`` and no ``source_node_id`` anywhere here, so a recalled episode
+    can never be spoken as a fresh grounded fact (the invariant holds by
+    construction). The store side deliberately omits the run's ``grounded_facts``.
+    """
+
+    goal: str = ""
+    url_host: str = ""
+    subgoals: list[Subgoal] = Field(default_factory=list)
+    plan_utterance: str = ""
+    outcome: Literal["completed", "declined", "error"] = "completed"
+    consent: list[ConsentRecord] = Field(default_factory=list)
+    hard_stops: int = 0
+    approvals: int = 0
+    decide_ms_mean: float = 0.0
+    perceive_ms_mean: float = 0.0
+    completed_at: float = 0.0
+
+
+class Recall(BaseModel):
+    """What ``Memory.recall`` returns to the planner to make the NEXT run faster +
+    recall preferences. THE INVARIANT FIREWALL: a ``Recall`` is structurally NOT a
+    ``Fact`` and has NO ``source_node_id`` field, so a remembered value cannot be
+    routed through VERIFY as speakable. ``plan_hint`` warm-starts the plan,
+    ``preferences`` supply fill CANDIDATES, ``consent_recall`` surfaces a spoken
+    reminder at the gate — all advisory, all re-grounded/re-consented live."""
+
+    plan_hint: Optional["WorkflowEpisode"] = None
+    preferences: dict[str, str] = Field(default_factory=dict)
+    consent_recall: list[ConsentRecord] = Field(default_factory=list)
+    similarity: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +447,10 @@ class ClarionState(TypedDict):
     trace: Annotated[list[TraceEvent], operator.add]
 
 
+# Resolve Profile's forward reference to ``WorkflowEpisode`` (defined after Profile).
+Profile.model_rebuild()
+
+
 __all__ = [
     "AxNode",
     "SelectorMap",
@@ -389,6 +463,9 @@ __all__ = [
     "Proposal",
     "Subgoal",
     "StepProposal",
+    "ConsentRecord",
+    "WorkflowEpisode",
+    "Recall",
     "Observation",
     "PageDiff",
     "Stage",
