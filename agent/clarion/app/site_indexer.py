@@ -68,9 +68,24 @@ def _origin(url: str) -> str:
     return f"{p.scheme}://{p.netloc}"
 
 
+# ONE category index for ALL sites' structure (replaces one-index-per-site). Sites
+# are separated by the ``site`` metadata + a query-time filter, NOT by index — the
+# recommended Moss data model (docs/research/moss-index-design.md): far fewer indexes
+# (stays under the plan cap), trivial onboarding (just tag metadata), one shared
+# embedding model. Kept distinct from the policy KB (``clarion-kb``).
+STRUCTURE_INDEX = "clarion-site-structure"
+
+
+def host_of(url: str) -> str:
+    """The host — the ``site`` partition key for the shared structure index
+    (e.g. ``www.usa.gov``). Lower-cased; ``""`` for a blank/garbage URL."""
+    return (urlparse(url).netloc or "").lower()
+
+
 def index_name_for(url: str) -> str:
-    """Per-site Moss index name, e.g. ``clarion-site-www-usa-gov``. Keeps each
-    site's structure map separate from the policy KB (``clarion-kb``)."""
+    """DEPRECATED (pre-migration): the per-site index name, e.g.
+    ``clarion-site-www-usa-gov``. Retained for back-compat; the live path now uses
+    the single ``STRUCTURE_INDEX`` + a ``site`` metadata filter instead."""
     host = urlparse(url).netloc.lower() or "site"
     slug = re.sub(r"[^a-z0-9]+", "-", host).strip("-")
     return f"clarion-site-{slug}"
@@ -116,12 +131,14 @@ async def crawl_and_index(
     log: Callable[[str], None] = print,
 ) -> CrawlResult:
     """Read-only same-origin BFS from ``start_url``; index each page's STRUCTURE
-    into a per-site Moss index. Returns what was indexed (and what was skipped)."""
+    into the shared category index (``STRUCTURE_INDEX``), tagged with the ``site``
+    host so queries scope by metadata filter. Returns what was indexed (+ skipped)."""
     from clarion.actuator.actuator import PlaywrightActuator
     from clarion.retrieval import GeminiMossIngest
 
     origin = _origin(start_url)
-    index = index or index_name_for(start_url)
+    index = index or STRUCTURE_INDEX
+    host = host_of(start_url)
     result = CrawlResult(index=index, origin=origin)
 
     actuator = await PlaywrightActuator.create(start_url, headless=headless)
@@ -165,47 +182,56 @@ async def crawl_and_index(
         return result
 
     # One combined doc → one chunk per page (split on the `#` headings) → ONE
-    # batched embed + ONE index build. Reuses the live Ingest adapter verbatim.
+    # batched embed + ONE upsert. Every chunk is tagged with the `site` host so the
+    # single category index holds all sites, scoped at query time by a metadata
+    # filter (docs/research/moss-index-design.md). Reuses the live Ingest adapter.
     doc = "\n\n".join(blocks)
     ingest = GeminiMossIngest(index=index)
-    passages = await ingest.ingest(doc)
+    passages = await ingest.ingest(
+        doc, extra_metadata={"site": host, "category": "structure"}
+    )
     result.chunks = len(passages)
     log(f"  [done] indexed {len(result.pages)} pages → {result.chunks} chunks "
-        f"into Moss index {index!r}.")
+        f"into Moss index {index!r} (site={host!r}).")
     return result
 
 
 class SiteKnowledge:
-    """Query-time consult of the per-site STRUCTURE index (the crawler's output) —
+    """Query-time consult of the shared STRUCTURE index (the crawler's output) —
     the read side of knowledge-layer item #4(a), injected into the planner.
 
-    Given the live page URL, it picks the matching `clarion-site-<host>` index and
-    returns grounded STRUCTURE facts (other pages + their affordances) to inform
-    PLANNING ("which page hosts this flow"). It is **best-effort and fail-open**:
-    any miss — index not built yet, no creds, network error — yields ``[]`` so the
-    planner silently degrades to page-only, never erroring. It NEVER feeds the
-    epistemic GROUND (these are cross-page structure facts, not live current-page
-    values), so the no-fact-without-a-live-source invariant is untouched.
+    Given the live page URL, it queries the ONE ``STRUCTURE_INDEX`` and scopes to the
+    current site with a metadata filter (``site $eq <host>``), returning grounded
+    STRUCTURE facts (other pages + their affordances) to inform PLANNING ("which page
+    hosts this flow"). It is **best-effort and fail-open**: any miss — index not built
+    yet, no creds, network error — yields ``[]`` so the planner silently degrades to
+    page-only, never erroring. It NEVER feeds the epistemic GROUND (these are
+    cross-page structure facts, not live current-page values), so the
+    no-fact-without-a-live-source invariant is untouched.
 
-    One ``MossRetriever`` is memoised per index (lazy `load_index` on first query).
+    One ``MossRetriever`` over the shared index is memoised (lazy ``load_index`` on
+    first query); per-site separation is the metadata filter, not the index
+    (docs/research/moss-index-design.md).
     """
 
     def __init__(self, *, k: int = 4) -> None:
         self._k = k
-        self._by_index: dict[str, object] = {}
+        self._retriever = None  # one MossRetriever over the shared STRUCTURE_INDEX
 
     async def context_facts(self, url: str, goal: str) -> list[Fact]:
-        if not url:
+        host = host_of(url)
+        if not host:
             return []
-        index = index_name_for(url)
         try:
-            retriever = self._by_index.get(index)
-            if retriever is None:
+            if self._retriever is None:
                 from clarion.retrieval import MossRetriever
 
-                retriever = MossRetriever(index=index)
-                self._by_index[index] = retriever
-            return await retriever.query(goal, k=self._k)
+                self._retriever = MossRetriever(index=STRUCTURE_INDEX)
+            return await self._retriever.query(
+                goal,
+                k=self._k,
+                filter={"field": "site", "condition": {"$eq": host}},
+            )
         except Exception:  # noqa: BLE001 - consult is optional; degrade to page-only
             return []
 
@@ -231,12 +257,16 @@ async def main() -> int:
         return 1
 
     # The real proof (status doc): load the index back and query it — round-trip
-    # retrieval over what we just crawled.
+    # retrieval over what we just crawled, scoped to THIS site via a metadata filter
+    # (the same path SiteKnowledge uses).
     from clarion.retrieval import MossRetriever
 
-    print(f"\n== smoke query: {query!r} (index {res.index!r}) ==")
+    host = host_of(start_url)
+    print(f"\n== smoke query: {query!r} (index {res.index!r}, site={host!r}) ==")
     retriever = MossRetriever(index=res.index)
-    hits = await retriever.query(query, k=3)
+    hits = await retriever.query(
+        query, k=3, filter={"field": "site", "condition": {"$eq": host}}
+    )
     if not hits:
         print("  (no hits — index may still be building, or the query missed)")
     for i, h in enumerate(hits, 1):

@@ -169,8 +169,19 @@ class GeminiMossIngest(Ingest):
 
         return await asyncio.to_thread(_call)
 
-    async def ingest(self, doc: bytes | str) -> list[Passage]:
-        """Parse → chunk → Gemini-embed → upsert to Moss → return Passages."""
+    async def ingest(
+        self, doc: bytes | str, *, extra_metadata: Optional[dict] = None
+    ) -> list[Passage]:
+        """Parse → chunk → Gemini-embed → upsert to Moss → return Passages.
+
+        ``extra_metadata`` is merged into every chunk's metadata — the partition key
+        for a CATEGORY index shared across tenants (e.g. ``{"site": host,
+        "category": "structure"}`` so one ``clarion-site-structure`` index holds all
+        sites, queried with a ``filter`` on ``site`` — see
+        ``docs/research/moss-index-design.md``). It is also folded into the
+        content-derived doc id so two tenants with identical chunk text don't collide
+        on one ref (while re-ingesting the SAME tenant's chunk still upserts in place).
+        """
         text = await self._parse(doc)
         chunks = _chunk_text(text)
         if not chunks:
@@ -185,11 +196,15 @@ class GeminiMossIngest(Ingest):
         # Stable, content-derived ids so re-ingesting the same doc upserts in place.
         moss_docs: list[MossDoc] = []
         passages: list[Passage] = []
+        extra = {str(k): str(v) for k, v in (extra_metadata or {}).items()}
+        # Fold the partition metadata into the content hash so two tenants with the
+        # same chunk text get distinct refs, while the SAME tenant's chunk stays stable.
+        salt = "|".join(f"{k}={extra[k]}" for k in sorted(extra))
         for i, (chunk, vec) in enumerate(zip(chunks, vectors)):
-            digest = hashlib.sha1(chunk.encode("utf-8")).hexdigest()[:12]
+            digest = hashlib.sha1(f"{salt}|{chunk}".encode("utf-8")).hexdigest()[:12]
             ref = f"{self._index}::{digest}"
             heading = chunk.splitlines()[0][:80] if chunk.splitlines() else ""
-            meta = {"chunk": str(i), "heading": heading}
+            meta = {**extra, "chunk": str(i), "heading": heading}
             moss_docs.append(MossDoc(id=ref, text=chunk, metadata=meta, embedding=vec))
             passages.append(Passage(text=chunk, ref=ref, score=1.0, metadata=meta))
 

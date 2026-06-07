@@ -83,9 +83,15 @@ class MossRetriever(Retriever):
             await self._moss.load_index(self._index)
             self._loaded = True
 
-    async def query(self, q: str, *, k: int = 5) -> list[Fact]:
+    async def query(self, q: str, *, k: int = 5, filter: dict | None = None) -> list[Fact]:
         """Embed the query with Gemini, run the local Moss search, map hits →
-        ranked grounded ``Fact``s (each with a ``source_node_id`` + ``retrieved_at``)."""
+        ranked grounded ``Fact``s (each with a ``source_node_id`` + ``retrieved_at``).
+
+        ``filter`` (optional, additive to the frozen ``Retriever.query`` signature) is
+        a Moss metadata predicate that scopes the search to a subset of ONE category
+        index — e.g. ``{"field": "site", "condition": {"$eq": host}}`` to read one
+        site's structure out of the shared ``clarion-site-structure`` index
+        (``docs/research/moss-index-design.md``). Evaluated on the loaded index."""
         await self._ensure_loaded()
 
         t0 = time.perf_counter()
@@ -93,7 +99,7 @@ class MossRetriever(Retriever):
         # index: embed with Gemini and pass the vector.
         vec = None if self._embedder is None else (await self._embedder.embed([q]))[0]
         res = await self._moss.search(
-            self._index, q, top_k=k, embedding=vec, alpha=self._alpha
+            self._index, q, top_k=k, embedding=vec, alpha=self._alpha, filter=filter
         )
         self._last_query_ms = (time.perf_counter() - t0) * 1000.0
         self._last_runtime_ms = res.time_taken_ms

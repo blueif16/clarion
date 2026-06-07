@@ -63,8 +63,8 @@ never the `web/demo-site` clone.
 | **Epistemic fences** | **✅ REAL** | `kernel/policy.py` membership (`is_speakable_value`) + pairing (`pairing_backs`); `NegativeVerifier` hedge |
 | **Irreversibility gate** | **✅ REAL — dual-signal** | `kernel/irreversibility.py` (structural pre-screen escalate-only; UNKNOWN-on-no-undo gates Fast) |
 | **Done-check** | **✅ REAL — code-selected, anchored** | `stages/checks.py` 5 generic checks + URL anchor; hardcoded registry DELETED |
-| Retrieval (Moss, KB) | **embedding path config-gated; built-in BLOCKED** | `retrieval/`; `MOSS_EMBED_MODEL` selects **Gemini custom** (working — custom vectors bypass the model host) or **built-in `moss-minilm`/`moss-mediumlm`** (wired but DEAD: `models.moss.link` still can't serve the model to the moss runtime — `load_index` fails on `.../config.json`, verified 2 ways 2026-06-06). **The active Moss project (in `agent/.env`) is now a clean dedicated one with `clarion-kb` built + smoke-verified** (Gemini custom embeds, ~1ms in-mem). NB the per-project index limit (was 3 → raised 2026-06-06); per-site STRUCTURE indexes live separately as `clarion-site-<host>` |
-| **Website STRUCTURE index** (knowledge layer a) | **WIRED into PLAN (consult) + built/proven live** | `app/site_indexer.py`: read-only same-origin crawl → `describe_page` affordances (no values) → per-site Moss `clarion-site-<host>`. `SiteKnowledge.context_facts` is consulted by the planner (`stages/graph.py` folds a SITE MAP into the plan `orient`), gated by `CLARION_SITE_KNOWLEDGE=1`, fail-open. Proven on usa.gov (consult surfaces `/complaints` first for a complaint goal) |
+| Retrieval (Moss, KB) | **embedding path config-gated; built-in BLOCKED** | `retrieval/`; `MOSS_EMBED_MODEL` selects **Gemini custom** (working — custom vectors bypass the model host) or **built-in `moss-minilm`/`moss-mediumlm`** (wired but DEAD: `models.moss.link` still can't serve the model to the moss runtime — `load_index` fails on `.../config.json`, verified 2 ways 2026-06-06). **The active Moss project (in `agent/.env`) is now a clean dedicated one with `clarion-kb` built + smoke-verified** (Gemini custom embeds, ~1ms in-mem). NB the per-project index limit is a PRICING tier (free Developer=3, paid=Unlimited), not a hard wall. **Moss supports query-time metadata filtering** (`QueryOptions.filter`, `$eq`/`$in`/… on a loaded index) → website structure now lives in ONE `clarion-site-structure` index partitioned by `{site}` metadata, NOT one index per site (`docs/research/moss-index-design.md`) |
+| **Website STRUCTURE index** (knowledge layer a) | **WIRED into PLAN (consult) + built/proven live; ONE category index** | `app/site_indexer.py`: read-only same-origin crawl → `describe_page` affordances (no values) → the SINGLE `clarion-site-structure` index, each chunk tagged `{site,url}`. `SiteKnowledge.context_facts` is consulted by the planner (`stages/graph.py` folds a SITE MAP into the plan `orient`) and scopes by metadata `filter` (`site $eq <host>`), gated by `CLARION_SITE_KNOWLEDGE=1`, fail-open. **Per-category-not-per-site** (research: `docs/research/moss-index-design.md`; Moss `QueryOptions.filter`). Proven on usa.gov (consult surfaces `/complaints` first; non-matching site filter → 0) |
 | User profile/traits store | **port exists, unused** | `Memory`/`Profile` ports (knowledge layer — next) |
 
 ---
@@ -127,12 +127,15 @@ behavior on a real site with `load_dotenv` keys, never an exit code.
 4. **Knowledge layer** (the user's vision): graphs + embedding DBs over
    **(a) website functionalities** (seed = `PageReadout.affordances`) — ✅ a read-only
    STRUCTURE crawler shipped as a SPIKE (`app/site_indexer.py`): same-origin BFS →
-   `describe_page` affordances (NEVER live values) → per-site Moss `clarion-site-<host>`,
-   proven on usa.gov. ✅ **Now WIRED into PLAN**: `SiteKnowledge.context_facts`
-   (gated `CLARION_SITE_KNOWLEDGE=1`, fail-open) is consulted by the planner, which
-   folds a SITE MAP into the plan `orient` so the Reasoner can pick which page to
-   navigate to. Next: a background crawl-on-activation + extend the consult into
-   PROPOSE. Then **(b) task paths** (the subgoal plans we run), **(c) user profile/traits**
+   `describe_page` affordances (NEVER live values) → the SINGLE `clarion-site-structure`
+   index, partitioned by `{site}` metadata (per-category, not per-site —
+   `docs/research/moss-index-design.md`), proven on usa.gov. ✅ **WIRED into PLAN**:
+   `SiteKnowledge.context_facts` (gated `CLARION_SITE_KNOWLEDGE=1`, fail-open) is
+   consulted by the planner, scoped by a `site` metadata filter, folding a SITE MAP
+   into the plan `orient` so the Reasoner can pick which page to navigate to. Next: a
+   background crawl-on-activation + extend the consult into PROPOSE; apply the same
+   category+metadata model to **(b) task paths** (the subgoal plans we run) and
+   **(c) user profile/traits**
    (the `Memory`/`Profile` port). Categorize + persist + reuse across sites.
 5. **Data-model simplification pass.** Audit `ClarionState`/`_PlanState` + value
    objects; keep only what we track (no bloat).
