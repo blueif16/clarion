@@ -6,12 +6,19 @@ recall · remember-gate logic). **Pending:** the voice remember-gate *surfacing*
 (`voice_entry`, in-flight) + a live Moss episode round-trip. Storage = the current Moss
 implementation._
 
-_NB (post-design discovery, from the structure-index research): Moss **does** support
-query-time metadata filtering (`QueryOptions.filter`), and the index cap is a pricing tier
-(free=3, paid=unlimited) — so §0's "no metadata filter" / per-user-index reasoning is
-**superseded**. The shipped impl keeps the per-user `clarion-mem-{user}` index (works;
-single-user `"default"` for the event); a clean future simplification is ONE shared
-`clarion-mem` index keyed by `user_id` + `kind` metadata filters._
+_**Index layout — SUPERSEDED → category indexes (matches `docs/research/moss-index-design.md`).**
+Moss **does** support query-time metadata filtering (`QueryOptions.filter`) and the index
+cap is a pricing tier, so the per-user `clarion-mem-{user}` index in §0/§1/§2 below is the
+ORIGINAL design and is **no longer how it's built**. The shipped adapter uses TWO shared
+category indexes partitioned by a `user_id` metadata filter (`user_id $eq <uid>`):_
+- _**`clarion-profile`** — facts (`kind="fact"`) + preferences (`kind="preference"`)._
+- _**`clarion-task-paths`** — episodes (`kind="episode"`), keyed by `(user_id, goal, site)`._
+
+_Everything else below — the doc shapes, the `kind` discriminator, the write/reuse paths, the
+invariant firewall — is unchanged; only the index NAMING moved from one-index-per-user to
+category-index-+-filter. This scales to any number of users/sites within the index budget and
+matches the site-structure index. Index names override via `MOSS_PROFILE_INDEX` /
+`MOSS_TASKPATHS_INDEX`._
 
 This is backlog item #4 (the knowledge layer) in `docs/clarion-status.md`, scoped down
 to what ships for the event. It persists **what the user has done and prefers** so the
