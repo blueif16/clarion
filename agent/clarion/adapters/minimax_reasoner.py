@@ -65,6 +65,12 @@ class MinimaxReasoner(OpenAIReasoner):
         super().__init__(
             api_key=resolved_key, model=resolved_model, base_url=resolved_base
         )
+        # MiniMax-M3 runs in thinking mode by DEFAULT and inlines a `<think>…</think>`
+        # block in `content` before the JSON — which breaks structured-output
+        # parsing AND adds decode latency. Disable it (the MiniMax analog of the
+        # Gemini `thinking_budget=0` fix: a config knob on the SAME model, not a
+        # swap). `_strip_think` in the parent is the belt-and-suspenders fallback.
+        self._extra_body = {"thinking": {"type": "disabled"}}
 
     def _ensure_client(self):
         # Same lazy OpenAI client as the parent, but with a MiniMax-accurate
