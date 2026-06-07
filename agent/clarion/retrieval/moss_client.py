@@ -25,13 +25,18 @@ Moss has two planes, both rooted at ``https://service.usemoss.dev``:
 
 EMBEDDINGS — two selectable paths, via ``MOSS_EMBED_MODEL`` (``builtin_embed_model``):
 
-  - **Built-in (default-recommended now)** — ``moss-minilm`` / ``moss-mediumlm``.
-    Moss embeds text internally in its Rust runtime (no key, sub-ms, no external
-    embed RPC). This path fetches the model from ``https://models.moss.link`` at
-    ``load_index`` time; that host was TLS-broken (``WRONG_VERSION_NUMBER``) on
-    2026-05-31 but is back to a clean TLS 1.3 handshake (re-probed 2026-06-06), so
-    the built-in path is viable again. Docs carry NO ``embedding``; the index is
-    built with ``model_id=<that built-in id>``.
+  - **Built-in (the default)** — ``moss-minilm`` / ``moss-mediumlm``. Moss embeds
+    text internally in its Rust runtime (no key, sub-10ms, no external embed RPC).
+    The ~90MB ONNX model is fetched from ``https://models.moss.link`` ONCE at the
+    first ``load_index`` and cached under ``~/.cache/moss-models/`` (overridable via
+    ``MOSS_MODEL_CACHE_DIR`` / ``MODEL_DOWNLOAD_URL``) — every load after is offline.
+    GOTCHA (cost us hours, do NOT re-misdiagnose): a local **SafeBrowse SNI web-
+    filter** — seen here via a Tailscale exit node — silently blocks
+    ``models.moss.link``. Symptom = TLS ``WRONG_VERSION_NUMBER`` on the handshake /
+    ``load_index`` failing on ``.../config.json``. It is NOT a Moss outage and NOT
+    fixable in code: clear the exit node (``tailscale set --exit-node=``) or
+    allowlist the host, do the one-time download, then the cache makes it permanent.
+    Docs carry NO ``embedding``; the index is built with ``model_id=<built-in id>``.
   - **Custom (Gemini) — fallback** — when ``MOSS_EMBED_MODEL`` is unset/``gemini``
     we embed with Gemini (``gemini-embedding-001``) at ingest + query, mark the
     index ``model_id="custom"``, and the runtime never touches the model host.
