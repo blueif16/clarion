@@ -389,7 +389,36 @@ def build_stage_graph(
             "paired_facts": state.get("paired_facts", []),
         }  # type: ignore[assignment]
 
-        result = await kernel.ainvoke(seed, kernel_cfg)
+        # On a CONSENT RESUME the parent `executor` node re-executes from the TOP
+        # (langgraph semantics), so this code re-runs. If the child kernel thread is
+        # already parked at its consent interrupt, a bare `ainvoke(seed)` would
+        # DISCARD that parked interrupt and re-decide from scratch — losing the
+        # proposal the user just approved (ACT then never runs the approved click,
+        # and the flow loops re-asking for consent). So: if the child is parked,
+        # RESUME it with the cached decision instead of re-seeding.
+        snap = await kernel.aget_state(kernel_cfg)
+        child_parked = bool(snap.next)
+        print(
+            f"  [drive] subgoal={idx} {'RESUME parked kernel' if child_parked else 'seed fresh kernel'} "
+            f"pending={(state.get('pending_proposal').id if state.get('pending_proposal') else None)}",
+            flush=True,
+        )
+        if child_parked:
+            pp = state.get("pending_proposal")
+            # This interrupt() returns the ALREADY-cached consent decision (its value
+            # is never re-surfaced), so it just hands the user's yes/no to the parked
+            # child to drive it CONSENT → ACT exactly once on the approved proposal.
+            req = ConsentRequest(
+                proposal_id=pp.id if pp else "",
+                utterance=pp.utterance if pp else "",
+                irreversible=bool(pp.irreversible) if pp else True,
+            )
+            decision = ConsentDecision.model_validate(interrupt(req.model_dump()))
+            result = await kernel.ainvoke(
+                Command(resume=decision.model_dump()), kernel_cfg
+            )
+        else:
+            result = await kernel.ainvoke(seed, kernel_cfg)
         for _ in range(8):
             if "__interrupt__" not in result:
                 break

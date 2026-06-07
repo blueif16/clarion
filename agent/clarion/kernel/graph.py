@@ -746,6 +746,12 @@ def build_kernel(
         """
         proposal = state["pending_proposal"]
         assert proposal is not None and proposal.action is not None
+        print(
+            f"  [act] proposal={proposal.id} kind={proposal.action.kind} "
+            f"index={proposal.action.index} irreversible={proposal.irreversible} "
+            f"already_acted={_already_acted(state, proposal.id)}",
+            flush=True,
+        )
 
         # (1) idempotency once-flag
         if _already_acted(state, proposal.id):
