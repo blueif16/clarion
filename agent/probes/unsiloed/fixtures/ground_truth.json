@@ -1,0 +1,305 @@
+{
+  "bar_sales.png": {
+    "chart_type": "vertical_bar",
+    "title": "Quarterly Revenue 2025 (USD millions)",
+    "data": {
+      "x_label": "Quarter",
+      "y_label": "Revenue (USD millions)",
+      "categories": [
+        "Q1",
+        "Q2",
+        "Q3",
+        "Q4"
+      ],
+      "values": [
+        12.4,
+        18.9,
+        15.2,
+        23.7
+      ]
+    },
+    "expect": "Report four bars with values 12.4, 18.9, 15.2, 23.7 for Q1-Q4 respectively; y-axis labelled 'Revenue (USD millions)'."
+  },
+  "line_trend.png": {
+    "chart_type": "multi_series_line",
+    "title": "Monthly Active Users (thousands)",
+    "data": {
+      "x_label": "Month",
+      "y_label": "Users (thousands)",
+      "x_categories": [
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun"
+      ],
+      "series": {
+        "Free": [
+          120,
+          135,
+          150,
+          162,
+          158,
+          175
+        ],
+        "Pro": [
+          30,
+          42,
+          55,
+          70,
+          88,
+          110
+        ]
+      }
+    },
+    "expect": "Two series 'Free' and 'Pro' over Jan-Jun; Free ends at 175, Pro ends at 110 (thousands)."
+  },
+  "pie_share.png": {
+    "chart_type": "pie",
+    "title": "Traffic Sources",
+    "data": {
+      "slices": {
+        "Organic": 45,
+        "Paid": 25,
+        "Referral": 18,
+        "Social": 12
+      },
+      "unit": "percentage",
+      "total": 100
+    },
+    "expect": "Pie with four slices: Organic 45%, Paid 25%, Referral 18%, Social 12%."
+  },
+  "grouped_bar.png": {
+    "chart_type": "grouped_bar",
+    "title": "Headcount by Department & Year",
+    "data": {
+      "x_label": "Department",
+      "y_label": "Headcount",
+      "categories": [
+        "Eng",
+        "Sales",
+        "Support"
+      ],
+      "series": {
+        "2024": [
+          40,
+          25,
+          15
+        ],
+        "2025": [
+          62,
+          30,
+          22
+        ]
+      }
+    },
+    "expect": "Six bars (3 departments x 2 years); Eng grew from 40 to 62, Sales 25\u219230, Support 15\u219222."
+  },
+  "scatter_corr.png": {
+    "chart_type": "scatter",
+    "title": "Ad Spend vs. Signups",
+    "data": {
+      "x_label": "Ad Spend (USD k)",
+      "y_label": "Signups",
+      "numpy_seed": 0,
+      "true_slope": 3,
+      "n_points": 40,
+      "x_range": [
+        0,
+        50
+      ],
+      "noise_std": 15,
+      "relationship": "positive linear correlation"
+    },
+    "expect": "40 scattered points showing a positive trend; slope approximately 3; a dashed fit line shown."
+  },
+  "stacked_bar.png": {
+    "chart_type": "stacked_bar",
+    "title": "Expenses by Category per Quarter",
+    "data": {
+      "x_label": "Quarter",
+      "y_label": "Expenses (USD thousands)",
+      "categories": [
+        "Q1",
+        "Q2",
+        "Q3",
+        "Q4"
+      ],
+      "series": {
+        "Salaries": [
+          50,
+          52,
+          55,
+          58
+        ],
+        "Marketing": [
+          20,
+          28,
+          22,
+          35
+        ],
+        "Ops": [
+          10,
+          12,
+          11,
+          14
+        ]
+      }
+    },
+    "expect": "Three stacked segments per quarter; Q4 total = 107 (Salaries 58 + Marketing 35 + Ops 14)."
+  },
+  "dashboard.png": {
+    "chart_type": "mixed_bar_and_table",
+    "title": "Revenue Dashboard",
+    "data": {
+      "bar_chart": {
+        "title": "Quarterly Revenue 2025",
+        "categories": [
+          "Q1",
+          "Q2",
+          "Q3",
+          "Q4"
+        ],
+        "values": [
+          12.4,
+          18.9,
+          15.2,
+          23.7
+        ],
+        "y_label": "Revenue (USD millions)"
+      },
+      "table": {
+        "columns": [
+          "Quarter",
+          "Revenue (USD M)",
+          "Growth %"
+        ],
+        "rows": [
+          [
+            "Q1",
+            "12.4",
+            "\u2014"
+          ],
+          [
+            "Q2",
+            "18.9",
+            "52%"
+          ],
+          [
+            "Q3",
+            "15.2",
+            "-20%"
+          ],
+          [
+            "Q4",
+            "23.7",
+            "56%"
+          ]
+        ]
+      }
+    },
+    "expect": "Left half: bar chart with four bars; right half: a 4-row table with columns Quarter, Revenue, Growth %; Q2 shows 52% growth, Q3 -20%, Q4 56%."
+  },
+  "report.pdf": {
+    "chart_type": "pdf_two_page",
+    "title": "Clarion Analytics Report",
+    "data": {
+      "page_1": {
+        "chart": "multi_series_line",
+        "title": "Monthly Active Users (thousands)",
+        "heading": "Clarion Analytics Report \u2014 Monthly Active Users",
+        "series": {
+          "Free": [
+            120,
+            135,
+            150,
+            162,
+            158,
+            175
+          ],
+          "Pro": [
+            30,
+            42,
+            55,
+            70,
+            88,
+            110
+          ]
+        },
+        "x_categories": [
+          "Jan",
+          "Feb",
+          "Mar",
+          "Apr",
+          "May",
+          "Jun"
+        ]
+      },
+      "page_2": {
+        "chart": "stacked_bar",
+        "title": "Expenses by Category per Quarter",
+        "heading": "Clarion Analytics Report \u2014 Expense Breakdown",
+        "series": {
+          "Salaries": [
+            50,
+            52,
+            55,
+            58
+          ],
+          "Marketing": [
+            20,
+            28,
+            22,
+            35
+          ],
+          "Ops": [
+            10,
+            12,
+            11,
+            14
+          ]
+        },
+        "x_categories": [
+          "Q1",
+          "Q2",
+          "Q3",
+          "Q4"
+        ],
+        "table": {
+          "columns": [
+            "Category",
+            "Q1",
+            "Q2",
+            "Q3",
+            "Q4"
+          ],
+          "rows": [
+            [
+              "Salaries",
+              50,
+              52,
+              55,
+              58
+            ],
+            [
+              "Marketing",
+              20,
+              28,
+              22,
+              35
+            ],
+            [
+              "Ops",
+              10,
+              12,
+              11,
+              14
+            ]
+          ]
+        }
+      }
+    },
+    "expect": "Two-page PDF: page 1 has a line chart with Free/Pro series; page 2 has a stacked bar chart and a 3-row data table of expense values."
+  }
+}
