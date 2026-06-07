@@ -96,6 +96,26 @@ from clarion.contracts.state import (
     SelectorMap,
 )
 
+# Same-origin http(s) anchors on the page, resolved-absolute, hash-stripped,
+# deduped, document order preserved — the read-only input to a STRUCTURE crawl
+# (``app.site_indexer``). Pure read; never clicks or navigates.
+_COLLECT_LINKS_JS = """() => {
+  const origin = location.origin;
+  const out = [], seen = new Set();
+  for (const a of document.querySelectorAll('a[href]')) {
+    let u;
+    try { u = new URL(a.href, location.href); } catch (e) { continue; }
+    if (u.origin !== origin) continue;
+    if (!/^https?:$/.test(u.protocol)) continue;
+    u.hash = '';
+    if (seen.has(u.href)) continue;
+    seen.add(u.href);
+    out.push(u.href);
+  }
+  return out;
+}"""
+
+
 class PlaywrightActuator(Actuator):
     """The real a11y-tree Actuator over a single page (execution §4).
 
@@ -279,6 +299,18 @@ class PlaywrightActuator(Actuator):
         layout_by_backend, _ = parse_snapshot(snapshot)
         geometry = ax_node_geometry(ax_tree, layout_by_backend)
         return extract_paired_facts(ax_tree, geometry=geometry)
+
+    async def collect_links(self) -> list[str]:
+        """Same-origin http(s) link URLs on the current page — the read-only input
+        to a STRUCTURE crawl (``app.site_indexer``). Absolute, hash-stripped,
+        deduped, document order preserved. Not part of the frozen ``Actuator`` port
+        — an extra read like ``read_facts`` / ``describe_page``. Pure read: it never
+        navigates or mutates, so the crawl cannot take an action (agentic invariant)."""
+        try:
+            hrefs = await self._page.evaluate(_COLLECT_LINKS_JS)
+        except Exception:  # noqa: BLE001 - link harvest is best-effort
+            return []
+        return list(hrefs) if hrefs else []
 
     async def act(self, action: Action) -> Observation:
         """Execute the action against the live page, then re-perceive (§4.3)."""
