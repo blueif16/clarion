@@ -23,14 +23,20 @@ Moss has two planes, both rooted at ``https://service.usemoss.dev``:
    ``POST /query`` but at the time of writing it returns ``503`` (Moss-side
    upstream down), so the local path is the only working query path.
 
-EMBEDDINGS — Moss embeds text internally with ``moss-minilm`` (no key needed) for
-the *default* path. BUT that path requires the runtime to download the model from
-``https://models.moss.link`` at ``load_index`` time, which is currently
-TLS-broken (``WRONG_VERSION_NUMBER``). The working path is therefore a **custom
-embedding** index: we embed with Gemini (``gemini-embedding-001``) at both ingest
-and query time, mark the index ``model_id="custom"``, and the runtime never
-touches the broken model host. So **Gemini embeddings ARE needed** here — see
-``ingest_gemini.GeminiEmbedder``.
+EMBEDDINGS — two selectable paths, via ``MOSS_EMBED_MODEL`` (``builtin_embed_model``):
+
+  - **Built-in (default-recommended now)** — ``moss-minilm`` / ``moss-mediumlm``.
+    Moss embeds text internally in its Rust runtime (no key, sub-ms, no external
+    embed RPC). This path fetches the model from ``https://models.moss.link`` at
+    ``load_index`` time; that host was TLS-broken (``WRONG_VERSION_NUMBER``) on
+    2026-05-31 but is back to a clean TLS 1.3 handshake (re-probed 2026-06-06), so
+    the built-in path is viable again. Docs carry NO ``embedding``; the index is
+    built with ``model_id=<that built-in id>``.
+  - **Custom (Gemini) — fallback** — when ``MOSS_EMBED_MODEL`` is unset/``gemini``
+    we embed with Gemini (``gemini-embedding-001``) at ingest + query, mark the
+    index ``model_id="custom"``, and the runtime never touches the model host.
+
+The two are NOT mixable in one index — switching paths requires a rebuild.
 
 The heavy lifting (HTTP to the control plane, pulling/holding the index artifact,
 the in-memory vector search) lives in the official ``moss`` SDK + its native
@@ -52,6 +58,21 @@ from typing import Any, Optional, Sequence
 MANAGE_URL = os.environ.get("MOSS_MANAGE_URL", "https://service.usemoss.dev/v1/manage")
 VERSION_URL = os.environ.get("MOSS_VERSION_URL", "https://service.usemoss.dev/version")
 SERVICE_VERSION = "v1"
+
+# Moss built-in embedding models (the runtime embeds locally — no external key,
+# sub-ms — but must fetch the model from models.moss.link at load_index time).
+_BUILTIN_EMBED_MODELS = {"moss-minilm", "moss-mediumlm"}
+
+
+def builtin_embed_model() -> Optional[str]:
+    """The configured Moss built-in embedding model id, or ``None`` for the Gemini
+    custom-embedding path. Reads ``MOSS_EMBED_MODEL`` (e.g. ``moss-mediumlm``);
+    unset / ``gemini`` / anything unrecognized → ``None`` (custom Gemini path).
+
+    Consumed by ``ingest_gemini`` / ``retriever_moss`` / ``memory_moss`` so the
+    embedding path is one config flip + a rebuild, with Gemini as the fallback."""
+    m = os.environ.get("MOSS_EMBED_MODEL", "").strip().lower()
+    return m if m in _BUILTIN_EMBED_MODELS else None
 
 
 @dataclass
@@ -277,4 +298,4 @@ class MossClient:
         return await self._ensure().delete_index(name)
 
 
-__all__ = ["MossClient", "MossDoc", "MossHit", "MossSearch"]
+__all__ = ["MossClient", "MossDoc", "MossHit", "MossSearch", "builtin_embed_model"]

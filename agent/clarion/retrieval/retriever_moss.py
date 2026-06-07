@@ -10,8 +10,10 @@
 
 The first query lazily ``load_index``-es the Moss index into the in-memory runtime
 so subsequent queries run locally in ~1-10 ms (the latency-meter beat). The query
-text is embedded with Gemini (``gemini-embedding-001``) because the index is a
-custom-embedding index — see ``moss_client`` / ``ingest_gemini`` docstrings.
+is embedded by whichever path the index was built with (``MOSS_EMBED_MODEL``):
+a Moss built-in model embeds locally at query time (no external RPC), else the
+query text is embedded with Gemini (``gemini-embedding-001``) for a custom index —
+see ``moss_client`` / ``ingest_gemini`` docstrings.
 
 This is what ``TimedRetriever`` wraps in the hero run, replacing ``FakeRetriever``.
 """
@@ -25,7 +27,7 @@ from clarion.contracts.ports import Retriever
 from clarion.contracts.state import Fact
 
 from clarion.retrieval.ingest_gemini import GeminiEmbedder
-from clarion.retrieval.moss_client import MossClient
+from clarion.retrieval.moss_client import MossClient, builtin_embed_model
 
 _DEFAULT_INDEX = os.environ.get("MOSS_INDEX", "clarion-kb")
 
@@ -51,7 +53,10 @@ class MossRetriever(Retriever):
         alpha: float = 0.8,
     ) -> None:
         self._moss = moss or MossClient()
-        self._embedder = embedder or GeminiEmbedder()
+        # Built-in Moss model → no external embedder (Moss embeds the query
+        # locally); else the Gemini custom-embedding path. Injected embedder wins.
+        self._builtin = builtin_embed_model()
+        self._embedder = embedder or (None if self._builtin else GeminiEmbedder())
         self._index = index
         self._alpha = alpha
         self._loaded = False
@@ -84,7 +89,9 @@ class MossRetriever(Retriever):
         await self._ensure_loaded()
 
         t0 = time.perf_counter()
-        vec = (await self._embedder.embed([q]))[0]
+        # Built-in index: pass no vector → Moss embeds the query locally. Custom
+        # index: embed with Gemini and pass the vector.
+        vec = None if self._embedder is None else (await self._embedder.embed([q]))[0]
         res = await self._moss.search(
             self._index, q, top_k=k, embedding=vec, alpha=self._alpha
         )
