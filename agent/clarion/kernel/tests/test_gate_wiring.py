@@ -68,7 +68,10 @@ class _ReadActuator(Actuator):
 
 
 def _negative_say_reasoner(say: str) -> FakeReasoner:
-    """A reasoner that reads back a NEGATIVE claim (``say``)."""
+    """A reasoner that reads back a NEGATIVE claim (``say``). It self-reports the
+    polarity via ``asserts_absence=True`` (the model metacognition that replaced
+    the retired lexical ``is_negative_claim`` keyword list) so PROPOSE routes it
+    through the closed-world ``NegativeVerifier``."""
     return FakeReasoner(
         steps=[
             StepProposal(
@@ -79,6 +82,7 @@ def _negative_say_reasoner(say: str) -> FakeReasoner:
                 irreversibility="reversible",
                 success_check="status-fact-appeared",
                 say=say,
+                asserts_absence=True,
             )
         ]
     )

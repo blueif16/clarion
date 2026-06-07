@@ -30,7 +30,6 @@ __all__ = [
     "is_member",
     "is_speakable_value",
     "pairing_backs",
-    "is_negative_claim",
     "is_consented",
     "assert_consented",
     "speakable",
@@ -130,43 +129,17 @@ def pairing_backs(
 
 
 # ---------------------------------------------------------------------------
-# Negative-claim detection (drives the NegativeVerifier honest-decline, fence #5)
+# Negative-claim routing (drives the NegativeVerifier honest-decline, fence #5)
 #
-# A pure lexical pre-filter: does a candidate spoken line ASSERT A NEGATIVE
-# ("there is no late fee", "you have no autopay")? Only such lines need the
-# coverage-aware closed-world check in ``kernel.negative_verifier`` — a positive
-# read-back of a grounded value is already fenced by membership (#2). Pure: no SDK.
+# Which spoken lines need the coverage-aware closed-world check in
+# ``kernel.negative_verifier``? The ones that ASSERT A NEGATIVE ("there is no late
+# fee", "you have no autopay"). That polarity is decided by the LLM Reasoner and
+# carried on ``StepProposal.asserts_absence`` (the model does the metacognition) —
+# NOT by a lexical keyword/stopword list, which the de-hardcoding thesis bans. A
+# positive read-back of a grounded value is already fenced by membership (#2), so
+# it never needs the verifier. (The retired lexical ``is_negative_claim`` lived
+# here; PROPOSE now routes on ``step.asserts_absence``.)
 # ---------------------------------------------------------------------------
-
-
-# Negation markers that turn a read-back into a NEGATIVE assertion about a topic.
-_NEGATION_MARKERS = (
-    "no ",
-    "not ",
-    "n't ",
-    "none",
-    "without ",
-    "there is no",
-    "there are no",
-    "isn't",
-    "aren't",
-    "doesn't",
-    "don't",
-    "free of",
-    "zero ",
-)
-
-
-def is_negative_claim(say: str) -> bool:
-    """True iff ``say`` reads as an ASSERTED NEGATIVE ("no late fee", "you don't
-    have autopay") — the only lines the NegativeVerifier must coverage-gate.
-
-    Deliberately a cheap lexical pre-filter (fail-open toward MORE checking is the
-    safe side: a false positive here only routes a line through the verifier, which
-    then asserts it anyway if grounded). A purely numeric/positive read-back
-    ("$84.32") trips nothing and skips the verifier."""
-    low = f" {say.lower().strip()} "
-    return any(m in low for m in _NEGATION_MARKERS)
 
 
 # ---------------------------------------------------------------------------
