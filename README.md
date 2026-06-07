@@ -44,7 +44,7 @@ flowchart TB
 
     subgraph TASK["🧠 Task Plane · LangGraph kernel — LLM decides, kernel enforces"]
         direction LR
-        G["GROUND"] --> V["VERIFY<br/>membership +<br/>pairing fence"] --> P["PROPOSE<br/>← LLM Reasoner"] --> IG{{"IRREVERSIBILITY GATE<br/>reversible · irreversible · UNKNOWN"}} --> C{{"CONSENT<br/>interrupt() = 'yes?'"}} --> A["ACT"] --> CF["CONFIRM<br/>code done-check"]
+        G["GROUND"] --> V["VERIFY<br/>membership +<br/>pairing fence"] --> P["PROPOSE<br/>← LLM Reasoner"] --> IG{{"IRREVERSIBILITY GATE<br/>reversible · irreversible · UNKNOWN"}} --> C{{"CONSENT<br/>interrupt() = 'yes?'<br/>+ highlight target node"}} --> A["ACT"] --> CF["CONFIRM<br/>code done-check"]
         CF -.->|"next sub-goal"| G
     end
 
@@ -76,7 +76,7 @@ flowchart TB
     SITE -.->|"SITE MAP · affordances, never values"| REASONER
     PROF -.->|"recall prefs → re-ground live"| REASONER
     PATHS -.->|"recall prior plan (hint only)"| REASONER
-    CF -.->|"write-back: facts · episodes<br/>(prefs consent-gated)"| PROF
+    CF -.->|"write-back: facts (live) ·<br/>prefs + episodes (consent-gated)"| PROF
     CF -.-> PATHS
 
     classDef gate fill:#fde68a,stroke:#d97706,stroke-width:2px,color:#1c1917;
@@ -141,8 +141,8 @@ The task plane carries **no per-site, per-goal logic.** One generic LLM plans th
 
 Clarion learns across runs without ever eroding the invariant. Everything lives in **Moss, one index per data _category_** with a metadata `filter` (`{site}` / `{user_id}`), never one index per site or tenant — local-first, sub-10ms, embedded in-process:
 
-- **Indexed webpages — `clarion-site-structure`** (`app/site_indexer.py`, gated `CLARION_SITE_KNOWLEDGE=1`, fail-open). A read-only same-origin crawl records each page's **affordances — headings + controls, _never live values_** — partitioned by `{site}`. At PLAN, `SiteKnowledge` folds a **SITE MAP** into the Reasoner's orient so it can pick which page to navigate to. Structure, not data: it can never become a spoken fact.
-- **User memory — `clarion-profile` (facts + prefs) + `clarion-task-paths` (episodes)** (`retrieval/memory_moss.py`, `{user_id}`-filtered). A finished run writes a `WorkflowEpisode` (goal + plan, **never grounded values**); `Memory.recall` warm-starts the **next** plan with a `prior_plan_hint` and reminds the user what they consented to last time.
+- **Indexed webpages — `clarion-site-structure`** (`app/site_indexer.py`, gated `CLARION_SITE_KNOWLEDGE=1`, fail-open). A read-only same-origin crawl records each page's **affordances — headings + controls, _never live values_** — partitioned by `{site}`. At PLAN, `SiteKnowledge` folds a **SITE MAP** into the Reasoner's orient so it can pick which page to navigate to. Structure, not data: it can never become a spoken fact. The cache is **self-populating**: `app/auto_index.py` fire-and-forgets a **cookie-less, public-only** background crawl of every page the agent navigates to (gated `CLARION_AUTO_INDEX=1`, fail-open) — being cookie-less _is_ the public/private split (it can never reach an authenticated page). Freshness is **verify-on-use, not TTL** (`app/structure_freshness.py`): a value-blind structural fingerprint on a stable per-URL id, so a re-crawl **supersedes a changed page in place** — no stale-chunk rot.
+- **User memory — `clarion-profile` (facts + prefs) + `clarion-task-paths` (episodes)** (`retrieval/memory_moss.py`, `{user_id}`-filtered). Capture is **consent-gated end-of-flow** (_no memory without a yes_): a `_REMEMBER` offer for preferences (secret fields — passwords, OTP, CVV, SSN — are suppressed before the offer is ever spoken) and a sibling `_SAVE_WORKFLOW` offer for the run as a `WorkflowEpisode` (goal + plan + the consents you gave, **never grounded values**). An episode is only offered when it clears `WorkflowEpisode.is_workflow()` — **transactional** (an approved irreversible step) **or substantial** (≥3 sub-goals or ≥3 filled fields) — so a trivial one-step read is never stored (nothing to repeat; it re-grounds live). On re-entry, `Memory.recall` warm-starts the **next** plan with a `prior_plan_hint` (advisory only, re-grounded live).
 
 **The firewall (load-bearing, structural).** Recall is a non-`Fact` `Recall` type with **no `source_node_id` field**, and lives on the `Memory` port — never the `Retriever` (which would stamp a live source onto a remembered value). So a recalled value is **structurally unspeakable**: it re-enters only as planner advice / a fill candidate and is **re-grounded live** before anything is spoken or any irreversible step runs. A remembered "approve" never auto-approves — every irreversible step still hits a fresh `interrupt()`. Preference capture is a consent-gated, end-of-flow **"remember?"** offer with secret-suppression (passwords, OTP, CVV, SSN are never offered) — _no memory without a yes_. Spec: `docs/clarion-memory-design.md`.
 
@@ -152,12 +152,12 @@ Clarion learns across runs without ever eroding the invariant. Everything lives 
 ```
 agent/clarion/contracts/   ports (incl. Reasoner · Memory) · state (Fact.id · PairedFact · Recall) · events  ← FROZEN
             /kernel/        graph (loop + gate) · policy (fences) · reasoner_guard · irreversibility · negative_verifier
-            /actuator/      merged-AXTree perception (lazy-stamp) + act + diff + geometric PairedFacts
+            /actuator/      merged-AXTree perception (lazy-stamp) + act + diff + geometric PairedFacts + source-node highlight
             /stages/        generic executor + checks (code done-check) + RESCUE cross-cut
             /adapters/      voice_livekit · minimax_reasoner (default) · minimax_synthesizer · gemini/openai_reasoner (alternates)
             /retrieval/     moss_client · retriever_moss · memory_moss (user memory) · ingest_gemini (embed-vector fallback) · context_ranker (semantic top-K)
             /instrument/    latency meter · cold-RAG baseline · to_panel_state
-            /app/           runtime · gov_proof (autonomous TAS driver) · voice_entry · extension_runtime · site_indexer · remember
+            /app/           runtime · gov_proof (autonomous TAS driver) · voice_entry · extension_runtime · site_indexer · auto_index · structure_freshness · remember
 web/extension/  THE PRODUCT — Chrome MV3   ·   web/demo-site/  ·  web/panel/  ·  web/spike-target/  (Next.js aux, NOT test targets)
 docs/foundation.md (why) · docs/execution.md (build) · docs/clarion-memory-design.md (memory) · docs/clarion-status.md (live status)
 ```
@@ -196,8 +196,8 @@ The hackathon thesis is "retrieval is the bottleneck." Clarion's invariant puts 
 2. **Live latency meter** — `Moss: ~3ms` next to a greyed `cold RAG: ~340ms`. Retrieval disappears from the budget.
 3. **Sources + negative-verification panel** — every spoken fact cited; *"no late fee — verified: not present."*
 4. **Barge-in** — interrupt mid-sentence, instant stop.
-5. **The consent gate as a visible state** — `AWAITING YOUR YES` at the autopay upsell and at submit.
-6. **Glass-box trace** — every step and the "why" behind it.
+5. **The consent gate as a visible state** — `AWAITING YOUR YES` at the autopay upsell and at submit, with a **highlight box** that lands on the *exact* control the agent will act on (driven by the same AX node identity it clicks, never a screenshot guess) plus its proven field⟷label pairing — so a sighted observer sees Clarion is pointed at the right thing *before* the yes.
+6. **Glass-box action trace** — every decided action surfaces as a push-notification toast (fades if reversible; **persists + pulses if irreversible or awaiting-yes**) and settles into a permanent Activity history with the full "why" (classification, gate rationale, grounded source). And the user can *hear* it: a `read_history` voice tool reads back the last N actions as a grounded, persona-clean line — never the model's recollection. The highlight box proves invariant #1 (*source*); this trace proves invariant #2 (*consent*).
 
 **Demo set:** one primary live run — utility **bill-pay** on a self-hosted clone with authentic accessibility flaws (stuck-rescue → verified readback → consented payment behind the hard-stop) — plus a **generality montage** of the same agent on the worst real tasks: government/benefits portals (68 min per barrier), travel booking (91–94% barriers), shopping checkout (86%). It never looks hardcoded. The human close: *"I did it myself."*
 
@@ -207,14 +207,14 @@ The hackathon thesis is "retrieval is the bottleneck." Clarion's invariant puts 
 
 ### How we're ready
 
-- **Deterministic regression gate:** `221 passed, 10 deselected`, fully offline (`.[test]` pulls no network) — including a goal-agnostic invariant spec whose guards are proven **red-before-green by mutation** (disable the structural net / the post-decode guard / the grounding check → the matching invariant test goes red), plus a no-network `FakeMemory` round-trip that asserts recall never carries a `source_node_id`.
+- **Deterministic regression gate:** `256 passed, 10 deselected`, fully offline (`.[test]` pulls no network) — including a goal-agnostic invariant spec whose guards are proven **red-before-green by mutation** (disable the structural net / the post-decode guard / the grounding check → the matching invariant test goes red), plus a no-network `FakeMemory` round-trip that asserts recall never carries a `source_node_id`.
 - **Providers live (event-day):** LiveKit · Deepgram STT (`nova-3`, EN-only) · **MiniMax-M3 brain** (M2.7 failover) · **LiveKit Inference TTS** (Cartesia Sonic-2 + Deepgram Aura-2 failover) · **Moss retrieval live**, `clarion-kb` + `clarion-site-structure` built and persistent; the user-memory indexes (`clarion-profile` / `clarion-task-paths`) ship behind `CLARION_MEMORY=1`.
 - **Judge-proof offline path:** `CLARION_DEMO_MODE=1` replays the hero run with no network, so a venue Wi-Fi failure can't kill the demo. Reliability is an engineering choice, not luck.
 - **Latency engineered, not hoped:** Moss is pre-warmed and the embed fires on partial-STT so the on-stage retrieval number is the in-memory **~3ms**, inside LiveKit's **<800ms** turn budget.
 
 ```bash
 # deterministic gate (no network)
-cd agent && pip install -e ".[test]" && python -m pytest clarion          # 221 passed, 10 deselected
+cd agent && pip install -e ".[test]" && python -m pytest clarion          # 256 passed, 10 deselected
 
 # the de-hardcoded proof, fully live on REAL gov sites (Playwright + MiniMax-M3 Reasoner)
 cd agent && pip install -e ".[spike]" && pip install -e ".[retrieval]"

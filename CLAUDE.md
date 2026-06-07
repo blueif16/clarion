@@ -13,8 +13,10 @@ Full spec: `docs/foundation.md` (product, LOCKED) · `docs/execution.md` (build 
 - **Epistemic:** never *speak* a fact not just retrieved, incl. negatives ("no late fee here"). A `Fact` with `source_node_id = None` is ungrounded and MUST NOT be spoken.
 - **Agentic:** never commit an irreversible side-effect without an explicit per-step "yes."
 - **Memory** (knowledge layer, `CLARION_MEMORY=1`): never persist a user fact/preference/workflow without an explicit "remember this" yes; secrets are never offered (`app/remember.py`). A recalled value re-enters as a HINT to re-ground — `Recall` has no `source_node_id`, so it is structurally unspeakable, never spoken from memory. Spec: `docs/clarion-memory-design.md`.
+  - **What counts as a workflow EPISODE** (do not loosen): record one ONLY when the finished run clears `WorkflowEpisode.is_workflow()` — TRANSACTIONAL (an approved *irreversible* step) **OR** substantial (`>=3` subgoals **OR** `>=3` filled fields, `n_filled`). A trivial one-step read is NOT a workflow (nothing to repeat — it re-grounds live). Classify by STRUCTURAL counts of what the run did, NEVER a lexical read of the goal (the de-hardcoding thesis). The live offer is the `_SAVE_WORKFLOW` stage node (sibling of `_REMEMBER`; writes via `Memory.write_episode` ONLY on an explicit yes, rides the existing `interrupt()` voice loop — no `voice_entry` change); `gov_proof` gates its autonomous write on the SAME bar. The transactional signal lives in the kernel `CONSENT` trace (`irreversible`/`proposal_id`/`utterance`), NOT the `Consent` log.
 
 ## Summary rules (detail below)
+- **FEATURE FREEZE (2026-06-07 → event):** no new features. The job now is to make the EXISTING workloads actually work end-to-end (live-voice product path) — stabilize, fix, and verify. Any new capability needs explicit sign-off. The current stabilization targets are the deferred/gap items below: the spoken consent-recall offer, GAP-1 (DeliveryGate), GAP-4 (abstain-and-clarify response channel), and a live Moss memory round-trip.
 - ALWAYS keep `contracts/` and `kernel/` free of provider SDKs — providers live only in Wave-1 adapters.
 - NEVER swap models to fix latency — pipeline/stream/parallelize first; model choices are fixed.
 - NEVER hard-code word/keyword lists (stopwords, name/intent matchers, synonym tables) to classify, rank, or route — derive meaning from the LLM or embeddings behind a port. Lexical token-matching on page/goal text is the de-hardcoding thesis's banned heuristic (it's why `_topk_slice`'s lexical rank must become a semantic `ContextRanker`).
@@ -33,13 +35,13 @@ Full spec: `docs/foundation.md` (product, LOCKED) · `docs/execution.md` (build 
 ```
 agent/clarion/contracts/  ports.py · state.py · events.py   ← FROZEN; pure pydantic/abc/typing
 agent/clarion/fakes/      in-memory impl of every port
-agent/clarion/kernel/     graph.py · policy.py · irreversibility.py · reasoner_guard.py  ← 6-node loop, 2-clause policy
-agent/clarion/actuator/   merged-AXTree perception + act + diff
+agent/clarion/kernel/     graph.py · policy.py · irreversibility.py · reasoner_guard.py · negative_verifier.py  ← 6-node loop, 2-clause policy
+agent/clarion/actuator/   merged-AXTree perception + act + diff + source-node highlight (consent-time visual proof)
 agent/clarion/stages/     planner + generic executor + checks + RESCUE cross-cut
 agent/clarion/adapters/   voice_livekit.py · minimax_reasoner.py · minimax_synthesizer.py  ← real providers live here
-agent/clarion/retrieval/  moss_client · retriever_moss · memory_moss · ingest_gemini (embed-vector fallback)
+agent/clarion/retrieval/  moss_client · retriever_moss · memory_moss · context_ranker (semantic top-K) · ingest_gemini (embed-vector fallback)
 agent/clarion/instrument/ latency meter + cold-RAG baseline + to_panel_state
-agent/clarion/app/        voice_entry · extension_runtime · gov_proof · remember · site_indexer · runtime
+agent/clarion/app/        voice_entry · extension_runtime · gov_proof · remember · site_indexer · auto_index · structure_freshness · runtime
 web/extension/  THE PRODUCT — Chrome MV3 (service-worker · offscreen · hud · relay-client)
 web/demo-site/ · web/panel/  Next.js aux (NOT test targets) · web/spike-target/
 docs/persona.md · scripts/copy_lint.py
@@ -59,7 +61,7 @@ docs/persona.md · scripts/copy_lint.py
 
 ## Run it all
 ```bash
-# deterministic regression gate (no network) — 191 passed, 10 deselected
+# deterministic regression gate (no network) — 256 passed, 10 deselected
 cd agent && pip install -e ".[test]" && python -m pytest clarion
 python -m pytest clarion -m live                        # live Moss tests (needs creds)
 
