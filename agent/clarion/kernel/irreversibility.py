@@ -65,6 +65,18 @@ def classify(
     Fail-closed default: an empty / unrecognised judgement is treated as
     ``"unknown"`` (which gates), never silently ``"reversible"``.
     """
+    # A read-back performs NO mutation, so it is reversible BY CONSTRUCTION —
+    # whatever the model judged. PROPOSE degrades an off-page / value-less step to
+    # a side-effect-free ``read`` while still carrying the model's irreversibility
+    # judgement of the ABANDONED step on ``pending_step``; that stale judgement must
+    # NOT flag the read irreversible. If it does, ``consent_gate`` (which auto-
+    # proceeds a read — no side-effect to gate) routes it straight to ACT and
+    # ``assert_consented`` then hard-stops a harmless grounded read with a
+    # PolicyViolation. foundation §5 gates consequential ACTS, never a read — so
+    # this structural truth lives HERE in the classifier, not bolted onto the graph.
+    if proposal.action is not None and proposal.action.kind == "read":
+        return "reversible"
+
     judgment: Classification = (
         reasoner_judgment
         if reasoner_judgment in ("reversible", "irreversible", "unknown")

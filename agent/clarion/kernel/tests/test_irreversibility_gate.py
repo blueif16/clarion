@@ -136,6 +136,21 @@ def test_read_action_has_no_structural_opinion() -> None:
     assert classify(proposal, _NO_UNDO_PAGE, "reversible") == "reversible"
 
 
+def test_read_back_is_reversible_even_when_model_judged_irreversible() -> None:
+    """A read performs no mutation → reversible by construction, regardless of the
+    model judgement. PROPOSE degrades an off-page step to a side-effect-free read
+    but carries the model's irreversibility judgement of the ABANDONED step; the
+    classifier must not let that stale judgement flag the read irreversible (else
+    consent_gate auto-proceeds the read to ACT and assert_consented hard-stops a
+    harmless grounded read — the 'prop-0-0 irreversible without consent' crash)."""
+    proposal = _proposal("read", None)
+    assert classify(proposal, _NO_UNDO_PAGE, "irreversible") == "reversible"
+    assert classify(proposal, _NO_UNDO_PAGE, "unknown") == "reversible"
+    # And the degenerate empty/garbage judgement (would fail-closed to unknown for a
+    # consequential control) is also harmless for a read.
+    assert classify(proposal, _NO_UNDO_PAGE, "") == "reversible"  # type: ignore[arg-type]
+
+
 def test_fill_into_textbox_has_no_structural_opinion() -> None:
     textbox_page = _page(
         AxNode(index=0, role="textbox", name="Amount", node_id="n-amt"),
