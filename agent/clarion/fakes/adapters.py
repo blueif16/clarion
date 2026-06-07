@@ -20,15 +20,18 @@ from clarion.contracts.ports import (
 from clarion.contracts.state import (
     Action,
     AxNode,
+    ConsentRecord,
     Fact,
     Observation,
     PageDiff,
     PageReadout,
     Passage,
     Profile,
+    Recall,
     SelectorMap,
     StepProposal,
     Subgoal,
+    WorkflowEpisode,
 )
 
 
@@ -287,12 +290,21 @@ class FakeIngest(Ingest):
         ]
 
 
+def _goal_norm(goal: str) -> str:
+    return " ".join((goal or "").lower().split())
+
+
 class FakeMemory(Memory):
-    """In-memory profile store. ``write`` appends a fact; ``read_profile`` returns
-    the accumulated facts for a user (or an empty profile)."""
+    """In-memory user-memory store. ``write`` appends a fact; the knowledge-layer
+    methods (preferences/episodes/recall) are dict/list-backed so the no-network
+    gate exercises write→recall round-trips and the no-leak invariant test without
+    Moss creds. Mirrors the live ``MossMemory`` semantics: episodes upsert by
+    ``(goal_norm, url_host)``; ``recall`` returns a ``Recall`` (never a ``Fact``)."""
 
     def __init__(self) -> None:
         self._facts: dict[str, list[Fact]] = {}
+        self._prefs: dict[str, dict[str, str]] = {}
+        self._episodes: dict[str, list[WorkflowEpisode]] = {}
         # All writes that did not carry a user id (the kernel writes facts; the
         # user binding happens at the call site in real adapters).
         self.written: list[Fact] = []
@@ -302,9 +314,53 @@ class FakeMemory(Memory):
         # Bucket by source for deterministic read-back in single-user tests.
         self._facts.setdefault("default", []).append(fact)
 
+    async def write_preference(
+        self, user_id: str, key: str, value: str, *, origin: str = "stated"
+    ) -> None:
+        self._prefs.setdefault(user_id, {})[key] = value
+
+    async def write_episode(self, user_id: str, episode: WorkflowEpisode) -> None:
+        key = (_goal_norm(episode.goal), episode.url_host)
+        eps = self._episodes.setdefault(user_id, [])
+        for i, e in enumerate(eps):
+            if (_goal_norm(e.goal), e.url_host) == key:
+                eps[i] = episode  # upsert: latest good path wins.
+                return
+        eps.append(episode)
+
+    async def recall(
+        self, user_id: str, goal: str, url_host: str, *, k: int = 3
+    ) -> Recall:
+        eps = self._episodes.get(user_id, [])
+        gn = _goal_norm(goal)
+        plan_hint: WorkflowEpisode | None = None
+        # Prefer an exact (goal, host) match; else a goal match; else most recent.
+        for e in eps:
+            if _goal_norm(e.goal) == gn and e.url_host == url_host:
+                plan_hint = e
+                break
+        if plan_hint is None:
+            for e in reversed(eps):
+                if _goal_norm(e.goal) == gn:
+                    plan_hint = e
+                    break
+        if plan_hint is None and eps:
+            plan_hint = eps[-1]
+        return Recall(
+            plan_hint=plan_hint,
+            preferences=dict(self._prefs.get(user_id, {})),
+            consent_recall=list(plan_hint.consent) if plan_hint else [],
+            similarity=1.0 if plan_hint else 0.0,
+        )
+
     async def read_profile(self, user_id: str) -> Profile:
         facts = self._facts.get(user_id) or self._facts.get("default") or []
-        return Profile(user_id=user_id, facts=list(facts))
+        return Profile(
+            user_id=user_id,
+            facts=list(facts),
+            preferences=dict(self._prefs.get(user_id, {})),
+            episodes=list(self._episodes.get(user_id, [])),
+        )
 
 
 __all__ = [
