@@ -9,9 +9,10 @@ Full spec: `docs/foundation.md` (product, LOCKED) · `docs/execution.md` (build 
 **▶ READ FIRST each session: `docs/clarion-status.md`** — LIVE progress: what's real vs hardcoded, what's left, what to fix/test. Keep it current (edit it in the same commit as the change). Next-session kickoff prompt: `docs/clarion-handoff-prompt.md`.
 
 ## The invariant (this is the kernel — do not erode it)
-> **No fact without a source. No action without a yes.**
+> **No fact without a source. No action without a yes. No memory without a yes.**
 - **Epistemic:** never *speak* a fact not just retrieved, incl. negatives ("no late fee here"). A `Fact` with `source_node_id = None` is ungrounded and MUST NOT be spoken.
 - **Agentic:** never commit an irreversible side-effect without an explicit per-step "yes."
+- **Memory** (knowledge layer, `CLARION_MEMORY=1`): never persist a user fact/preference/workflow without an explicit "remember this" yes; secrets are never offered (`app/remember.py`). A recalled value re-enters as a HINT to re-ground — `Recall` has no `source_node_id`, so it is structurally unspeakable, never spoken from memory. Spec: `docs/clarion-memory-design.md`.
 
 ## Summary rules (detail below)
 - ALWAYS keep `contracts/` and `kernel/` free of provider SDKs — providers live only in Wave-1 adapters.
@@ -36,7 +37,7 @@ agent/clarion/stages/     planner + per-stage nodes + RESCUE cross-cut
 agent/clarion/adapters/   voice_livekit.py · tts_vertex.py  ← real providers live here
 agent/clarion/retrieval/  Moss + Gemini-embedding stack
 agent/clarion/instrument/ latency meter + cold-RAG baseline + to_panel_state
-agent/clarion/app/        runtime · hero_harness · voice_entry · demo_mode · kb_beat
+agent/clarion/app/        runtime · hero_harness · voice_entry · demo_mode · kb_beat · site_indexer
 web/demo-site/  (hero target) · web/panel/ (six effects) · web/spike-target/ (S1 gate)
 docs/persona.md · scripts/copy_lint.py
 ```
