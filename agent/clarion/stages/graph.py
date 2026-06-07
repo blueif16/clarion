@@ -48,6 +48,7 @@ from clarion.contracts.state import (
     SelectorMap,
     Subgoal,
     TraceEvent,
+    WorkflowEpisode,
 )
 from clarion.kernel.graph import _ALLOWED_MSGPACK_MODULES, _PlanState, build_kernel, seed_state
 from clarion.stages.checks import evaluate_success_check, make_anchor
@@ -96,6 +97,7 @@ _EXECUTOR = "executor"
 _RESCUE = "rescue"
 _REPLANNER = "replanner"
 _REMEMBER = "remember"
+_SAVE_WORKFLOW = "save_workflow"
 
 
 def _trace(node: str, event: str = "info", **data: object) -> TraceEvent:
@@ -187,6 +189,55 @@ def _remember_offer_utterance(candidates: list[tuple[str, str]]) -> str:
     )
 
 
+def _save_workflow_offer_utterance(goal: str, host: str) -> str:
+    """The ONE spoken "save this workflow?" offer (persona: in-command, no banned
+    words). Ends on an explicit yes/no so the consent is unambiguous."""
+    where = f" on {host}" if host else ""
+    return (
+        f"You just finished {goal}{where}. I can remember these steps as a workflow "
+        f"so next time is faster. Say yes to save, or no to skip."
+    )
+
+
+def _consent_records_from_trace(trace: list[TraceEvent]) -> list[ConsentRecord]:
+    """Reconstruct the run's ConsentRecords from the kernel CONSENT exit events the
+    executor forwarded up (the kernel ``Consent`` log carries no ``irreversible`` /
+    ``utterance``). Deduped by ``proposal_id`` (a consent re-executes across an
+    interrupt resume; keep the last decision) so counts aren't inflated."""
+    by_id: dict[str, ConsentRecord] = {}
+    for e in trace:
+        if e.node != "CONSENT" or e.event != "exit":
+            continue
+        pid = str(e.data.get("proposal_id") or "")
+        by_id[pid] = ConsentRecord(
+            proposal_id=pid,
+            utterance=str(e.data.get("utterance") or ""),
+            irreversible=bool(e.data.get("irreversible", False)),
+            decision=str(e.data.get("decision") or ""),
+        )
+    return list(by_id.values())
+
+
+def _episode_from_state(state: dict, host: str) -> WorkflowEpisode:
+    """Project a COMPLETED run's shared state into a ``WorkflowEpisode`` (the live
+    counterpart of ``gov_proof``'s ``ProofResult`` harvest). Stores the plan SHAPE +
+    consent + the filled-field count — NEVER a grounded value."""
+    subgoals: list[Subgoal] = list(state.get("subgoals", []) or [])
+    consent = _consent_records_from_trace(state.get("trace", []) or [])
+    return WorkflowEpisode(
+        goal=state.get("goal", ""),
+        url_host=host,
+        subgoals=subgoals,
+        plan_utterance=verbalize_subgoals(subgoals),
+        outcome="completed",  # the save node is reached only on a clean finish.
+        consent=consent,
+        approvals=sum(1 for c in consent if c.decision == "approve"),
+        hard_stops=sum(1 for c in consent if c.decision == "reject"),
+        n_filled=len(state.get("_filled") or {}),
+        completed_at=time.time(),
+    )
+
+
 def _with_site_map(orient: PageReadout, site_facts: list[Fact]) -> PageReadout:
     """Return a COPY of the ORIENT readout whose summary carries a SITE MAP block
     built from the per-site structure facts — for PLANNING only (which page to
@@ -234,6 +285,7 @@ def build_stage_graph(
     memory: Optional[Memory] = None,
     user_id: str = "default",
     remember_nominate: Optional[RememberNominate] = None,
+    offer_workflow_save: bool = False,
     ranker: Optional[ContextRanker] = None,
     rank_min_nodes: Optional[int] = None,
 ):
@@ -484,6 +536,16 @@ def build_stage_graph(
         fresh: SelectorMap = merged["page_index"]
         check_name = merged.get("success_check") or subgoal.done_check or ""
         after_url = await _current_url(actuator)
+        # Knowledge-layer AUTO-INDEX (greedy, public-only): every NEW page the agent
+        # navigates to gets the same background read-only PUBLIC crawl as the first
+        # ORIENT, so the structure map fills in as we browse. Fire only on a real URL
+        # change; the hook is gated/throttled/cookie-less app-side — private pages are
+        # unreachable by the cookie-less crawler, so they're simply never indexed.
+        if on_orient is not None and after_url and after_url != before_url:
+            try:
+                on_orient(after_url)
+            except Exception:  # noqa: BLE001 - the warm-up hook is best-effort.
+                pass
         anchor = make_anchor(before_url, after_url)
         advanced = evaluate_success_check(
             check_name, merged, before_map, fresh, anchor  # type: ignore[arg-type]
@@ -578,12 +640,13 @@ def build_stage_graph(
             update["stage_idx"] = idx + 1
             update["_replan_attempts"] = 0
             update["_rescue_done_for"] = None
-            # Next subgoal; on the LAST subgoal, route to the end-of-flow remember
-            # offer when active (no memory without a yes), else straight to END.
+            # Next subgoal; on the LAST subgoal, route into the end-of-flow consent
+            # chain (save-workflow? → remember? → END), each self-gating (no memory
+            # without a yes). Straight to END when nothing is active.
             if idx + 1 < len(subgoals):
                 goto = _EXECUTOR
             else:
-                goto = _REMEMBER if remember_nominate is not None else END
+                goto = _end_of_flow_entry()
             return Command(update=update, goto=goto)
 
         # Done-check failed → the replanner (bounded retry).
@@ -647,6 +710,78 @@ def build_stage_graph(
             goto=_EXECUTOR,
         )
 
+    # ---- end-of-flow routing (save-workflow? → remember? → END) ----------
+    _save_active = offer_workflow_save and memory is not None
+
+    def _end_of_flow_entry() -> str:
+        """The first active end-of-flow node on a completed run, else END."""
+        if _save_active:
+            return _SAVE_WORKFLOW
+        if remember_nominate is not None:
+            return _REMEMBER
+        return END
+
+    def _after_save_workflow() -> str:
+        """Where the save-workflow node hands off: the preference offer if active,
+        else END."""
+        return _REMEMBER if remember_nominate is not None else END
+
+    # ---- save_workflow (end-of-flow "save this workflow?" offer) ----------
+    async def save_workflow(state: _StageState) -> Command:
+        """The consent-gated, end-of-flow EPISODE capture (the completed-workflow
+        record — knowledge-layer #4b). Reached ONLY on a COMPLETED flow when active.
+
+        Projects the finished run into a ``WorkflowEpisode`` (plan SHAPE + consent +
+        filled-field count, NEVER a grounded value), and offers to remember it ONLY
+        when it ``is_workflow()`` — a real multi-step / form / transactional run, not
+        a trivial one-step read (which re-grounds every time and is nothing to
+        repeat). The offer is ONE ``ConsentRequest`` via ``interrupt()`` — the voice
+        plane speaks it and resumes with the spoken yes/no through the SAME consent
+        loop as every other gate — and the episode is written through the ``Memory``
+        port ONLY on an explicit "yes" (no memory without a yes). Best-effort: a
+        memory miss is swallowed, never failing the finished run."""
+        host = _host_of(await _current_url(actuator))
+        episode = _episode_from_state(dict(state), host)
+        if not episode.is_workflow():
+            # A trivial read — nothing worth remembering; hand off silently.
+            return Command(
+                update={
+                    "trace": [_trace("SAVE_WORKFLOW", "exit", offered=False)]
+                },
+                goto=_after_save_workflow(),
+            )
+        decision_payload = interrupt(
+            ConsentRequest(
+                proposal_id="save_workflow",
+                utterance=_save_workflow_offer_utterance(episode.goal, host),
+                irreversible=False,
+            ).model_dump()
+        )
+        decision = ConsentDecision.model_validate(decision_payload)
+        saved = False
+        if decision.decision == "approve" and memory is not None:
+            try:
+                await memory.write_episode(user_id, episode)
+                saved = True
+            except Exception:  # noqa: BLE001 — a memory miss must never break the run.
+                saved = False
+        return Command(
+            update={
+                "trace": [
+                    _trace(
+                        "SAVE_WORKFLOW",
+                        "exit",
+                        offered=True,
+                        kept=decision.decision == "approve",
+                        saved=saved,
+                        n_subgoals=len(episode.subgoals),
+                        n_filled=episode.n_filled,
+                    )
+                ]
+            },
+            goto=_after_save_workflow(),
+        )
+
     # ---- remember (end-of-flow "remember?" offer — no memory without a yes) ----
     async def remember(state: _StageState) -> Command:
         """The consent-gated, end-of-flow preference capture (the third invariant
@@ -703,6 +838,7 @@ def build_stage_graph(
     builder.add_node(_EXECUTOR, executor)
     builder.add_node(_RESCUE, rescue)
     builder.add_node(_REPLANNER, replanner)
+    builder.add_node(_SAVE_WORKFLOW, save_workflow)
     builder.add_node(_REMEMBER, remember)
 
     builder.add_edge(START, _PLANNER)

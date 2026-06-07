@@ -22,12 +22,15 @@ from clarion.contracts.state import (
     Fact,
     Observation,
     PageDiff,
+    PageReadout,
     SelectorMap,
     StepProposal,
     Subgoal,
 )
+from clarion.contracts.events import ConsentDecision
 from clarion.fakes import FakeRetriever
 from clarion.stages.graph import build_stage_graph, seed_stage_state
+from langgraph.types import Command
 
 
 # --- the orchestration contract -------------------------------------------
@@ -46,7 +49,7 @@ async def test_disabled_by_default(monkeypatch):
     assert calls == []  # gated off → nothing crawled
 
 
-async def test_runs_once_per_host_then_throttles(monkeypatch):
+async def test_runs_once_per_url_then_throttles(monkeypatch):
     monkeypatch.setenv("CLARION_AUTO_INDEX", "1")
     ai._reset_seen()
     calls = []
@@ -54,13 +57,19 @@ async def test_runs_once_per_host_then_throttles(monkeypatch):
     async def _crawl(url, **kw):
         calls.append(url)
 
-    # first activation on the host → crawls
+    # first navigation to a page → crawls
     assert await auto_index_host("https://usa.gov/benefits", crawl=_crawl) is True
-    # a later activation on the SAME host (any path) → throttled, no second crawl
-    assert await auto_index_host("https://usa.gov/other", crawl=_crawl) is False
+    # the SAME page again (fragment/trailing-slash normalized away) → throttled
+    assert await auto_index_host("https://usa.gov/benefits/#x", crawl=_crawl) is False
+    # a DIFFERENT page, even on the SAME host → crawls (index every page we visit)
+    assert await auto_index_host("https://usa.gov/other", crawl=_crawl) is True
     # a different host → crawls
     assert await auto_index_host("https://weather.gov/", crawl=_crawl) is True
-    assert calls == ["https://usa.gov/benefits", "https://weather.gov/"]
+    assert calls == [
+        "https://usa.gov/benefits",
+        "https://usa.gov/other",
+        "https://weather.gov/",
+    ]
 
 
 async def test_blank_host_is_skipped(monkeypatch):
@@ -197,3 +206,80 @@ async def test_planner_invokes_on_orient_hook():
     await graph.ainvoke(seed, {"configurable": {"thread_id": str(uuid.uuid4())}})
     assert len(seen) == 1  # planner called the hook exactly once, at orient
     assert isinstance(seen[0], str)  # handed the (possibly empty) page url
+
+
+class _NavActuator(Actuator):
+    """A single link; a click 'navigates' (the ``describe_page`` url flips), so the
+    generic ``navigated`` done-check passes — exercising the executor's
+    fire-on-navigation auto-index trigger with the NEW page url."""
+
+    def __init__(self) -> None:
+        self.act_calls: list[Action] = []
+        self._url = "https://nav.test/start"
+
+    def _map(self) -> SelectorMap:
+        return SelectorMap(
+            nodes={0: AxNode(index=0, role="link", name="Go", node_id="n-go")},
+            token_estimate=8,
+        )
+
+    async def perceive(self) -> SelectorMap:
+        return self._map()
+
+    async def describe_page(self) -> PageReadout:
+        return PageReadout(title="t", url=self._url, summary="s")
+
+    async def act(self, action: Action) -> Observation:
+        self.act_calls.append(action)
+        if action.kind in ("click", "navigate"):
+            self._url = "https://nav.test/dest"
+        return Observation(selector_map=self._map(), success=True)
+
+    async def diff(self, before: SelectorMap, after: SelectorMap) -> PageDiff:
+        return PageDiff()
+
+
+class _ClickReasoner:
+    async def plan_goal(self, goal, orient, affordances):  # noqa: ANN001, ARG002
+        return [Subgoal(description="go to dest", done_check="navigated")]
+
+    async def decide_step(self, goal, ranked_slice, facts, history, context=None):  # noqa: ANN001, ARG002
+        target = next(iter(sorted(ranked_slice.nodes)), None)
+        return StepProposal(
+            scratch_reasoning="click the link",
+            action_kind="click",
+            target_index=target,
+            irreversibility="reversible",
+            success_check="navigated",
+            say="",
+        )
+
+
+async def test_executor_fires_on_orient_on_navigation():
+    """Every NEW page the agent navigates to fires the auto-index hook with the new
+    url — the greedy per-page indexing trigger (not just the first ORIENT)."""
+    seen: list[str] = []
+    actuator = _NavActuator()
+    graph = build_stage_graph(
+        _ClickReasoner(),
+        FakeRetriever(corpus={}),
+        actuator,
+        mode="fast",
+        max_replans=1,
+        on_orient=seen.append,
+    )
+    cfg = {"configurable": {"thread_id": str(uuid.uuid4())}}
+    seed = seed_stage_state(
+        goal="go to dest", mode="fast", page_index=await actuator.perceive()
+    )
+    out = await graph.ainvoke(seed, cfg)
+    # Approve any consent gate so the click actually executes and the page navigates
+    # (the executor's on-navigation trigger fires only after a real URL change).
+    for _ in range(4):
+        if "__interrupt__" not in out:
+            break
+        out = await graph.ainvoke(
+            Command(resume=ConsentDecision(decision="approve").model_dump()), cfg
+        )
+    assert seen[0] == "https://nav.test/start"  # planner orient (start page)
+    assert "https://nav.test/dest" in seen  # executor fired on the navigation

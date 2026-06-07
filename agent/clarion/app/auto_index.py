@@ -22,9 +22,12 @@ Safety / invariants (why this is allowed to run automatically):
     auto-index is a best-effort warm-up, never a hard dependency.
   - **GATED.** Off unless ``CLARION_AUTO_INDEX=1`` (so the no-network test gate, demo
     mode, and the event-day live worker are untouched unless explicitly enabled).
-  - **THROTTLED.** Each host is crawled at most once per process (an in-memory
-    guard), so a multi-turn session never re-crawls. Cross-process freshness is the
-    re-crawl supersede + fingerprint (``structure_freshness``), not a TTL.
+  - **THROTTLED (per landing-page URL).** Each distinct page URL is crawled at most
+    once per process — so the agent indexes EVERY public page it navigates to, but
+    never re-crawls one within a session. After a crawl, every page it actually
+    indexed (the seed + its BFS neighbours) is marked seen, so landing later on a
+    page already reached as a neighbour won't re-crawl it. Cross-process freshness is
+    the re-crawl supersede + fingerprint (``structure_freshness``), not a TTL.
 """
 
 from __future__ import annotations
@@ -32,9 +35,11 @@ from __future__ import annotations
 import asyncio
 import os
 from typing import Awaitable, Callable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
-# Hosts already crawled (or in flight) in THIS process — the per-process throttle.
-_SEEN_HOSTS: set[str] = set()
+# Page URLs already crawled (or in flight) in THIS process — the per-landing-page
+# throttle, so a session indexes every public page it visits, each at most once.
+_SEEN_URLS: set[str] = set()
 
 
 def auto_index_enabled() -> bool:
@@ -42,9 +47,23 @@ def auto_index_enabled() -> bool:
     return os.environ.get("CLARION_AUTO_INDEX") == "1"
 
 
+def _url_key(url: str) -> str:
+    """A normalized dedup key for a page URL: scheme + host (lower-cased) + path
+    (trailing slash trimmed) + query, with the fragment dropped. ``""`` for a
+    blank/garbage URL (which is then skipped)."""
+    try:
+        s = urlsplit((url or "").strip())
+    except ValueError:
+        return ""
+    if s.scheme not in ("http", "https") or not s.netloc:
+        return ""
+    path = s.path.rstrip("/") or "/"
+    return urlunsplit((s.scheme.lower(), s.netloc.lower(), path, s.query, ""))
+
+
 def _reset_seen() -> None:
-    """Clear the per-process host throttle (tests only)."""
-    _SEEN_HOSTS.clear()
+    """Clear the per-process URL throttle (tests only)."""
+    _SEEN_URLS.clear()
 
 
 async def auto_index_host(
@@ -60,19 +79,18 @@ async def auto_index_host(
     """
     if not auto_index_enabled():
         return False
-    from clarion.app.site_indexer import host_of, is_denied_url  # light (stdlib only)
+    from clarion.app.site_indexer import is_denied_url  # light (stdlib only)
 
-    host = host_of(url)
-    if not host or host in _SEEN_HOSTS:
+    key = _url_key(url)
+    if not key or key in _SEEN_URLS:
         return False
-    # Don't auto-crawl when the user is sitting on a denylisted SEED (a /logout,
-    # /login, delete… page) — and don't consume the host's throttle slot, so a later
-    # activation on a normal page of the same host can still index it.
+    # Don't auto-crawl a denylisted SEED (a /logout, /login, delete… page) — and
+    # don't consume its throttle slot, so a later normal page still indexes.
     if is_denied_url(url):
         log(f"[auto-index] seed {url!r} is denylisted (auth/destructive) — skipped")
         return False
-    # Claim the host BEFORE awaiting so two concurrent activations don't double-crawl.
-    _SEEN_HOSTS.add(host)
+    # Claim the URL BEFORE awaiting so two concurrent navigations don't double-crawl.
+    _SEEN_URLS.add(key)
     try:
         if crawl is None:
             from clarion.app.site_indexer import crawl_and_index
@@ -81,15 +99,21 @@ async def auto_index_host(
         max_pages = int(os.environ.get("CLARION_CRAWL_MAX_PAGES", "6"))
         max_depth = int(os.environ.get("CLARION_CRAWL_MAX_DEPTH", "1"))
         log(
-            f"[auto-index] crawling public structure of {host!r} "
+            f"[auto-index] crawling public structure from {url!r} "
             f"(max_pages={max_pages}, depth={max_depth})"
         )
-        await crawl(url, max_pages=max_pages, max_depth=max_depth, log=log)
+        result = await crawl(url, max_pages=max_pages, max_depth=max_depth, log=log)
+        # Mark every page the crawl actually indexed (the seed + its BFS neighbours)
+        # so navigating later to one already reached as a neighbour won't re-crawl it.
+        for u in getattr(result, "pages", None) or []:
+            k = _url_key(u)
+            if k:
+                _SEEN_URLS.add(k)
         return True
     except Exception as exc:  # noqa: BLE001 - best-effort warm-up; never propagate.
-        # Release the host so a later activation can retry after a transient failure.
-        _SEEN_HOSTS.discard(host)
-        log(f"[auto-index] skipped {host!r} — {exc}")
+        # Release the URL so a later navigation can retry after a transient failure.
+        _SEEN_URLS.discard(key)
+        log(f"[auto-index] skipped {url!r} — {exc}")
         return False
 
 
