@@ -414,8 +414,22 @@ class HeroRuntime:
         are LLM-derived, ZERO baked topology."""
         from clarion.stages.graph import build_stage_graph
 
+        # Knowledge-layer #4(a): consult the per-site STRUCTURE index at PLAN time so
+        # the Reasoner knows which page hosts the goal's flow. Opt-in (live only) via
+        # CLARION_SITE_KNOWLEDGE=1 — default OFF keeps the page-only planner and the
+        # no-network test gate untouched. Fail-open inside SiteKnowledge.
+        site_context = None
+        if os.environ.get("CLARION_SITE_KNOWLEDGE") == "1":
+            from clarion.app.site_indexer import SiteKnowledge
+
+            site_context = SiteKnowledge().context_facts
+
         return build_stage_graph(
-            self.reasoner, self.retriever, self.actuator, mode=self.mode
+            self.reasoner,
+            self.retriever,
+            self.actuator,
+            mode=self.mode,
+            site_context=site_context,
         )
 
     async def close(self) -> None:
