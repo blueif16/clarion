@@ -221,6 +221,129 @@ def test_pairing_fence_needs_a_single_backing_pair() -> None:
 
 
 # ---------------------------------------------------------------------------
+# (1c) ABSTAIN-AND-CLARIFY on an ambiguous goal (the hero beat)
+# ---------------------------------------------------------------------------
+
+
+class _TwoLinkActuator(Actuator):
+    """A live map with TWO plausible navigate targets so the ambiguity beat is
+    drivable: index 0 ('Pay my bill') and index 1 ('Pay a parking ticket')."""
+
+    def __init__(self) -> None:
+        self.act_calls: list[Action] = []
+
+    def _map(self) -> SelectorMap:
+        return SelectorMap(
+            nodes={
+                0: AxNode(index=0, role="link", name="Pay my bill", node_id="n-bill"),
+                1: AxNode(
+                    index=1, role="link", name="Pay a parking ticket", node_id="n-ticket"
+                ),
+            },
+            token_estimate=20,
+        )
+
+    async def perceive(self) -> SelectorMap:
+        return self._map()
+
+    async def act(self, action: Action) -> Observation:
+        self.act_calls.append(action)
+        return Observation(selector_map=self._map(), success=True)
+
+    async def diff(self, before: SelectorMap, after: SelectorMap) -> PageDiff:
+        return PageDiff()
+
+
+def _ambiguous_reasoner(*, alternatives: list[int]) -> FakeReasoner:
+    """A reasoner scripted to pick index 0 (navigate) but self-report ``alternatives``
+    — the model's metacognitive ambiguity signal. A non-empty list MUST make the
+    kernel clarify instead of act."""
+    return FakeReasoner(
+        steps=[
+            StepProposal(
+                scratch_reasoning="the goal could mean either link",
+                action_kind="navigate",
+                target_index=0,
+                value_ref=None,
+                irreversibility="irreversible",
+                success_check="navigated",
+                say="",
+                alternatives=list(alternatives),
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_goal_abstains_and_clarifies() -> None:
+    """A navigate step whose ``alternatives`` is non-empty MUST produce a SAFE
+    read-back-and-ask (a ``read`` action naming BOTH controls), never a
+    consequential navigate. The hero beat: abstain over guess."""
+    facts: list[Fact] = []
+    retriever = _ScriptedRetriever(facts)
+    actuator = _TwoLinkActuator()
+    graph = build_kernel(
+        _ambiguous_reasoner(alternatives=[1]), retriever, actuator, mode="normal"
+    )
+
+    seed = seed_state(goal="pay", mode="normal")
+    seed["page_index"] = await actuator.perceive()
+    config = _cfg()
+
+    final = await graph.ainvoke(seed, config)
+
+    # No consent interrupt (a read auto-proceeds) and NO consequential act.
+    assert "__interrupt__" not in final
+    assert actuator.act_calls == [] or all(
+        a.kind == "read" for a in actuator.act_calls
+    )
+    # The pending proposal is a SAFE read, not a navigate.
+    proposal = final["pending_proposal"]
+    assert proposal.action is not None and proposal.action.kind == "read"
+    assert proposal.irreversible is False
+    # The clarify question names BOTH live controls (abstain-and-clarify).
+    assert "Pay my bill" in proposal.utterance
+    assert "Pay a parking ticket" in proposal.utterance
+    # The abstain is recorded in the trace.
+    abstain_ev = next(
+        e
+        for e in final["trace"]
+        if e.node == "PROPOSE" and e.data.get("abstained") == "ambiguous"
+    )
+    assert abstain_ev.data["alternatives"] == [1]
+
+
+@pytest.mark.asyncio
+async def test_no_alternatives_acts_normally() -> None:
+    """Backward compat: with ``alternatives=[]`` a navigate proposal is formed as
+    before (a consequential action that gates), NOT a clarify read-back."""
+    facts: list[Fact] = []
+    retriever = _ScriptedRetriever(facts)
+    actuator = _TwoLinkActuator()
+    graph = build_kernel(
+        _ambiguous_reasoner(alternatives=[]), retriever, actuator, mode="normal"
+    )
+
+    seed = seed_state(goal="pay my bill", mode="normal")
+    seed["page_index"] = await actuator.perceive()
+    config = _cfg()
+
+    result = await graph.ainvoke(seed, config)
+
+    # A normal consequential navigate gates at CONSENT (Normal mode).
+    assert "__interrupt__" in result
+    assert graph.get_state(config).next == ("consent",)
+    assert actuator.act_calls == []
+    parked = graph.get_state(config)
+    proposal = parked.values["pending_proposal"]
+    assert proposal.action is not None and proposal.action.kind == "navigate"
+    # No abstain trace event in the unambiguous case.
+    assert not any(
+        e.data.get("abstained") == "ambiguous" for e in parked.values["trace"]
+    )
+
+
+# ---------------------------------------------------------------------------
 # (2) Normal mode pauses at CONSENT for a consequential step
 # ---------------------------------------------------------------------------
 
@@ -368,6 +491,22 @@ async def test_resume_approve_twice_acts_once() -> None:
         if e.node == "ACT" and e.data.get("skipped") == "already-acted"
     ]
     assert skipped, "expected an 'already-acted' ACT skip marker on the re-run"
+
+
+@pytest.mark.asyncio
+async def test_failed_act_does_not_poison_once_flag() -> None:
+    """A FAILED act (success=False) must NOT trip the §2.3 once-flag. Proposal ids
+    repeat across replans of one subgoal (``prop-{stage}-{step}``), so a failed act
+    (e.g. an abstain-and-clarify ``read`` with no index) must leave a retry — even a
+    real, user-consented click on the same id — free to dispatch."""
+    from clarion.kernel.graph import _already_acted, _trace
+
+    pid = "prop-0-0"
+    failed = {"trace": [_trace("ACT", "info", acted_proposal_id=pid, success=False)]}
+    assert _already_acted(failed, pid) is False  # failed → retry allowed
+
+    succeeded = {"trace": [_trace("ACT", "info", acted_proposal_id=pid, success=True)]}
+    assert _already_acted(succeeded, pid) is True  # success → no double-act
 
 
 # ---------------------------------------------------------------------------

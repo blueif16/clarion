@@ -184,9 +184,17 @@ def _trace(node: str, event: str = "info", **data: object) -> TraceEvent:
 
 
 def _already_acted(state: ClarionState, proposal_id: str) -> bool:
-    """The §2.3 once-flag check: has ACT already recorded an ``acted_proposal_id``
-    marker for this proposal? If so, a re-entry (e.g. a second resume(approve))
-    must NOT side-effect again.
+    """The §2.3 once-flag check: has ACT already SUCCESSFULLY acted on this
+    proposal? If so, a re-entry (e.g. a second resume(approve)) must NOT
+    side-effect again.
+
+    Only a ``success=True`` marker counts. A FAILED act (``success=False`` — e.g.
+    an abstain-and-clarify ``read`` with no index, or a click whose element was
+    gone) had NO side effect, so it must NOT block a retry. Proposal ids repeat
+    across replans of one subgoal (``prop-{stage}-{step}``), so without this a
+    single failed act would poison every later attempt on that id — including a
+    real, user-consented click — which then silently skips and the page never
+    moves.
 
     ``trace`` is the reducer-accumulated channel (``Annotated[list[TraceEvent],
     operator.add]`` in the frozen contract), so on an interrupt re-execution this
@@ -195,6 +203,7 @@ def _already_acted(state: ClarionState, proposal_id: str) -> bool:
     return any(
         ev.node == "ACT"
         and ev.data.get("acted_proposal_id") == proposal_id
+        and ev.data.get("success")
         for ev in state["trace"]
     )
 
