@@ -14,11 +14,14 @@ double-POST to `ext.log` (SW skips sink on `fromWorker`); `clarion-up` reaps orp
 (a bar-orb that breathes/sweeps/bounces per agent state — idle·linking·listening·thinking·
 speaking·error, driven off the real `[agent] old → new` lines) + an elegant event log
 (category accents, level dots, drag/collapse/copy/clear). `hud.js`.
-**Knowledge layer (spike):** a read-only same-origin STRUCTURE crawler
-(`app/site_indexer.py`) injects page affordances (headings + controls, NEVER live
-values) into a per-site Moss index (`clarion-site-<host>`) — proven live on usa.gov
-with round-trip retrieval. Active Moss project set to a clean dedicated one;
-`clarion-kb` (re)built + smoke-verified there (Gemini custom embeds, ~1ms in-mem)._
+**Knowledge layer:** a read-only same-origin STRUCTURE crawler (`app/site_indexer.py`)
+injects page affordances (headings + controls, NEVER live values) into ONE
+`clarion-site-structure` Moss index partitioned by `{site}` metadata (per-CATEGORY,
+not per-site — Moss `QueryOptions.filter`; `docs/research/moss-index-design.md`), and
+is WIRED into PLAN via `SiteKnowledge` (gated `CLARION_SITE_KNOWLEDGE=1`, fail-open).
+Active Moss project is a clean dedicated one; `clarion-kb` + `clarion-site-structure`
+built + verified (Gemini custom embeds, ~1ms in-mem). PyTorch advisory silenced
+(turn-detector uses onnxruntime, not torch)._
 
 This is the single source of truth for **where we are and what's left**. Keep it
 current: when you finish or change something, edit this file in the same commit.

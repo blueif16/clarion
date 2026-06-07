@@ -74,7 +74,7 @@ Secrets in `agent/.env` (gitignored; template `agent/.env.example`).
 
 ## Provider state (event-day truth)
 - **LiveKit** live · **Deepgram** STT live · **Gemini LLM+TTS** live via AI Studio (`gemini-3.5-flash` + `gemini-3.1-flash-tts-preview`/Kore; Vertex-Express `AQ.*` key is billing-blocked, kept behind `TTS_MODE=vertex`).
-- **Moss** retrieval live; its embed host + cloud-query are bypassed by Gemini `gemini-embedding-001` custom embeddings. `clarion-kb` index is built + persistent (reused).
+- **Moss** retrieval live (Gemini `gemini-embedding-001` custom embeddings bypass the model host; index limit is a PRICING tier — free=3, paid=unlimited). **Data-model rule: ONE index per data CATEGORY + a metadata `QueryOptions.filter`, NEVER one index per site/tenant** (Moss supports `filter` on a loaded index; research `docs/research/moss-index-design.md`). Live indexes: `clarion-kb` (policy KB) + `clarion-site-structure` (knowledge-layer (a): ALL sites' affordances, `{site}`-partitioned — `app/site_indexer.py` crawls read-only & writes, `SiteKnowledge` consults at PLAN, gated `CLARION_SITE_KNOWLEDGE=1`, fail-open).
 - **Minimax** — Gemini TTS stands in (swap seam = the `Synthesizer` ABC).
 - Pre-warm the Moss index and fire the embed on partial-STT so the on-stage number is the in-memory ~3ms (the ~2.7s embed RPC must overlap speech).
 
