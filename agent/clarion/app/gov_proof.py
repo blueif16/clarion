@@ -460,26 +460,30 @@ class GovProofDriver:
             and os.environ.get("CLARION_MEMORY") == "1"
             and outcome != "error"
         ):
-            try:
-                await self.rt.memory.write_episode(
-                    self.rt.user_id,
-                    WorkflowEpisode(
-                        goal=self.goal,
-                        url_host=(urlparse(self.url).hostname or ""),
-                        subgoals=self.result.subgoals,
-                        plan_utterance=self.result.plan_utterance,
-                        outcome=outcome,  # type: ignore[arg-type]
-                        consent=[_remembered(c) for c in self.result.consent_events],
-                        hard_stops=self.result.hard_stops,
-                        approvals=self.result.approvals,
-                        decide_ms_mean=_mean(self.result.decide_ms),
-                        perceive_ms_mean=_mean(self.result.perceive_ms),
-                        completed_at=time.time(),
-                    ),
-                )
-                _p(f"  [memory] episode saved (outcome={outcome})")
-            except Exception as exc:  # noqa: BLE001 — never fail a run on a memory miss.
-                _p(f"  [memory] episode write skipped: {exc}")
+            episode = WorkflowEpisode(
+                goal=self.goal,
+                url_host=(urlparse(self.url).hostname or ""),
+                subgoals=self.result.subgoals,
+                plan_utterance=self.result.plan_utterance,
+                outcome=outcome,  # type: ignore[arg-type]
+                consent=[_remembered(c) for c in self.result.consent_events],
+                hard_stops=self.result.hard_stops,
+                approvals=self.result.approvals,
+                decide_ms_mean=_mean(self.result.decide_ms),
+                perceive_ms_mean=_mean(self.result.perceive_ms),
+                completed_at=time.time(),
+            )
+            # Same workflow-bar as the live offer: only record a real workflow
+            # (transactional / multi-step / form), never a trivial read — so the
+            # autonomous driver doesn't pollute the shared store with one-step reads.
+            if not episode.is_workflow():
+                _p("  [memory] episode skipped (not a workflow: trivial read)")
+            else:
+                try:
+                    await self.rt.memory.write_episode(self.rt.user_id, episode)
+                    _p(f"  [memory] episode saved (outcome={outcome})")
+                except Exception as exc:  # noqa: BLE001 — never fail a run on a memory miss.
+                    _p(f"  [memory] episode write skipped: {exc}")
 
         return self._finalize()
 

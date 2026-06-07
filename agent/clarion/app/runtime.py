@@ -446,7 +446,14 @@ class HeroRuntime:
         # (mirrors site_context). Active ONLY when memory is on (CLARION_MEMORY=1 builds
         # self.memory); default OFF → the stage graph never reaches the remember node.
         remember_nominate = None
-        if self.memory is not None and os.environ.get("CLARION_MEMORY") == "1":
+        # Knowledge-layer #4(b): the end-of-flow "save this workflow?" offer rides the
+        # SAME gate (memory built + CLARION_MEMORY=1). The save node itself only fires
+        # when the finished run ``is_workflow()`` (multi-step / form / transactional),
+        # and writes the episode ONLY on an explicit yes (no memory without a yes).
+        offer_workflow_save = (
+            self.memory is not None and os.environ.get("CLARION_MEMORY") == "1"
+        )
+        if offer_workflow_save:
             from clarion.app.remember import nominate_remember_candidates
 
             def _nominate(filled, page):
@@ -499,6 +506,7 @@ class HeroRuntime:
             memory=self.memory,
             user_id=self.user_id,
             remember_nominate=remember_nominate,
+            offer_workflow_save=offer_workflow_save,
             ranker=ranker,
             rank_min_nodes=rank_min_nodes,
         )

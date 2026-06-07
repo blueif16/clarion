@@ -378,6 +378,29 @@ class WorkflowEpisode(BaseModel):
     decide_ms_mean: float = 0.0
     perceive_ms_mean: float = 0.0
     completed_at: float = 0.0
+    # How many fields the run filled — the "complicated form" effort signal for
+    # ``is_workflow`` (a form is often ONE subgoal with many fields, so subgoal
+    # count alone misses it). Never a value, just a count.
+    n_filled: int = 0
+
+    def is_workflow(self) -> bool:
+        """Is this finished run substantial enough to remember + offer to repeat?
+
+        TWO independent axes, OR'd — a run qualifies on EITHER:
+          - CONSEQUENCE: it committed an irreversible step the user approved
+            (``transactional``) — a one-click bill-pay counts even though it is
+            short; or
+          - EFFORT: it ran a multi-step process (``>= 3`` subgoals) OR filled out a
+            real form (``>= 3`` fields).
+        A trivial single-surface read (one subgoal, no fills, no commit) is NOT a
+        workflow — there is nothing to repeat (the answer re-grounds every time).
+        Derived purely from the run's own record — structural counts, never a
+        lexical read of the goal text (the de-hardcoding thesis)."""
+        transactional = any(
+            c.irreversible and c.decision == "approve" for c in self.consent
+        )
+        substantial = len(self.subgoals) >= 3 or self.n_filled >= 3
+        return transactional or substantial
 
 
 class Recall(BaseModel):

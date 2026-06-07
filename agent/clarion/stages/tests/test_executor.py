@@ -29,12 +29,14 @@ from clarion.contracts.ports import Actuator
 from clarion.contracts.state import (
     Action,
     AxNode,
+    ConsentRecord,
     Fact,
     Observation,
     PageDiff,
     SelectorMap,
     StepProposal,
     Subgoal,
+    WorkflowEpisode,
 )
 from clarion.fakes import FakeActuator, FakeMemory, FakeReasoner, FakeRetriever
 from clarion.stages.checks import evaluate_success_check, make_anchor
@@ -241,6 +243,35 @@ async def test_executor_gates_consequential_step_in_normal_mode() -> None:
     assert any(c.decision == "approve" for c in final["consent_log"])
 
 
+@pytest.mark.asyncio
+async def test_consent_resume_does_not_re_decode() -> None:
+    """The consent-resume latency fix: approving a parked step must RESUME the
+    parked inner kernel, NOT re-seed + re-decide it. A re-decode on every "yes" was
+    a wasted ~3s LLM decode live. The deterministic inner-kernel thread id makes the
+    parent resume land on the SAME parked child, so ``decide_step`` runs exactly once
+    across advance + resume."""
+    reasoner = _fill_then_done_reasoner()
+    actuator = _FormActuator()
+    graph = build_stage_graph(
+        reasoner, _page_facts_retriever(), actuator, mode="normal", max_replans=1
+    )
+    config = _cfg()
+    seed = seed_stage_state(
+        goal="enter the amount", mode="normal", page_index=await actuator.perceive()
+    )
+    paused = await graph.ainvoke(seed, config)
+    assert "__interrupt__" in paused
+    # The step was decided ONCE to surface consent.
+    assert len(reasoner.decide_calls) == 1
+
+    approve = Command(resume=ConsentDecision(decision="approve").model_dump())
+    final = await graph.ainvoke(approve, config)
+    assert "__interrupt__" not in final
+    # The approved step ACTED — and the resume did NOT re-run the decider (still 1).
+    assert any(a.kind == "fill" for a in actuator.act_calls)
+    assert len(reasoner.decide_calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # (3b) the end-of-flow "remember?" offer — wired, consent-gated (no memory
 #      without a yes). The injected nominator wraps app.remember (secret-
@@ -334,6 +365,171 @@ async def test_no_remember_node_when_offer_inactive() -> None:
     )
     assert "__interrupt__" not in final
     assert not any(e.node == "REMEMBER" for e in final["trace"])
+
+
+# ---------------------------------------------------------------------------
+# (3c) is_workflow classification + the end-of-flow "save this workflow?" offer
+#      (knowledge-layer #4b). A finished run is recorded ONLY when it is a real
+#      workflow (transactional OR >=3 subgoals OR >=3 fields) and ONLY on a yes.
+# ---------------------------------------------------------------------------
+
+
+def test_is_workflow_classification() -> None:
+    """The two-axis bar: CONSEQUENCE (an approved irreversible step) OR EFFORT
+    (>=3 subgoals OR >=3 filled fields). A trivial one-step read is neither."""
+
+    def ep(**kw) -> WorkflowEpisode:  # noqa: ANN003
+        return WorkflowEpisode(goal="g", url_host="h", **kw)
+
+    sub = Subgoal(description="s", done_check="field_nonempty")
+    approve_irrev = ConsentRecord(proposal_id="p", irreversible=True, decision="approve")
+    reject_irrev = ConsentRecord(proposal_id="p", irreversible=True, decision="reject")
+    approve_rev = ConsentRecord(proposal_id="p", irreversible=False, decision="approve")
+
+    # CONSEQUENCE: an approved irreversible step → a workflow even though it is short.
+    assert ep(subgoals=[sub], consent=[approve_irrev]).is_workflow() is True
+    # A REJECTED irreversible step committed nothing → not transactional.
+    assert ep(subgoals=[sub], consent=[reject_irrev]).is_workflow() is False
+    # An approved REVERSIBLE step alone is not transactional.
+    assert ep(subgoals=[sub], consent=[approve_rev]).is_workflow() is False
+    # EFFORT: >=3 subgoals → a multi-step process is a workflow.
+    assert ep(subgoals=[sub, sub, sub]).is_workflow() is True
+    # EFFORT: >=3 filled fields → a complicated form is a workflow (even at 1 subgoal).
+    assert ep(subgoals=[sub], n_filled=3).is_workflow() is True
+    # TRIVIAL: one step, no fills, no commit → nothing to repeat.
+    assert ep(subgoals=[sub]).is_workflow() is False
+    assert ep(subgoals=[sub, sub], n_filled=2, consent=[approve_rev]).is_workflow() is False
+
+
+class _IrreversibleFillReasoner(_FillReasoner):
+    """Like ``_FillReasoner`` but classifies the fill IRREVERSIBLE — so it gates at
+    consent (any mode) and, once approved, the finished run is TRANSACTIONAL."""
+
+    async def decide_step(self, goal, ranked_slice, facts, history, context=None):  # noqa: ANN001, ARG002
+        sp = await super().decide_step(goal, ranked_slice, facts, history, context)
+        return sp.model_copy(update={"irreversibility": "irreversible"})
+
+
+async def _drive_to_save_offer(graph, seed, config):
+    """Run a flow to the 'save this workflow?' offer, approving every prior
+    (action) consent. Returns (result, save_req) — save_req is None if the run
+    ended without offering."""
+    result = await graph.ainvoke(seed, config)
+    approve = Command(resume=ConsentDecision(decision="approve").model_dump())
+    for i in range(8):
+        if "__interrupt__" not in result:
+            return result, None
+        (intr,) = result["__interrupt__"]
+        req = ConsentRequest.model_validate(intr.value)
+        if i == 0:
+            # The first gate is the irreversible ACTION consent, not the save offer.
+            assert req.proposal_id != "save_workflow" and req.irreversible is True
+        if req.proposal_id == "save_workflow":
+            return result, req
+        result = await graph.ainvoke(approve, config)
+    raise AssertionError("never reached the save-workflow offer")
+
+
+@pytest.mark.asyncio
+async def test_save_workflow_offer_fires_and_writes_on_yes() -> None:
+    """A transactional run (an approved irreversible step) → the end-of-flow offer
+    fires and writes the EPISODE through Memory on a yes. Exercises the whole new
+    path: the kernel CONSENT trace carries ``irreversible`` → the executor forwards
+    it → the episode's consent reconstructs it → ``is_workflow`` → ``write_episode``."""
+    mem = FakeMemory()
+    actuator = _FormActuator()
+    graph = build_stage_graph(
+        _IrreversibleFillReasoner(), _page_facts_retriever(), actuator,
+        mode="normal", max_replans=1,
+        memory=mem, offer_workflow_save=True,  # NB: no preference offer, to isolate.
+    )
+    config = _cfg()
+    seed = seed_stage_state(
+        goal="pay the bill", mode="normal", page_index=await actuator.perceive()
+    )
+    paused, save_req = await _drive_to_save_offer(graph, seed, config)
+    assert save_req is not None and "pay the bill" in save_req.utterance.lower()
+    assert (await mem.read_profile("default")).episodes == []  # nothing before the yes
+
+    final = await graph.ainvoke(
+        Command(resume=ConsentDecision(decision="approve").model_dump()), config
+    )
+    assert "__interrupt__" not in final
+    eps = (await mem.read_profile("default")).episodes
+    assert len(eps) == 1 and eps[0].goal == "pay the bill"
+    assert eps[0].is_workflow() is True and eps[0].outcome == "completed"
+    # The episode carries the irreversible consent record reconstructed from the trace.
+    assert any(c.irreversible and c.decision == "approve" for c in eps[0].consent)
+    sw = [e for e in final["trace"] if e.node == "SAVE_WORKFLOW" and e.event == "exit"]
+    assert sw and sw[-1].data["offered"] is True and sw[-1].data["saved"] is True
+
+
+@pytest.mark.asyncio
+async def test_save_workflow_persists_nothing_on_no() -> None:
+    """No on the save offer → NOTHING persists (no memory without a yes)."""
+    mem = FakeMemory()
+    actuator = _FormActuator()
+    graph = build_stage_graph(
+        _IrreversibleFillReasoner(), _page_facts_retriever(), actuator,
+        mode="normal", max_replans=1,
+        memory=mem, offer_workflow_save=True,
+    )
+    config = _cfg()
+    seed = seed_stage_state(
+        goal="pay the bill", mode="normal", page_index=await actuator.perceive()
+    )
+    _, save_req = await _drive_to_save_offer(graph, seed, config)
+    assert save_req is not None
+    final = await graph.ainvoke(
+        Command(resume=ConsentDecision(decision="reject").model_dump()), config
+    )
+    assert "__interrupt__" not in final
+    assert (await mem.read_profile("default")).episodes == []
+    sw = [e for e in final["trace"] if e.node == "SAVE_WORKFLOW" and e.event == "exit"]
+    assert sw and sw[-1].data["kept"] is False and sw[-1].data["saved"] is False
+
+
+@pytest.mark.asyncio
+async def test_save_workflow_skipped_on_trivial_read() -> None:
+    """A trivial run (one reversible fill — <3 subgoals, <3 fields, no commit) is
+    NOT a workflow → the save node SKIPS the offer (no interrupt, nothing written)
+    and the flow ends cleanly."""
+    mem = FakeMemory()
+    actuator = _FormActuator()
+    graph = build_stage_graph(
+        _fill_then_done_reasoner(), _page_facts_retriever(), actuator,
+        mode="fast", max_replans=1,
+        memory=mem, offer_workflow_save=True,
+    )
+    final = await graph.ainvoke(
+        seed_stage_state(
+            goal="enter the amount", mode="fast", page_index=await actuator.perceive()
+        ),
+        _cfg(),
+    )
+    assert "__interrupt__" not in final
+    assert (await mem.read_profile("default")).episodes == []
+    sw = [e for e in final["trace"] if e.node == "SAVE_WORKFLOW" and e.event == "exit"]
+    assert sw and sw[-1].data["offered"] is False
+
+
+@pytest.mark.asyncio
+async def test_no_save_workflow_node_when_offer_inactive() -> None:
+    """Default (offer_workflow_save=False) → the save node is never reached (the
+    frozen / memory-off path stays inert)."""
+    actuator = _FormActuator()
+    graph = build_stage_graph(
+        _fill_then_done_reasoner(), _page_facts_retriever(), actuator,
+        mode="fast", max_replans=1,
+    )
+    final = await graph.ainvoke(
+        seed_stage_state(
+            goal="enter the amount", mode="fast", page_index=await actuator.perceive()
+        ),
+        _cfg(),
+    )
+    assert "__interrupt__" not in final
+    assert not any(e.node == "SAVE_WORKFLOW" for e in final["trace"])
 
 
 # ---------------------------------------------------------------------------
