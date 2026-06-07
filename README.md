@@ -29,6 +29,42 @@ Everything below — the architecture, the memory layer, the demo, the reason th
 
 ---
 
+## Key functionalities (at a glance)
+
+A map of what Clarion does, grouped by layer. Each item is detailed in the section noted — this is the index.
+
+**Task plane — the de-hardcoded loop, safe by construction** (§1 · §1.1)
+- **`GROUND → VERIFY → PROPOSE → ⟨GATE⟩ → CONSENT → ACT → CONFIRM`** — the kernel loop: the LLM decides, the kernel enforces the two invariants in code.
+- **`Reasoner` (MiniMax-M3)** — plans the goal into sub-goals and decides each grounded step behind a frozen port, with zero site-specific topology.
+- **Membership + pairing fences** — a value is speakable only if byte-identical to a live grounded `Fact`, and an "X is Y" claim needs a single geometric `PairedFact` backing both halves.
+- **`PairedFact`** — label↔value paired geometrically at extract time, so a citation can never land on the wrong number.
+- **Dual-signal irreversibility gate** — `reversible | irreversible | UNKNOWN`; either the model or a code pre-screen can escalate, the model can never downgrade, and `UNKNOWN` routes through consent.
+- **Consent gate** — a LangGraph `interrupt()` blocks until the human says yes; `ACT` is idempotent (once-flag).
+- **Generic done-check** — code-selected and page-verified; the model never grades its own success.
+- **`NegativeVerifier`** — a spoken negative comes from a closed-world search with coverage evidence, else an honest hedge.
+- **Normal / Fast modes** — per-step confirmation, vs. run-ahead through reversible steps with a hard-stop at any irreversible/UNKNOWN one.
+
+**Perception & action** (§1)
+- **Accessibility-tree perception** — a numbered merged AXTree → `selector_map`, robust where vision-based agents break; every spoken fact carries a `source_node_id`.
+- **Click-by-AX-identity** — acts on the node's identity (scroll + quads), never a screenshot coordinate guess.
+- **Source-node highlight** — outlines the exact control it will act on, synced to the readback, before the yes.
+
+**Knowledge layer** (§1.2)
+- **Indexed webpages (`clarion-site-structure`)** — a self-populating, cookie-less, public-only auto-index of page affordances, kept fresh by verify-on-use (no TTL).
+- **User memory (`clarion-profile` · `clarion-task-paths`)** — consent-gated facts + preferences and workflow episodes, opt-in behind `CLARION_MEMORY=1`.
+- **Recall warm-start** — a prior plan re-enters the next run as an advisory `prior_plan_hint`, re-grounded live.
+- **The firewall** — `Recall` has no `source_node_id`, so a remembered value is structurally unspeakable; secrets are never offered.
+
+**Voice & demo surfaces** (§2)
+- **Speculative retrieval** — queries fire on partial STT, while the user is still talking.
+- **Live latency meter** — `Moss: ~3ms` next to a greyed `cold RAG: ~340ms`.
+- **Sources + negative-verification panel** — every spoken fact cited; "no late fee — verified: not present."
+- **Barge-in** — interrupt mid-sentence, instant stop.
+- **Consent gate as a visible state** — `AWAITING YOUR YES` + the highlight box on the exact control.
+- **Glass-box action trace + `read_history`** — every action toasts (persists if irreversible) into a permanent history; the user can hear the last N actions back.
+
+---
+
 ## 1. System architecture
 
 Two planes and an actuator, wired by **events, not nested loops**. The kernel imports **zero provider SDKs** — every vendor lives behind a port, so the whole stack is swappable.
