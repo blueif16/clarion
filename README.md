@@ -106,7 +106,7 @@ Task Plane [LangGraph]:  GROUND → VERIFY → PROPOSE → ⟨GATE⟩ → ⟨CON
 ```
 </details>
 
-**The loop** (`kernel/graph.py`) is the heart, and it is **de-hardcoded — the LLM decides, the kernel enforces.** `GROUND` retrieves; `VERIFY` asserts only grounded facts (and confirmed absences) and adds the **membership + pairing fences** (a value is speakable only if it is byte-identical to a live grounded `Fact`, and an "X is Y" claim needs a single geometric `PairedFact` backing both halves); `PROPOSE` is the LLM **`Reasoner`** choosing the next grounded action over a ranked slice — a pure post-decode guard rejects any off-page index or invented value; the **`IRREVERSIBILITY GATE`** is dual-signal (`reversible | irreversible | UNKNOWN`) — the model's judgment AND a code structural pre-screen, where **either can escalate and the model can never downgrade**, and `UNKNOWN` routes through `CONSENT` even in Fast mode; the **`CONSENT` gate** (LangGraph `interrupt()`) blocks until the human says yes; `ACT` is idempotent (checks the consent-log once-flag before side-effecting); `CONFIRM` advances only on a **code-selected, page-verified done-check** (the model never grades its own success).
+**The loop** (`kernel/graph.py`) is the heart, and it is **de-hardcoded — the LLM decides, the kernel enforces.** `GROUND` retrieves; `VERIFY` asserts only grounded facts (and confirmed absences) and adds the **membership + pairing fences** (a value is speakable only if it is byte-identical to a live grounded `Fact`, and an "X is Y" claim needs a single geometric `PairedFact` backing both halves); `PROPOSE` is the LLM **`Reasoner`** choosing the next grounded action — given the **full situational context** (a `DecideContext`: the user's *verbatim* intent, the current plan phase + its done-check, the live page, the step history, and what just happened) so the decider is the best-informed agent in the loop — over a ranked slice; a pure post-decode guard rejects any off-page index or invented value; the **`IRREVERSIBILITY GATE`** is dual-signal (`reversible | irreversible | UNKNOWN`) — the model's judgment AND a code structural pre-screen, where **either can escalate and the model can never downgrade**, and `UNKNOWN` routes through `CONSENT` even in Fast mode; the **`CONSENT` gate** (LangGraph `interrupt()`) blocks until the human says yes; `ACT` is idempotent (checks the consent-log once-flag before side-effecting); `CONFIRM` advances only on a **code-selected, page-verified done-check** (the model never grades its own success).
 
 ### 1.1 The de-hardcoded design (Clarion-PE/G) — SHIPPED
 
@@ -125,7 +125,7 @@ The task plane carries **no per-site, per-goal logic.** One generic LLM plans th
 |---|---|---|
 | `VoiceTransport` | **LiveKit** (+ Deepgram STT `nova-3`, EN-only) · TTS = **LiveKit Inference** (Cartesia Sonic-2 + Deepgram Aura-2 failover, native — no per-provider key) | audio in/out, turn detection, barge-in |
 | `Retriever` | **Moss**, local-first (built-in `moss-minilm` embeds in-process; Gemini `gemini-embedding-001` custom-vector fallback) | `query → grounded facts[] + source_node_id`, sub-10ms in-memory |
-| `Reasoner` | **MiniMax-M3** (OpenAI-compatible) · **MiniMax-M2.7** failover (`FallbackAdapter`) | `plan_goal → sub-goals` · `decide_step → next grounded action`; the de-hardcoding boundary, the **only** LLM home (`gemini_reasoner`/`openai_reasoner` kept as alternate backends) |
+| `Reasoner` | **MiniMax-M3** (OpenAI-compatible) · **MiniMax-M2.7** failover (`FallbackAdapter`) | `plan_goal → specific sub-goals` (named to the real goal + live controls, zero site code) · `decide_step(…, context) → next grounded action`, fed a rich `DecideContext` (verbatim intent · plan phase · live page · history); the de-hardcoding boundary, the **only** LLM home (`gemini_reasoner`/`openai_reasoner` kept as alternate backends) |
 | `Synthesizer` | **MiniMax Speech** (`/v1/t2a_v2`) — the *kernel-facing* contract object (the audio you **hear** is the LiveKit Inference TTS above) | `text → audio` |
 | `Actuator` | **extension `chrome.debugger`** relay (product path, the user's real tab) · **Playwright/CDP** (autonomous proof) | merged numbered AXTree → act → re-perceive |
 | `Ingest` | site / doc → KB (`site_indexer` read-only crawl → `clarion-site-structure`) | parse + index pages and policy docs |
@@ -207,14 +207,14 @@ The hackathon thesis is "retrieval is the bottleneck." Clarion's invariant puts 
 
 ### How we're ready
 
-- **Deterministic regression gate:** `191 passed, 10 deselected`, fully offline (`.[test]` pulls no network) — including a goal-agnostic invariant spec whose guards are proven **red-before-green by mutation** (disable the structural net / the post-decode guard / the grounding check → the matching invariant test goes red), plus a no-network `FakeMemory` round-trip that asserts recall never carries a `source_node_id`.
+- **Deterministic regression gate:** `212 passed, 10 deselected`, fully offline (`.[test]` pulls no network) — including a goal-agnostic invariant spec whose guards are proven **red-before-green by mutation** (disable the structural net / the post-decode guard / the grounding check → the matching invariant test goes red), plus a no-network `FakeMemory` round-trip that asserts recall never carries a `source_node_id`.
 - **Providers live (event-day):** LiveKit · Deepgram STT (`nova-3`, EN-only) · **MiniMax-M3 brain** (M2.7 failover) · **LiveKit Inference TTS** (Cartesia Sonic-2 + Deepgram Aura-2 failover) · **Moss retrieval live**, `clarion-kb` + `clarion-site-structure` built and persistent; the user-memory indexes (`clarion-profile` / `clarion-task-paths`) ship behind `CLARION_MEMORY=1`.
 - **Judge-proof offline path:** `CLARION_DEMO_MODE=1` replays the hero run with no network, so a venue Wi-Fi failure can't kill the demo. Reliability is an engineering choice, not luck.
 - **Latency engineered, not hoped:** Moss is pre-warmed and the embed fires on partial-STT so the on-stage retrieval number is the in-memory **~3ms**, inside LiveKit's **<800ms** turn budget.
 
 ```bash
 # deterministic gate (no network)
-cd agent && pip install -e ".[test]" && python -m pytest clarion          # 191 passed, 10 deselected
+cd agent && pip install -e ".[test]" && python -m pytest clarion          # 212 passed, 10 deselected
 
 # the de-hardcoded proof, fully live on REAL gov sites (Playwright + MiniMax-M3 Reasoner)
 cd agent && pip install -e ".[spike]" && pip install -e ".[retrieval]"
