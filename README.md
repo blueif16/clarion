@@ -106,7 +106,7 @@ Task Plane [LangGraph]:  GROUND → VERIFY → PROPOSE → ⟨GATE⟩ → ⟨CON
 ```
 </details>
 
-**The loop** (`kernel/graph.py`) is the heart, and it is **de-hardcoded — the LLM decides, the kernel enforces.** `GROUND` retrieves; `VERIFY` asserts only grounded facts (and confirmed absences) and adds the **membership + pairing fences** (a value is speakable only if it is byte-identical to a live grounded `Fact`, and an "X is Y" claim needs a single geometric `PairedFact` backing both halves); `PROPOSE` is the LLM **`Reasoner`** choosing the next grounded action — given the **full situational context** (a `DecideContext`: the user's *verbatim* intent, the current plan phase + its done-check, the live page, the step history, and what just happened) so the decider is the best-informed agent in the loop — over a ranked slice; a pure post-decode guard rejects any off-page index or invented value; the **`IRREVERSIBILITY GATE`** is dual-signal (`reversible | irreversible | UNKNOWN`) — the model's judgment AND a code structural pre-screen, where **either can escalate and the model can never downgrade**, and `UNKNOWN` routes through `CONSENT` even in Fast mode; the **`CONSENT` gate** (LangGraph `interrupt()`) blocks until the human says yes; `ACT` is idempotent (checks the consent-log once-flag before side-effecting); `CONFIRM` advances only on a **code-selected, page-verified done-check** (the model never grades its own success).
+**The loop** (`kernel/graph.py`) is the heart, and it is **de-hardcoded — the LLM decides, the kernel enforces.** `GROUND` retrieves; `VERIFY` asserts only grounded facts (and confirmed absences) and adds the **membership + pairing fences** (a value is speakable only if it is byte-identical to a live grounded `Fact`, and an "X is Y" claim needs a single geometric `PairedFact` backing both halves); `PROPOSE` is the LLM **`Reasoner`** choosing the next grounded action — given the **full situational context** (a `DecideContext`: the user's *verbatim* intent, the current plan phase + its done-check, the live page, the step history, and what just happened) so the decider is the best-informed agent in the loop — over a candidate slice (optionally narrowed to a semantic top-K by the `ContextRanker` port — a smaller, faster enum, ranked by *meaning* not keywords, recall-safe + fail-open); a pure post-decode guard rejects any off-page index or invented value; the **`IRREVERSIBILITY GATE`** is dual-signal (`reversible | irreversible | UNKNOWN`) — the model's judgment AND a code structural pre-screen, where **either can escalate and the model can never downgrade**, and `UNKNOWN` routes through `CONSENT` even in Fast mode; the **`CONSENT` gate** (LangGraph `interrupt()`) blocks until the human says yes; `ACT` is idempotent (checks the consent-log once-flag before side-effecting); `CONFIRM` advances only on a **code-selected, page-verified done-check** (the model never grades its own success).
 
 ### 1.1 The de-hardcoded design (Clarion-PE/G) — SHIPPED
 
@@ -155,7 +155,7 @@ agent/clarion/contracts/   ports (incl. Reasoner · Memory) · state (Fact.id ·
             /actuator/      merged-AXTree perception (lazy-stamp) + act + diff + geometric PairedFacts
             /stages/        generic executor + checks (code done-check) + RESCUE cross-cut
             /adapters/      voice_livekit · minimax_reasoner (default) · minimax_synthesizer · gemini/openai_reasoner (alternates)
-            /retrieval/     moss_client · retriever_moss · memory_moss (user memory) · ingest_gemini (embed-vector fallback)
+            /retrieval/     moss_client · retriever_moss · memory_moss (user memory) · ingest_gemini (embed-vector fallback) · context_ranker (semantic top-K)
             /instrument/    latency meter · cold-RAG baseline · to_panel_state
             /app/           runtime · gov_proof (autonomous TAS driver) · voice_entry · extension_runtime · site_indexer · remember
 web/extension/  THE PRODUCT — Chrome MV3   ·   web/demo-site/  ·  web/panel/  ·  web/spike-target/  (Next.js aux, NOT test targets)
@@ -207,14 +207,14 @@ The hackathon thesis is "retrieval is the bottleneck." Clarion's invariant puts 
 
 ### How we're ready
 
-- **Deterministic regression gate:** `212 passed, 10 deselected`, fully offline (`.[test]` pulls no network) — including a goal-agnostic invariant spec whose guards are proven **red-before-green by mutation** (disable the structural net / the post-decode guard / the grounding check → the matching invariant test goes red), plus a no-network `FakeMemory` round-trip that asserts recall never carries a `source_node_id`.
+- **Deterministic regression gate:** `221 passed, 10 deselected`, fully offline (`.[test]` pulls no network) — including a goal-agnostic invariant spec whose guards are proven **red-before-green by mutation** (disable the structural net / the post-decode guard / the grounding check → the matching invariant test goes red), plus a no-network `FakeMemory` round-trip that asserts recall never carries a `source_node_id`.
 - **Providers live (event-day):** LiveKit · Deepgram STT (`nova-3`, EN-only) · **MiniMax-M3 brain** (M2.7 failover) · **LiveKit Inference TTS** (Cartesia Sonic-2 + Deepgram Aura-2 failover) · **Moss retrieval live**, `clarion-kb` + `clarion-site-structure` built and persistent; the user-memory indexes (`clarion-profile` / `clarion-task-paths`) ship behind `CLARION_MEMORY=1`.
 - **Judge-proof offline path:** `CLARION_DEMO_MODE=1` replays the hero run with no network, so a venue Wi-Fi failure can't kill the demo. Reliability is an engineering choice, not luck.
 - **Latency engineered, not hoped:** Moss is pre-warmed and the embed fires on partial-STT so the on-stage retrieval number is the in-memory **~3ms**, inside LiveKit's **<800ms** turn budget.
 
 ```bash
 # deterministic gate (no network)
-cd agent && pip install -e ".[test]" && python -m pytest clarion          # 212 passed, 10 deselected
+cd agent && pip install -e ".[test]" && python -m pytest clarion          # 221 passed, 10 deselected
 
 # the de-hardcoded proof, fully live on REAL gov sites (Playwright + MiniMax-M3 Reasoner)
 cd agent && pip install -e ".[spike]" && pip install -e ".[retrieval]"
