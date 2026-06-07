@@ -34,7 +34,8 @@ never the `web/demo-site` clone.
 
 | Piece | State | Evidence / location |
 |---|---|---|
-| Voice: LiveKit · Deepgram STT · **MiniMax-M3 LLM · MiniMax Speech 2.6-turbo TTS** | **REAL, wired (live-verify pending key)** | `app/voice_entry.py` — MiniMax via the LiveKit `minimax` plugin; STT stays Deepgram |
+| Voice: LiveKit · Deepgram STT · **MiniMax-M3 LLM · MiniMax Speech 2.6-turbo TTS** | **REAL, wired (live-verify pending key)** | `app/voice_entry.py` — MiniMax via the LiveKit `minimax` plugin; STT stays Deepgram. **Plugin needs `MINIMAX_GROUP_ID` + `voice_id` (not `voice`); model/voice enums differ from the raw t2a_v2 synth → reads `MINIMAX_PLUGIN_TTS_MODEL/_VOICE`** |
+| Voice-conversation observability (ASR heard · agent state · tool calls · errors · metrics) | **REAL — on the HUD panel + unified log** | `voice_entry.py` `hud()` → LiveKit room-data (`clarion-log` topic) → `offscreen.js` `DataReceived` → SW `pushHud`; also POSTs the worker log to the sink so `/tmp/clarion-ext.log` is ONE stream |
 | Perception (CDP AXTree → numbered map), lazy-stamp | **REAL, cheap** | `actuator/pipeline.py`, `actuator/*actuator.py` (perceive 0 stamp round-trips; `reperceive_node`) |
 | Actuator act (click/fill/navigate over CDP) + `filled` record | **REAL** | native-setter fills stamp `state["filled"]` by node_id |
 | Kernel loop GROUND→VERIFY→PROPOSE→⟨GATE⟩→CONSENT→ACT→CONFIRM | **REAL** | `kernel/graph.py` |
@@ -47,7 +48,7 @@ never the `web/demo-site` clone.
 | **Epistemic fences** | **✅ REAL** | `kernel/policy.py` membership (`is_speakable_value`) + pairing (`pairing_backs`); `NegativeVerifier` hedge |
 | **Irreversibility gate** | **✅ REAL — dual-signal** | `kernel/irreversibility.py` (structural pre-screen escalate-only; UNKNOWN-on-no-undo gates Fast) |
 | **Done-check** | **✅ REAL — code-selected, anchored** | `stages/checks.py` 5 generic checks + URL anchor; hardcoded registry DELETED |
-| Retrieval (Moss/Gemini embeddings, KB) | **REAL** | `clarion-kb` index, `retrieval/` |
+| Retrieval (Moss, KB) | **embedding path config-gated; built-in BLOCKED** | `retrieval/`; `MOSS_EMBED_MODEL` selects **Gemini custom** (working — custom vectors bypass the model host) or **built-in `moss-minilm`/`moss-mediumlm`** (wired but DEAD: `models.moss.link` still can't serve the model to the moss runtime — `load_index` fails on `.../config.json`, verified 2 ways 2026-06-06). **Also: this Moss project has NO `clarion-kb` — 3-index cap full of unrelated `vet_*` indexes.** To run Clarion retrieval here: free a slot + build `clarion-kb` with CUSTOM embeddings (Gemini, or a `MinimaxEmbedder`) |
 | User profile/traits store | **port exists, unused** | `Memory`/`Profile` ports (knowledge layer — next) |
 
 ---

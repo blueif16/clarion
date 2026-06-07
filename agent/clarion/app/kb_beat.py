@@ -210,7 +210,7 @@ async def ensure_kb_index(
     Live-only (touches Moss + Gemini). The runtime calls this once at LIVE startup;
     demo mode never calls it (offline).
     """
-    from clarion.retrieval import GeminiEmbedder, GeminiMossIngest, MossClient
+    from clarion.retrieval import GeminiMossIngest, MossClient
 
     index = index or os.environ.get("MOSS_INDEX", "clarion-kb")
     fixture_path = fixture_path or os.path.join(
@@ -221,10 +221,11 @@ async def ensure_kb_index(
     existing = {getattr(i, "name", None) for i in await moss.list_indexes()}
     if index in existing:
         return index, False
-    # Build once (reused by every subsequent run).
+    # Build once (reused by every subsequent run). The ingest resolves its embedding
+    # path from MOSS_EMBED_MODEL (built-in Moss model, else Gemini custom vectors).
     with open(fixture_path) as f:
         doc = f.read()
-    ingest = GeminiMossIngest(moss=moss, embedder=GeminiEmbedder(), index=index)
+    ingest = GeminiMossIngest(moss=moss, index=index)
     await ingest.ingest(doc)
     return index, True
 

@@ -23,6 +23,7 @@ from clarion.retrieval.moss_client import (
     MossDoc,
     MossHit,
     MossSearch,
+    builtin_embed_model,
 )
 from clarion.retrieval.retriever_moss import MossRetriever
 
@@ -35,4 +36,5 @@ __all__ = [
     "GeminiMossIngest",
     "GeminiEmbedder",
     "MossMemory",
+    "builtin_embed_model",
 ]

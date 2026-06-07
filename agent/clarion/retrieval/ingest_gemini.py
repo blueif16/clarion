@@ -6,10 +6,11 @@ Pipeline for ``ingest(doc)``:
      never need a separate parser SDK. (Unsiloed is the eventual parser per
      foundation §6; Gemini stands in here, behind the same ``Ingest`` ABC.)
   2. **chunk** the text into citable passages.
-  3. **embed** each chunk with Gemini (``gemini-embedding-001``) — REQUIRED here
-     because the Moss default ``moss-minilm`` model host is TLS-broken, so we run
-     a custom-embedding index (see ``moss_client`` module docstring).
-  4. **upsert** the chunks (+ vectors) into a Moss index and wait for the build.
+  3. **embed** — two paths (``MOSS_EMBED_MODEL`` via ``builtin_embed_model``):
+     built-in (``moss-minilm``/``moss-mediumlm``) skips this step and lets the Moss
+     runtime embed locally; else Gemini (``gemini-embedding-001``) custom vectors.
+  4. **upsert** the chunks (+ vectors, when custom) into a Moss index, built with
+     ``model_id=<built-in id>`` or ``"custom"``, and wait for the build.
   5. return ``list[Passage]`` — each ``ref`` is the Moss doc id, which becomes a
      spoken fact's ``source_node_id`` downstream (grounding invariant).
 
@@ -29,7 +30,7 @@ from typing import Optional, Sequence
 from clarion.contracts.ports import Ingest
 from clarion.contracts.state import Passage
 
-from clarion.retrieval.moss_client import MossClient, MossDoc
+from clarion.retrieval.moss_client import MossClient, MossDoc, builtin_embed_model
 
 # Current Gemini embedding model (text-embedding-004 is retired / 404s — verified
 # live 2026-05-31). Output dimensionality is pinned so ingest + query vectors
@@ -120,7 +121,11 @@ class GeminiMossIngest(Ingest):
         index: str = _DEFAULT_INDEX,
     ) -> None:
         self._moss = moss or MossClient()
-        self._embedder = embedder or GeminiEmbedder()
+        # Built-in Moss model → no external embedder (the runtime embeds locally);
+        # else the Gemini custom-embedding path. An explicitly injected embedder
+        # wins (tests / callers that force the custom path).
+        self._builtin = builtin_embed_model()
+        self._embedder = embedder or (None if self._builtin else GeminiEmbedder())
         self._index = index
 
     @property
@@ -129,7 +134,7 @@ class GeminiMossIngest(Ingest):
 
     @property
     def embed_dim(self) -> int:
-        return self._embedder.dim
+        return self._embedder.dim if self._embedder is not None else 0
 
     async def _parse(self, doc: bytes | str) -> str:
         """Raw doc → plain text. Text/markdown bytes decode directly; a PDF (or
@@ -171,7 +176,11 @@ class GeminiMossIngest(Ingest):
         if not chunks:
             return []
 
-        vectors = await self._embedder.embed(chunks)
+        # Built-in path: no vectors (Moss embeds at build time). Custom path: Gemini.
+        if self._embedder is None:
+            vectors: list = [None] * len(chunks)
+        else:
+            vectors = await self._embedder.embed(chunks)
 
         # Stable, content-derived ids so re-ingesting the same doc upserts in place.
         moss_docs: list[MossDoc] = []
@@ -195,7 +204,10 @@ class GeminiMossIngest(Ingest):
         if self._index in existing:
             res = await self._moss.add_docs(self._index, docs)
         else:
-            res = await self._moss.create_index(self._index, docs, model_id="custom")
+            # Built-in model id (moss-minilm/mediumlm) or the custom-vector index.
+            res = await self._moss.create_index(
+                self._index, docs, model_id=self._builtin or "custom"
+            )
         job_id = getattr(res, "job_id", None)
         if job_id:
             await self._moss.wait_for_job(job_id)

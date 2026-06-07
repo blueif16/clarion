@@ -24,7 +24,7 @@ from clarion.contracts.ports import Memory
 from clarion.contracts.state import Fact, Profile
 
 from clarion.retrieval.ingest_gemini import GeminiEmbedder
-from clarion.retrieval.moss_client import MossClient, MossDoc
+from clarion.retrieval.moss_client import MossClient, MossDoc, builtin_embed_model
 
 _MEM_PREFIX = os.environ.get("MOSS_MEMORY_PREFIX", "clarion-mem")
 
@@ -53,13 +53,15 @@ class MossMemory(Memory):
         user_id: str = "default",
     ) -> None:
         self._moss = moss or MossClient()
-        self._embedder = embedder or GeminiEmbedder()
+        # Built-in Moss model → no external embedder; else Gemini custom vectors.
+        self._builtin = builtin_embed_model()
+        self._embedder = embedder or (None if self._builtin else GeminiEmbedder())
         self._user_id = user_id
 
     async def write(self, fact: Fact) -> None:
         """Durably upsert ``fact`` into the user's Moss memory index."""
         index = _index_for(self._user_id)
-        vec = (await self._embedder.embed([fact.value]))[0]
+        vec = None if self._embedder is None else (await self._embedder.embed([fact.value]))[0]
         doc_id = (
             f"{index}::"
             + hashlib.sha1(fact.value.encode("utf-8")).hexdigest()[:12]
@@ -76,7 +78,9 @@ class MossMemory(Memory):
         if index in existing:
             res = await self._moss.add_docs(index, [doc])
         else:
-            res = await self._moss.create_index(index, [doc], model_id="custom")
+            res = await self._moss.create_index(
+                index, [doc], model_id=self._builtin or "custom"
+            )
         job_id = getattr(res, "job_id", None)
         if job_id:
             await self._moss.wait_for_job(job_id)
