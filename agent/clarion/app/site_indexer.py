@@ -59,6 +59,12 @@ _DENY = (
     "delete", "/remove", "/destroy", "cancel", "unsubscribe", "/api/",
 )
 
+# Milliseconds to let a page settle (JS/SPA render) before reading its a11y tree.
+# Default 0 → no behavior change for the no-network test gate / Fake transport; the
+# pre-warm sets it (e.g. CLARION_CRAWL_SETTLE_MS=1200) so client-rendered gov pages
+# expose their controls instead of indexing as contentless.
+_SETTLE_MS = int(os.environ.get("CLARION_CRAWL_SETTLE_MS", "0"))
+
 
 def _same_origin(url: str, origin: str) -> bool:
     p = urlparse(url)
@@ -169,17 +175,34 @@ async def crawl_and_index(
                 if not first:
                     await actuator.act(Action(kind="navigate", value=url))
                 first = False
+                # Let a JS/SPA page settle before we read its a11y tree — many gov
+                # pages render their controls client-side after `load`, so reading too
+                # early yields a contentless page (which we then skip below, losing
+                # coverage). Off by default (CLARION_CRAWL_SETTLE_MS=0 → tests/Fake
+                # transport unaffected); the pre-warm sets it (e.g. 1200).
+                if _SETTLE_MS:
+                    await asyncio.sleep(_SETTLE_MS / 1000)
                 readout = await actuator.describe_page()
             except Exception as exc:  # noqa: BLE001 - a bad page never kills the crawl
                 log(f"  [skip] {url} — {exc}")
                 result.skipped.append(url)
                 continue
 
-            blocks.append(page_block(readout))
-            result.pages.append(url)
-            fingerprints.append(page_fingerprint(readout))
-            log(f"  [page {len(result.pages)}/{max_pages}] {url} "
-                f"({len(readout.headings)} headings, {len(readout.affordances)} actions)")
+            # INDEX ONLY PAGES WITH CONTENT. A page with no headings AND no affordances
+            # is a contentless chunk ("I can't find any labeled headings or controls")
+            # — an unrendered/JS page or a pure-text notice. Indexing it pollutes
+            # retrieval (it even OUTRANKS real pages on a loose query — e.g. `about-us/
+            # privacy-and-security` beating the SSA page for "pay social security"), so
+            # SKIP indexing it. We STILL follow its links below (it may be a hub).
+            if readout.headings or readout.affordances:
+                blocks.append(page_block(readout))
+                result.pages.append(url)
+                fingerprints.append(page_fingerprint(readout))
+                log(f"  [page {len(result.pages)}/{max_pages}] {url} "
+                    f"({len(readout.headings)} headings, {len(readout.affordances)} actions)")
+            else:
+                log(f"  [skip-empty] {url} — no headings/affordances to index")
+                result.skipped.append(url)
 
             if depth < max_depth:
                 for link in await actuator.collect_links():
