@@ -257,13 +257,27 @@ async function connect(cfg) {
       // route it to the on-page toast feed + the panel's Activity section instead
       // of the diagnostic event log, so the action trace stays distinct.
       if (entry && entry.activity) {
+        // DEBUG (removable): PROVE the activity frame reached the offscreen doc,
+        // sinking to ext.log via fromWorker=false (independent of the SW forwarding
+        // it on). If this line is in ext.log but `[activity] pushActivity` is not,
+        // the SW routing is the break; if it's absent while worker.log shows
+        // `[activity] published`, LiveKit isn't delivering the data here.
+        const a = entry.activity;
+        swLog(
+          "[rx] activity frame",
+          `${a.kind} ${a.target} status=${a.status} irr=${a.irreversibility}`,
+          "info",
+          false
+        );
         swActivity(entry.activity);
       } else if (entry && entry.phase) {
         // fromWorker=true: HUD-render only, no sink re-POST (already in ext.log).
         swLog(entry.phase, entry.detail || "", entry.level || "info", true);
       }
-    } catch {
-      /* not a clarion-log frame — ignore */
+    } catch (e) {
+      // DEBUG (removable): a decode/parse failure was silently swallowed. Surface it
+      // (fromWorker=false → sinks to ext.log) so a malformed frame is visible.
+      swLog("[rx] clarion-log parse failed", (e && e.message) || String(e), "warn", false);
     }
   });
 
