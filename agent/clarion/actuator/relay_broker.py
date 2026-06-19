@@ -47,6 +47,7 @@ from clarion.actuator.relay import (
     DEFAULT_AGENT_PORT,
     DEFAULT_BROKER_HOST,
     DEFAULT_EXT_PORT,
+    RELAY_MAX_MESSAGE_BYTES,
 )
 
 
@@ -99,9 +100,18 @@ class RelayBroker:
         caller can prove the port is open before anything else runs."""
         from websockets.asyncio.server import serve
 
-        self._ext_server = await serve(self._handle_ext, self._host, self._ext_port)
+        # max_size=None on BOTH servers: the extension forwards a large getFullAXTree
+        # reply on 8771, which the 1 MiB default would reject (close 1009) → the
+        # broker logged "extension-gone" mid-perceive and the agent's CDP call hung
+        # to its 30s timeout. See RELAY_MAX_MESSAGE_BYTES.
+        self._ext_server = await serve(
+            self._handle_ext, self._host, self._ext_port, max_size=RELAY_MAX_MESSAGE_BYTES
+        )
         self._agent_server = await serve(
-            self._handle_agent, self._host, self._agent_port
+            self._handle_agent,
+            self._host,
+            self._agent_port,
+            max_size=RELAY_MAX_MESSAGE_BYTES,
         )
         _log(
             f"listening — extension ws://{self._host}:{self._ext_port} "

@@ -50,6 +50,18 @@ DEFAULT_BROKER_HOST = "127.0.0.1"
 DEFAULT_EXT_PORT = 8771
 DEFAULT_AGENT_PORT = 8773
 
+# The ``websockets`` library caps incoming messages at ``max_size`` — DEFAULT 1 MiB
+# (2**20) — and CLOSES the socket (close code 1009, MESSAGE_TOO_BIG) on any larger
+# frame. A single ``Accessibility.getFullAXTree`` / ``DOMSnapshot.captureSnapshot``
+# reply for a heavy page (e.g. recreation.gov) exceeds 1 MiB, so the default
+# SILENTLY dropped the relay mid-perceive (surfacing as ``session.end
+# extension-gone`` at the broker) and the agent's in-flight CDP call then hung to
+# the 30s ``SEND_TIMEOUT``. The relay is loopback-only and 1:1 with one trusted
+# tab, so we lift the cap (``None`` = no limit) on EVERY read endpoint — both broker
+# servers, this server, and the broker client — so a real perceive is never
+# truncated. (Lighter sites fit under 1 MiB, which is why it "worked before".)
+RELAY_MAX_MESSAGE_BYTES: "int | None" = None
+
 
 class CdpError(RuntimeError):
     """A ``cdp.error`` reply from the relay (the remote CDP call failed)."""
@@ -264,7 +276,11 @@ class WebSocketCdpRelay(_CorrelatedCdpRelay):
         # deterministic test gate gains a hard dependency on the ws library.
         from websockets.asyncio.server import serve
 
-        self._server = await serve(self._handle_conn, self._host, self._port)
+        # max_size=None: a large getFullAXTree reply must not trip the 1 MiB cap and
+        # drop the extension socket mid-perceive (see RELAY_MAX_MESSAGE_BYTES).
+        self._server = await serve(
+            self._handle_conn, self._host, self._port, max_size=RELAY_MAX_MESSAGE_BYTES
+        )
         return self
 
     @property
@@ -334,7 +350,10 @@ class BrokerCdpRelay(_CorrelatedCdpRelay):
         from websockets.asyncio.client import connect as ws_connect
 
         async def _dial() -> Any:
-            return await ws_connect(self.uri)
+            # max_size=None: the broker forwards the big getFullAXTree reply onto this
+            # client socket, so it must accept frames over 1 MiB too — else the cap
+            # just moves the drop downstream from the broker to here.
+            return await ws_connect(self.uri, max_size=RELAY_MAX_MESSAGE_BYTES)
 
         self._conn = await asyncio.wait_for(_dial(), timeout=timeout)
         self._connected.set()
@@ -378,4 +397,5 @@ __all__ = [
     "DEFAULT_BROKER_HOST",
     "DEFAULT_EXT_PORT",
     "DEFAULT_AGENT_PORT",
+    "RELAY_MAX_MESSAGE_BYTES",
 ]
