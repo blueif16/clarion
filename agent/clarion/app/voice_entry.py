@@ -75,8 +75,11 @@ async def _publish_hud(room, entry: dict) -> None:
         await room.local_participant.publish_data(
             json.dumps(entry), reliable=True, topic="clarion-log"
         )
-    except Exception:  # noqa: BLE001 - HUD mirroring must never break a turn
-        pass
+    except Exception as exc:  # noqa: BLE001 - HUD mirroring must never break a turn
+        # DEBUG (removable): a publish failure was silently swallowed, which made a
+        # missing toast undebuggable from the worker log. Surface it to worker.log
+        # (still never raises into a turn). Remove with the offscreen [rx] breadcrumb.
+        print(f"  [hud] publish_data FAILED topic=clarion-log: {exc!r}", flush=True)
 
 # LiveKit plugins register their Plugin singletons at import on the MAIN thread
 # (the worker forks jobs onto other threads and rejects off-main-thread
@@ -242,6 +245,52 @@ class StageGraphRunner:
         except Exception:  # noqa: BLE001 - never crash the turn on a read
             return None
         return readout.summary or None
+
+    async def undo_last(self) -> str:
+        """Reverse the most recent step on an explicit "go back" / "undo that" —
+        HONEST by construction. We undo ONLY a reversible navigation, by re-navigating
+        to the recorded prior URL (we already hold ``url_before``/``url_after`` on the
+        EXECUTOR trace; navigate-to-URL is the robust SPA-safe inverse). The reversal
+        is a REAL actuator navigate + re-perceive — never a faked "undone". It refuses
+        plainly when the last step is irreversible (you can't un-submit), and says so
+        when there's simply nothing to undo. The user's spoken "go back" IS the
+        consent for this reversible move (so no second yes); never call this to take
+        back an irreversible commit."""
+        if not self.ready:
+            return "I'm still connecting to your tab — give me a moment, then ask again."
+        # The last decided action + its GROUNDED reversibility verdict (kernel-
+        # computed, read off the recorded trace — never a guess).
+        items = self.activity_items()
+        last = items[-1] if items else None
+        committed = last is not None and last.status in ("done", "approved")
+        # Refuse ONLY a KNOWN irreversible commit — you can't un-submit a payment. An
+        # ``unknown`` step that merely navigated is still revertible (we re-navigate to
+        # url_before); we just hedge that we can't be sure nothing else changed. The
+        # tool also requires a real URL change below, so it never claims a phantom undo.
+        if committed and last.irreversibility == "irreversible":
+            return "I can't undo that one — that step can't be taken back."
+        nav = self._last_navigation()
+        if not nav or nav[0] == nav[1]:
+            return "There's nothing to undo — the last thing I did didn't move the page."
+        url_before, _url_after = nav
+        from clarion.contracts.state import Action
+
+        try:
+            await self._runtime.actuator.act(Action(kind="navigate", value=url_before))
+            readout = await self.describe_page()
+        except Exception as exc:  # noqa: BLE001 - never crash the turn on the reversal
+            return f"I couldn't take us back just now ({exc}). Want me to try again?"
+        # A fresh goal re-perceives, so the stale graph page_index self-heals; surface
+        # the restored page so the user immediately hears where they are again.
+        summary = (readout.summary or "").strip()
+        # Honest hedge when the reverted step was only ``unknown`` (we restored the
+        # page but can't be sure nothing else changed); a clean line for a reversible.
+        if committed and last.irreversibility == "unknown":
+            return (
+                "I took you back to the previous page. If that step changed anything "
+                f"beyond the page, I can't be sure that part is undone. {summary}"
+            ).strip()
+        return f"Done — I took you back. {summary}".strip()
 
     @property
     def _cfg(self) -> dict:
@@ -507,6 +556,15 @@ def build_voice_tools(runner: StageGraphRunner):
         return readout.summary
 
     @function_tool()
+    async def undo_last(context: RunContext) -> str:
+        """Take back / reverse the last step when the user says "go back", "undo
+        that", or "take it back". Only call this when they ask to reverse what was
+        just done. Speak the returned line VERBATIM. It reverses ONLY a reversible
+        navigation and refuses honestly when the last step can't be undone — never
+        claim to undo something irreversible like a submitted payment."""
+        return await runner.undo_last()
+
+    @function_tool()
     async def read_history(context: RunContext, n: int = 3) -> str:
         """Read back the last `n` steps we've actually taken — what was read,
         filled, selected, or is awaiting the user's yes. Call this when the user
@@ -605,12 +663,22 @@ def build_voice_tools(runner: StageGraphRunner):
             f"{runner.turn_summary()}",
             flush=True,
         )
+        # HONEST END (the same check advance_task makes at its END): a bounded
+        # give-up is NOT a success — never speak "Done." over a run that tried and
+        # could not finish. (Live 06-11 run: the kernel gave up on the search
+        # subgoal, this returned "Done.", and the voice plane then fabricated
+        # "Search submitted" on top of it.)
+        if runner.gave_up:
+            return (
+                f"I wasn't able to finish '{runner.goal}' on this page — I didn't "
+                f"find what I needed. Want me to read back what's here instead?"
+            )
         readout = await runner.navigated_readout()
         if readout is not None:
             return readout
         return "Done."
 
-    return [read_screen, read_history, advance_task, confirm_consent]
+    return [read_screen, read_history, undo_last, advance_task, confirm_consent]
 
 
 # ---------------------------------------------------------------------------
@@ -618,28 +686,42 @@ def build_voice_tools(runner: StageGraphRunner):
 # ---------------------------------------------------------------------------
 
 _INSTRUCTIONS = (
-    "You are Clarion, a voice web co-pilot for someone who cannot see the screen. "
-    "You keep them in command and never act without their explicit yes. You NEVER "
-    "assume what they want: you ORIENT first, then ACT on what they actually asked.\n\n"
-    "ORIENT — When they ask what's on the page or what they can do here, or whenever "
-    "you need to know the page before acting, call read_screen and speak its summary. "
-    "Say only what it returns; if it says something isn't there, say so — never guess.\n\n"
-    "SET THE GOAL — From what they say plus what's actually on the page, put their goal "
-    "into one short sentence, then go STRAIGHT to advance_task. Do NOT ask them to "
-    "confirm the goal and do NOT add your own yes/no question first — the ONE "
-    "confirmation is the readback advance_task returns, which names the exact control. "
-    "The goal comes from them, never from you.\n\n"
-    "ACT — As soon as you have their goal, call advance_task with that goal as "
-    "user_intent. "
-    "Speak the readback it returns VERBATIM, then wait for yes or no. When they answer, "
-    "call confirm_consent with approved=true for yes or approved=false for no. NEVER "
-    "take an irreversible step (like a payment) without an explicit yes.\n\n"
-    "Read grounded facts (amount, payee, due date, fees) and cite what you read. "
-    "Be concise; no emojis or markdown.\n\n"
-    "HISTORY — When they ask what you've done, the last few steps, or where they "
-    "are in the task, call read_history and speak its summary VERBATIM. It is built "
-    "from the real recorded steps, so it's the truth of what happened — never "
-    "recount steps from your own memory."
+    "You are Clarion, the eyes and hands on the web for a person who is BLIND or "
+    "low-vision and cannot see the screen at all. They are an expert who drives "
+    "screen readers every day — speak to them as a capable adult in command, in "
+    "short declarative sentences, never with deference, apology, or hand-holding. "
+    "The website may be broken; they are not. Your job is to get them where they "
+    "want to go and their task done — fast, plain, eyes-free.\n\n"
+    "BE TASK-DRIVEN, NOT A TOUR GUIDE. Lead with what serves what they asked. When "
+    "they tell you where to go or what to do ('pay my Social Security', 'make a loan "
+    "payment'), GET THEM THERE: orient if you need to, then navigate or act. If their "
+    "target isn't on this page, find the route to it — open the right section, search, "
+    "or browse — instead of reading back whatever happens to be here. Never recite the "
+    "whole page; surface the few things relevant to their goal, then move.\n\n"
+    "ORIENT — When you need to know the page (or they ask what's here), call "
+    "read_screen. Speak only what's relevant to their goal, a sentence or two; if they "
+    "want the full list, they'll ask. If it says something isn't there, say so plainly "
+    "— never guess.\n\n"
+    "SET THE GOAL — Put their goal in one short sentence from what they said plus "
+    "what's on the page, then go STRAIGHT to advance_task with it as user_intent. Don't "
+    "ask them to confirm the goal first — the goal is theirs.\n\n"
+    "ACT — Call advance_task and speak the readback it returns VERBATIM. That readback "
+    "is the single confirmation. If it asks for their yes — a CONSEQUENTIAL, "
+    "irreversible step like submitting a payment, sending money, or confirming an order "
+    "— wait for yes or no, then call confirm_consent (approved=true for yes, false for "
+    "no). If it just reports a reversible move (a page opened, a section reached, "
+    "something read), keep going toward their goal. Do NOT add your own yes/no question "
+    "or an 'I can't undo this' warning on top of ordinary navigation or reading, and do "
+    "NOT stack repeated warnings. One clear yes, only at the moment that truly matters. "
+    "NEVER take an irreversible step without an explicit yes.\n\n"
+    "Read grounded facts (amount, payee, due date, fees) and cite where you read them; "
+    "say plainly when something isn't there. Be concise; no emojis or markdown.\n\n"
+    "HISTORY — When they ask what you've done or where they are, call read_history and "
+    "speak its summary VERBATIM — the real recorded steps, never your own memory.\n\n"
+    "GO BACK — When they say 'go back', 'undo that', or 'take it back', call undo_last "
+    "and speak its result VERBATIM. It reverses only a reversible move and tells them "
+    "plainly when a step can't be taken back — never promise to undo something "
+    "irreversible."
 )
 
 
@@ -723,6 +805,13 @@ async def entrypoint(ctx) -> None:
             "level": level,
             "activity": item.model_dump(),
         }
+        # PROVE emission on the worker side (the publish path is otherwise silent —
+        # it never printed, so a missing toast was undebuggable from the worker log).
+        print(
+            f"  [activity] published {item.kind} {item.target!r} "
+            f"status={status} irr={item.irreversibility}",
+            flush=True,
+        )
         _spawn(_publish_hud(ctx.room, frame))
 
     runner._activity_sink = _emit_activity_frame
@@ -737,32 +826,17 @@ async def entrypoint(ctx) -> None:
     _synth = MinimaxSynthesizer()  # noqa: F841 - lazy httpx client
 
     vad = ctx.proc.userdata.get("vad") if hasattr(ctx, "proc") else None
+    # Flux owns turn detection ("stt"); nova-3 fallback returns the EOU detector.
+    _stt, _turn_detection = _build_stt()
     session = AgentSession(
-        stt=_deepgram.STT(
-            model=os.environ.get("STT_MODEL", "nova-3"),
-            # Single-stream Deepgram can't code-switch EN+Chinese: `multi` excludes
-            # Chinese, Chinese needs a dedicated `zh-*` model. So language is a knob —
-            # default en-US (the demo language); set STT_LANGUAGE=zh-CN to capture
-            # Mandarin (English then degrades), or =multi for EN+EU/JA code-switching.
-            language=os.environ.get("STT_LANGUAGE", "en-US"),
-            # smart_format = punctuation + dates/numbers/currency formatting (the
-            # gov-form domain: amounts, SSNs, dates) — cleaner text for the LLM.
-            smart_format=True,
-            # endpointing = ms of trailing silence before a segment is finalized. The
-            # plugin default (25ms) finalizes on micro-pauses, so halting speech split
-            # mid-word ("the s" / "r model") into many tiny finals. Raising it keeps a
-            # brief mid-sentence pause from cutting the utterance; the EOU turn detector
-            # still decides the real end of turn. Tune via STT_ENDPOINTING_MS.
-            endpointing_ms=int(os.environ.get("STT_ENDPOINTING_MS", "300")),
-            api_key=os.environ["DEEPGRAM_API_KEY"],
-        ),
+        stt=_stt,
         # MiniMax-M3 via the MiniMax Anthropic gateway (LiveKit `anthropic` plugin).
         llm=_build_llm(),
         # Voice = LiveKit Inference (native; no per-provider key) — Cartesia Sonic-2
         # default + Deepgram Aura-2 failover. Override with CLARION_TTS_MODEL/_VOICE.
         tts=_build_audio_tts(),
         vad=vad or _silero.VAD.load(),
-        turn_detection=_MultilingualModel() if _MultilingualModel else None,
+        turn_detection=_turn_detection,
     )
     agent = Agent(instructions=_INSTRUCTIONS, tools=tools)
     # Surface the live voice so "is the agent speaking?" is answerable from the log
@@ -772,6 +846,15 @@ async def entrypoint(ctx) -> None:
         "[tts] voice",
         f"LiveKit Inference · {os.environ.get('CLARION_TTS_MODEL', 'cartesia/sonic-2')}"
         + (f" → {_tts_fb}" if _tts_fb.lower() != "off" else ""),
+        "ok",
+    )
+    # Surface which ASR is up + whether it's driving turn detection (Flux) — so a
+    # "bad transcript" can be triaged to model vs. turn-segmentation from the HUD.
+    _stt_model = os.environ.get("STT_MODEL", "flux-general-en")
+    hud(
+        "[asr] model",
+        f"Deepgram {_stt_model}"
+        + (" · native turn-detect" if _stt_model.startswith("flux") else ""),
         "ok",
     )
 
@@ -864,13 +947,25 @@ async def entrypoint(ctx) -> None:
 
     # Attach the tab surface in the BACKGROUND; bind the runner when it's live.
     demo_url = os.environ.get("DEMO_SITE_URL", "http://localhost:8770/")
+    # Consent mode (kernel ``consent_gate``): "fast" auto-proceeds ONLY a step the
+    # IrreversibilityGate classified REVERSIBLE (and only under ``fast_act_cap``
+    # silent acts — then it forces a spoken beat); ``unknown``/``irreversible``
+    # ALWAYS gate, so the hard-stop invariant is untouched. "normal" gates every
+    # consequential step — the live 06-11 run burned three "say yes" round-trips
+    # before the task even ran (a search-box fill spoken as "treat as final").
+    # Default fast = the demo pacing; CLARION_CONSENT_MODE=normal to restore.
+    consent_mode = (
+        "normal"
+        if os.environ.get("CLARION_CONSENT_MODE", "fast").strip().lower() == "normal"
+        else "fast"
+    )
 
     async def attach_tab() -> None:
         try:
             if extension_actuator_selected():
                 from clarion.app.extension_runtime import ExtensionRuntime
 
-                ext = ExtensionRuntime(demo_url=demo_url, mode="normal", room=ctx.room)
+                ext = ExtensionRuntime(demo_url=demo_url, mode=consent_mode, room=ctx.room)
                 # The tab bridge is the ALWAYS-ON broker (started by clarion-up),
                 # NOT a port we bind here — that's what decouples it from voice.
                 # We dial the broker as a client and wait for the tab to attach.
@@ -881,7 +976,7 @@ async def entrypoint(ctx) -> None:
                 runtime = await ext.build_runtime()
             else:
                 runtime = await HeroRuntime.create(
-                    demo_url, mode="normal", room=ctx.room, headless=True
+                    demo_url, mode=consent_mode, room=ctx.room, headless=True
                 )
             runner.bind(runtime)
             loop("stage-graph runner READY — tab actions enabled")
@@ -926,6 +1021,72 @@ async def entrypoint(ctx) -> None:
         loop("[SIM] scripted utterances complete")
 
     _spawn(greet_then_sim())
+
+
+def _build_stt():
+    """STT + its turn-detection strategy, as a `(stt, turn_detection)` pair.
+
+    Default = Deepgram **Flux** (`STTv2`, the `wss://api.deepgram.com/v2/listen`
+    socket) — Deepgram's real-time-AGENT ASR (their nova-3 is positioned for
+    meetings/captioning, not interactive turns). Flux has a model-native phrase-
+    endpointing model that calls end-of-turn from acoustic + semantic cues, so it
+    OWNS turn detection (`turn_detection="stt"`) and REPLACES both the separate
+    `MultilingualModel` EOU detector and the nova-3 `endpointing_ms` pause-tuning
+    hack (the source of mid-word finals). VAD still runs for barge-in/interruption.
+    EN-only by design → `flux-general-en` (`flux-general-multi` takes a
+    `language_hint`; Flux has no `smart_format`).
+
+    Set `STT_MODEL=nova-3` (or any non-`flux*` model) to fall back to the prior
+    path: `STT` + `smart_format` + `STT_ENDPOINTING_MS` + the EOU turn detector.
+
+    Env: STT_MODEL (default `flux-general-en`) · STT_EAGER_EOT (0.3–0.9 enables
+    preemptive generation; unset = off) · STT_LANGUAGE / STT_ENDPOINTING_MS
+    (nova-path only) · CLARION_STT_KEYTERMS (comma-separated terms to BOOST —
+    proper nouns the demo task hinges on, e.g. "Point Reyes"; supported by BOTH
+    Flux and nova-3 as Deepgram keyterm prompting).
+    """
+    model = os.environ.get("STT_MODEL", "flux-general-en")
+    # Keyterm prompting: the user can't be expected to be heard perfectly — the
+    # live 06-11 run transcribed "Point Reyes" as "Ponteries" and the whole task
+    # plane chased the garbage string. Boosting the demo task's proper nouns is a
+    # recognition-accuracy config (per-deploy, set in clarion-up.sh / .env), NOT a
+    # semantic keyword list: nothing here classifies, ranks, or routes meaning.
+    keyterm = [
+        t.strip()
+        for t in os.environ.get("CLARION_STT_KEYTERMS", "").split(",")
+        if t.strip()
+    ]
+    if model.startswith("flux"):
+        kw = {}
+        eager = os.environ.get("STT_EAGER_EOT", "").strip()
+        if eager:  # opt-in preemptive generation (speculative LLM before EOT)
+            kw["eager_eot_threshold"] = float(eager)
+        if keyterm:
+            kw["keyterm"] = keyterm
+        stt = _deepgram.STTv2(model=model, api_key=os.environ["DEEPGRAM_API_KEY"], **kw)
+        return stt, "stt"
+
+    stt = _deepgram.STT(
+        model=model,
+        # keyterm boosting (nova-3 only — the plugin validates); [] = NOT_GIVEN-ish
+        # is not accepted on this ctor, so pass only when set.
+        **({"keyterm": keyterm} if keyterm else {}),
+        # Single-stream Deepgram can't code-switch EN+Chinese: `multi` excludes
+        # Chinese, Chinese needs a dedicated `zh-*` model. Default en-US (the demo
+        # language); set STT_LANGUAGE=zh-CN for Mandarin, =multi for EN+EU/JA.
+        language=os.environ.get("STT_LANGUAGE", "en-US"),
+        # smart_format = punctuation + dates/numbers/currency formatting (the
+        # gov-form domain: amounts, SSNs, dates) — cleaner text for the LLM.
+        smart_format=True,
+        # endpointing = ms of trailing silence before a segment is finalized. The
+        # plugin default (25ms) finalizes on micro-pauses, so halting speech split
+        # mid-word ("the s" / "r model") into many tiny finals. Raising it keeps a
+        # brief mid-sentence pause from cutting the utterance; the EOU turn detector
+        # still decides the real end of turn. Tune via STT_ENDPOINTING_MS.
+        endpointing_ms=int(os.environ.get("STT_ENDPOINTING_MS", "300")),
+        api_key=os.environ["DEEPGRAM_API_KEY"],
+    )
+    return stt, (_MultilingualModel() if _MultilingualModel else None)
 
 
 def _build_llm():
