@@ -51,6 +51,7 @@ from clarion.adapters.gemini_reasoner import (
     _plan_prompt,
     _plan_schema,
     _step_schema,
+    _subgoal_text,
 )
 from clarion.contracts.ports import Reasoner
 from clarion.contracts.state import (
@@ -323,14 +324,33 @@ class OpenAIReasoner(Reasoner):
             data = []
         subgoals: list[Subgoal] = []
         for item in data:
+            # The model sometimes returns the plan as bare description STRINGS
+            # (["search for X", "open the result", …]) instead of objects — accept
+            # them rather than drop the whole multi-step plan to the one-subgoal
+            # echo fallback (which silently erased the search-fallback plan). The
+            # generic done-check still runs; an absent done_check just means the
+            # executor uses its structural delta. Verified live (MiniMax-M3 emits
+            # this shape for recreation.gov planning).
+            if isinstance(item, str):
+                desc = item.strip()
+                if desc:
+                    subgoals.append(Subgoal(description=desc, done_check=""))
+                continue
             if not isinstance(item, dict):
                 continue
             done = item.get("done_check", "")
             if done not in SUCCESS_CHECKS:
                 done = ""
-            subgoals.append(
-                Subgoal(description=str(item.get("description", "")), done_check=done)
-            )
+            # The description key VARIES by model: MiniMax-M3 emits "subgoal" where
+            # the schema asked for "description" (it doesn't honor the strict schema).
+            # Accept either (plus a few synonyms). This is an alternate JSON KEY for
+            # the SAME field, NOT a semantic keyword heuristic — without it a real
+            # multi-step plan parsed to EMPTY strings (plan=['','','','']), leaving
+            # the decider planless → it free-formed on the homepage carousel (which
+            # rotated to the wrong destination) and NEVER navigated. Live 2026-06-07.
+            desc = _subgoal_text(item)
+            if desc:
+                subgoals.append(Subgoal(description=desc, done_check=done))
         return subgoals
 
     async def decide_step(

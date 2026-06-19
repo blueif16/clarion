@@ -272,3 +272,31 @@ async def test_plan_goal_decodes_and_clamps_done_check() -> None:
     # An invalid done_check is clamped to "" (never a fabricated check name).
     assert plan[1].done_check == ""
     assert r.plan_calls == ["pay my bill"]
+
+
+@pytest.mark.asyncio
+async def test_plan_goal_accepts_subgoal_key_not_just_description() -> None:
+    """REGRESSION (live 2026-06-07): MiniMax-M3 emits the plan with the key
+    ``"subgoal"`` instead of the schema's ``"description"``. The parser read only
+    ``"description"`` → every subgoal came back EMPTY (``plan=['','','','']``),
+    leaving the decider planless so it free-formed on the homepage carousel and
+    never navigated. The description key must be tolerant; an item with no usable
+    text under ANY known key is dropped, not appended empty."""
+    async def fake_gen(system, prompt, schema):  # noqa: ARG001
+        return [
+            {"subgoal": "type Point Reyes in the search field and submit",
+             "done_check": "navigated"},
+            {"subgoal": "open the Point Reyes campground result", "done_check": "navigated"},
+            {"done_check": "navigated"},  # no description under any key → dropped
+        ]
+
+    r = GeminiReasoner(api_key="k")
+    r._generate_json = fake_gen  # type: ignore[method-assign]
+    orient = PageReadout(title="Rec", url="https://recreation.gov", summary="home")
+    plan = await r.plan_goal("reserve Point Reyes", orient, [])
+
+    assert [s.description for s in plan] == [
+        "type Point Reyes in the search field and submit",
+        "open the Point Reyes campground result",
+    ]
+    assert all(s.done_check == "navigated" for s in plan)

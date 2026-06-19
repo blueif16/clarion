@@ -74,6 +74,32 @@ SUCCESS_CHECKS: tuple[str, ...] = (
 _ACTION_KINDS: tuple[str, ...] = ("click", "fill", "navigate", "read")
 _IRREVERSIBILITY: tuple[str, ...] = ("reversible", "irreversible", "unknown")
 
+# A plan subgoal's description arrives under different JSON KEYS depending on the
+# model: the schema asks for "description", but MiniMax-M3 (which doesn't honor the
+# strict schema) returns "subgoal". These are alternate keys for the SAME field —
+# accepting them is parse-robustness, NOT a semantic keyword heuristic (the banned
+# anti-pattern). Without it a real plan parsed to EMPTY strings and the decider ran
+# with no plan. Ordered by likelihood; first non-empty wins. Shared by both adapters.
+_SUBGOAL_DESC_KEYS: tuple[str, ...] = (
+    "description",
+    "subgoal",
+    "goal",
+    "step",
+    "task",
+    "text",
+)
+
+
+def _subgoal_text(item: dict) -> str:
+    """The subgoal description from a plan item, tolerant of the key the model used
+    (see ``_SUBGOAL_DESC_KEYS``). Returns ``''`` if none carries usable text — the
+    caller then DROPS the item rather than appending an empty subgoal."""
+    for key in _SUBGOAL_DESC_KEYS:
+        val = item.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
 
 class ReasonerError(RuntimeError):
     """Typed fail-closed signal the kernel can catch. Raised when the model's
@@ -678,14 +704,25 @@ class GeminiReasoner(Reasoner):
             data = []
         subgoals: list[Subgoal] = []
         for item in data:
+            # Accept bare description STRINGS as well as objects — a model that
+            # returns ["search for X", …] should not collapse to the one-subgoal
+            # fallback (parity with OpenAIReasoner.plan_goal).
+            if isinstance(item, str):
+                desc = item.strip()
+                if desc:
+                    subgoals.append(Subgoal(description=desc, done_check=""))
+                continue
             if not isinstance(item, dict):
                 continue
             done = item.get("done_check", "")
             if done not in SUCCESS_CHECKS:
                 done = ""
-            subgoals.append(
-                Subgoal(description=str(item.get("description", "")), done_check=done)
-            )
+            # Accept "subgoal"/synonyms as well as "description" — an alternate JSON
+            # key for the SAME field (a model that ignores the schema must not parse
+            # to empty subgoals). Parity with OpenAIReasoner.plan_goal.
+            desc = _subgoal_text(item)
+            if desc:
+                subgoals.append(Subgoal(description=desc, done_check=done))
         return subgoals
 
     async def decide_step(
