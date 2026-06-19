@@ -137,6 +137,8 @@ def _step_schema(live_indices: list[int], fact_ids: list[str]) -> dict[str, Any]
             "target_index",
             "alternatives",
             "value_ref",
+            "fill_text",
+            "submit",
             "irreversibility",
             "success_check",
             "say",
@@ -188,6 +190,27 @@ def _step_schema(live_indices: list[int], fact_ids: list[str]) -> dict[str, Any]
                     "The id of the grounded fact whose value to fill/speak — MUST "
                     "be one of the listed fact ids, or 'null' for a value-less "
                     "click. NEVER invent a value."
+                ),
+            },
+            "fill_text": {
+                "type": "STRING",
+                "description": (
+                    "The LITERAL text to TYPE for a 'fill' — ONLY when the value is "
+                    "the USER'S OWN input (a search query, a date, a name THEY gave "
+                    "you), which is NOT one of the grounded facts. Copy it from the "
+                    "user's request. Leave EMPTY for any other action, and whenever "
+                    "the value to enter is a grounded fact (use value_ref for that). "
+                    "NEVER put a value you read off the page here."
+                ),
+            },
+            "submit": {
+                "type": "BOOLEAN",
+                "description": (
+                    "For a 'fill' ONLY: TRUE to press Enter after typing, "
+                    "SUBMITTING the field — use it when a typed query must run "
+                    "and NO search/submit control is among the numbered items "
+                    "(many search boxes only submit on Enter). A submitting fill "
+                    "is consequential and will be consent-gated. FALSE otherwise."
                 ),
             },
             "irreversibility": {"type": "STRING", "enum": list(_IRREVERSIBILITY)},
@@ -252,9 +275,12 @@ _DECIDE_SYSTEM = (
     "a private web task themselves. You NEVER act on a page directly — you only "
     "propose the single next step as structured JSON, and a deterministic kernel "
     "enforces consent + grounding. Two hard rules:\n"
-    "  1. NO FACT WITHOUT A SOURCE. The 'say' line and any filled value MUST be "
-    "copied verbatim from one of the grounded facts listed below. Never invent or "
-    "paraphrase a value; if nothing grounded answers, say nothing (empty 'say').\n"
+    "  1. NO FACT WITHOUT A SOURCE. The 'say' line and any value you fill FROM THE "
+    "PAGE MUST be copied verbatim from one of the grounded facts listed below (via "
+    "value_ref). Never invent or paraphrase a page value; if nothing grounded "
+    "answers, say nothing (empty 'say'). (The USER'S OWN input — a search term, a "
+    "date or name they told you — is the exception: it has no page source, so type "
+    "it via 'fill_text', never value_ref.)\n"
     "  2. NO ACTION WITHOUT A YES. Judge irreversibility honestly. If a control "
     "might submit, send, pay, confirm, or navigate off-site and you are not sure it "
     "is undoable, mark it 'irreversible' or 'unknown' — never downgrade a risky "
@@ -268,7 +294,14 @@ _DECIDE_SYSTEM = (
     "show / find a section and a matching link or button is in the numbered items, "
     "you MUST click or navigate it — do NOT merely read its name back. Reading the "
     "label of the thing they asked to open does NOT satisfy the goal.\n"
-    "  - 'fill': to enter a value into an input field.\n"
+    "  - 'fill': to enter a value into an input field. When the value is the USER'S "
+    "OWN input (a search query, a date or name THEY gave you) — NOT something already "
+    "on the page — put the exact text to type in 'fill_text' and leave value_ref "
+    "null. To RUN a typed search: if a search/submit control is among the numbered "
+    "items, fill then 'click' it on the NEXT step; if there is NO such control, set "
+    "'submit' true on the fill itself — Enter is pressed after typing (many search "
+    "boxes only submit on Enter). If the value is a grounded fact on the page, use "
+    "value_ref instead.\n"
     "Use the CURRENT PHASE's done-check as your target: if it is 'navigated' you "
     "must move the page (click/navigate), not read. If WHAT JUST HAPPENED shows the "
     "previous step was a read and the subgoal is still not done, do NOT read again "
@@ -305,6 +338,9 @@ _PLAN_SYSTEM = (
     "individual fields are steps inside it, NOT separate subgoals. Only split out a "
     "field that itself needs multiple steps (a date-picker, a searchable dropdown, a "
     "multi-page wizard).\n"
+    "  - Searching the site → ONE subgoal ('search for X'): the search field can be "
+    "filled and submitted in a single step (Enter), so do NOT plan a separate "
+    "'click the search button' subgoal.\n"
     "Each subgoal names a registered done_check from the allowed set — the "
     "code-checkable milestone that proves it is done."
 )
@@ -486,6 +522,12 @@ def _decode_step(payload: dict[str, Any]) -> StepProposal:
         action_kind=action_kind,  # type: ignore[arg-type]
         target_index=_coerce_index(payload.get("target_index")),
         value_ref=_coerce_ref(payload.get("value_ref")),
+        # The literal user-supplied fill text (a search query etc.); empty → None.
+        # PROPOSE only honours it for a fill into a free-text control.
+        fill_text=(str(payload.get("fill_text", "")).strip() or None),
+        # Press Enter after typing (submit the field) — only meaningful for a
+        # fill; the gate treats a submitting fill as consequential.
+        submit=bool(payload.get("submit", False)),
         irreversibility=irr,  # type: ignore[arg-type]
         irreversibility_rationale=str(payload.get("irreversibility_rationale", "")),
         success_check=success_check,

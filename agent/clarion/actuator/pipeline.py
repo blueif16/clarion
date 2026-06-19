@@ -255,6 +255,38 @@ async def cdp_click_by_backend(send: CdpSend, backend_id: int) -> tuple[bool, st
         return False, f"click failed for node {backend_id}: {exc}"
 
 
+async def cdp_press_enter_by_backend(send: CdpSend, backend_id: int) -> tuple[bool, str]:
+    """Press Enter on a node by its AX-tree ``backendDOMNodeId`` — the SUBMIT half
+    of a ``fill`` with ``submit=True`` (a search box with no separate search
+    button: live-probed on recreation.gov, Enter on the filled combobox navigates
+    to the results page while the suggestions overlay offers NO clickable submit).
+
+    Identity-targeted like ``cdp_click_by_backend``: ``DOM.focus`` puts the caret
+    on the real element, then a trusted keyDown/keyUp pair (``text="\\r"`` so a
+    keypress event fires for SPA handlers). Shared verbatim by both actuators —
+    Playwright (``self._cdp.send``) and the extension relay (``self._relay.send``,
+    Input/DOM domains already enabled for the click path). Returns ``(ok, detail)``.
+    """
+    try:
+        await send("DOM.focus", {"backendNodeId": backend_id})
+    except Exception as exc:  # noqa: BLE001 - an unfocusable node can't take Enter
+        return False, f"focus failed for node {backend_id}: {exc}"
+    try:
+        await send(
+            "Input.dispatchKeyEvent",
+            {"type": "keyDown", "key": "Enter", "code": "Enter",
+             "windowsVirtualKeyCode": 13, "text": "\r"},
+        )
+        await send(
+            "Input.dispatchKeyEvent",
+            {"type": "keyUp", "key": "Enter", "code": "Enter",
+             "windowsVirtualKeyCode": 13},
+        )
+        return True, "enter"
+    except Exception as exc:  # noqa: BLE001 - report the real reason, never guess
+        return False, f"enter failed for node {backend_id}: {exc}"
+
+
 # --- source-node highlight (the epistemic-clause proof surface) --------------
 # A node-IDENTITY-driven outline drawn on the live page around the SAME node the
 # agent resolved for the action — never the stored ``bbox`` (which is document-

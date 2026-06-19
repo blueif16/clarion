@@ -211,6 +211,12 @@ class Action(BaseModel):
     index: Optional[int] = None
     value: Optional[str] = None
     irreversible: bool = False
+    # For a ``fill`` ONLY: press Enter after typing to SUBMIT the field (a search
+    # box with no separate search button — the live recreation.gov home). A
+    # submitting fill is consequential (it commits the query), so the gate treats
+    # it like a click, never like a bare re-typable fill. Additive, default False
+    # (backward-compatible with every existing caller/checkpoint).
+    submit: bool = False
 
 
 class Proposal(BaseModel):
@@ -266,6 +272,14 @@ class StepProposal(BaseModel):
     # A reference to a REAL ``Fact.id`` (the value to fill/speak), or None when the
     # action carries no value (a click). Validated vs live Fact ids by the guard.
     value_ref: Optional[str] = None
+    # A LITERAL string to TYPE for a ``fill`` — the USER'S OWN input (a search query,
+    # a date or name THEY gave), which has NO page source so it can't be a
+    # ``value_ref``. The "no fact without a source" fence governs values READ OFF THE
+    # PAGE (``value_ref``) and what we SPEAK — NOT what the user instructs us to enter,
+    # so typing their own words is safe. PROPOSE prefers a resolved ``value_ref`` and
+    # falls back to ``fill_text`` ONLY for a fill into a free-text entry control
+    # (textbox/searchbox/combobox). Additive, default-None (backward-compatible).
+    fill_text: Optional[str] = None
     # The model's grounded judgement, paired with the independent code structural
     # pre-screen at the gate (killer-closer #2). The model can ESCALATE, never
     # downgrade past the structural net; UNKNOWN routes through CONSENT in Fast mode.
@@ -283,6 +297,13 @@ class StepProposal(BaseModel):
     # kernel MUST clarify (a safe read-back-and-ask), never act on a guess. Additive,
     # default-empty (backward-compatible): an unset value is the unambiguous case.
     alternatives: list[int] = Field(default_factory=list)
+    # For a ``fill`` ONLY: press Enter after typing to SUBMIT the field. The model
+    # sets this when a typed query must be committed and NO search/submit control is
+    # in the numbered items (the live recreation.gov home: the only path to running
+    # the search is Enter — the decider knew it, "need to submit via Enter on
+    # field", and had no verb for it). Consequential: the gate treats a submitting
+    # fill like a click. Additive, default-False (backward-compatible).
+    submit: bool = False
     # The model's self-reported polarity metacognition: True when the proposed
     # ``say`` ASSERTS AN ABSENCE / negative ("no late fee", "no autopay enrolled")
     # instead of reading back a present value. The kernel routes ONLY a flagged

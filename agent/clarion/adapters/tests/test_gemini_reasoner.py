@@ -98,6 +98,20 @@ def test_schema_enumerates_live_indices_and_fact_ids() -> None:
     assert tuple(schema["properties"]["success_check"]["enum"]) == SUCCESS_CHECKS
 
 
+def test_decode_step_carries_submit_flag() -> None:
+    """``submit`` (press Enter after a fill — the search-box-with-no-button case)
+    decodes through to the StepProposal; absent → False (backward-compatible)."""
+    from clarion.adapters.gemini_reasoner import _decode_step
+
+    with_submit = _decode_step(
+        {"action_kind": "fill", "target_index": "0", "fill_text": "Point Reyes",
+         "submit": True}
+    )
+    assert with_submit.submit is True
+    without = _decode_step({"action_kind": "fill", "target_index": "0"})
+    assert without.submit is False
+
+
 # ---------------------------------------------------------------------------
 # 3 + 4. Clean decode → guard-valid; say forced verbatim from the ref Fact.
 # ---------------------------------------------------------------------------

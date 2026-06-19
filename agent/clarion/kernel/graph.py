@@ -126,6 +126,26 @@ _DEFAULT_RANK_MIN_NODES = 48
 # mutations without a checkpoint. A pure read-back never counts (no side-effect).
 _DEFAULT_FAST_ACT_CAP = 1
 
+# Free-text entry roles a literal ``StepProposal.fill_text`` (the user's own typed
+# input — a search query, a date) may be filled into. A STRUCTURAL a11y-role set, not
+# a name match: only controls that accept arbitrary typed text. Mirrors the actuator's
+# fillable set; kept here so the kernel needs no actuator import (layering).
+_TEXT_ENTRY_ROLES = frozenset(
+    {"textbox", "searchbox", "textarea", "combobox", "spinbutton"}
+)
+
+
+# The grounded, spoken reversibility clause appended to a consent readback, keyed on
+# the IrreversibilityGate's verdict (the kernel's own computation — never the voice
+# LLM's guess). It lets the user hear whether a step can be undone BEFORE they say
+# yes. ``unknown`` speaks the honest hedge (treat-as-final), matching the fail-closed
+# UNKNOWN-gates posture. Copy-lint-safe (no banned role words).
+_REVERSIBILITY_NOTE: dict[str, str] = {
+    "reversible": "I can undo this if you change your mind.",
+    "irreversible": "This can't be undone once it's done.",
+    "unknown": "I can't be sure I can undo this, so I'll treat it as final.",
+}
+
 
 class _PlanState(ClarionState, total=False):
     """The SUPERSET schema the de-hardcoded kernel + generic executor walk:
@@ -545,6 +565,22 @@ def build_kernel(
             tgt_dest = dests.get(step.target_index)
             if tgt_dest:
                 alts = [i for i in alts if dests.get(i) != tgt_dest]
+        # DUPLICATE-CONTROL dedup (structural, like the href dedup above): a page often
+        # renders the SAME control twice — a desktop + a mobile-header search box, both
+        # role=combobox name="Search Recreation.gov". Two controls with an IDENTICAL
+        # (role, accessible-name) are not a real choice — acting on either is
+        # equivalent — so they are not a genuine ambiguity; drop them. Identity on the
+        # live AX node (role + name), never a lexical keyword match; genuinely-distinct
+        # same-role fields (two differently-named inputs) still clarify.
+        if alts and step.target_index is not None:
+            tgt = page.nodes.get(step.target_index)
+            if tgt is not None:
+                tgt_key = (tgt.role, tgt.name.strip())
+                alts = [
+                    i
+                    for i in alts
+                    if (page.nodes[i].role, page.nodes[i].name.strip()) != tgt_key
+                ]
         if step.action_kind in ("fill", "click", "navigate") and alts:
             # Gather candidate names from the LIVE map (chosen target first), capped
             # to ~3, skipping empties — these are read off real perceived nodes.
@@ -614,13 +650,45 @@ def build_kernel(
         # fill/click/navigate/read branches below (click/navigate carry no value).
         say = ""
 
-        if step.action_kind == "fill" and target_node is not None and value is not None:
-            action = Action(kind="fill", index=step.target_index, value=value)
-            say = step.say if step.say else value
-            utterance = (
-                f"I found the {node_name or 'field'}. I'll fill it with {say}. "
-                f"Say yes to continue."
+        # A fill's value: a grounded page Fact (``value_ref``) takes priority; failing
+        # that, the USER'S OWN literal input (``fill_text``) is allowed ONLY for a
+        # free-text entry control (search box / textbox). Typing the user's own words
+        # is their instruction, not an epistemic assertion — the "no fact without a
+        # source" fence governs page-read values (``value_ref``) + what we SPEAK, not
+        # what the user told us to enter. The role gate keeps it to real text inputs.
+        fill_value = value
+        if (
+            fill_value is None
+            and step.action_kind == "fill"
+            and step.fill_text
+            and target_node is not None
+            and target_node.role in _TEXT_ENTRY_ROLES
+        ):
+            fill_value = step.fill_text
+
+        if step.action_kind == "fill" and target_node is not None and fill_value is not None:
+            # ``submit`` (press Enter after typing) rides the Action so the
+            # actuator commits the query in the SAME consented act — and the
+            # utterance SAYS so, because the user is consenting to the submit,
+            # not just the typing (a submitting fill always gates: the
+            # classifier treats it like a click, never a bare re-typable fill).
+            action = Action(
+                kind="fill",
+                index=step.target_index,
+                value=fill_value,
+                submit=bool(step.submit),
             )
+            say = step.say if step.say else fill_value
+            if step.submit:
+                utterance = (
+                    f"I found the {node_name or 'field'}. I'll fill it with {say} "
+                    f"and press Enter to run it. Say yes to continue."
+                )
+            else:
+                utterance = (
+                    f"I found the {node_name or 'field'}. I'll fill it with {say}. "
+                    f"Say yes to continue."
+                )
         elif step.action_kind in ("click", "navigate") and target_node is not None:
             action = Action(kind=step.action_kind, index=step.target_index)
             utterance = f"I'm about to use {node_name or 'this control'}. Say yes to continue."

@@ -78,6 +78,7 @@ from clarion.actuator.pipeline import (  # noqa: F401  (re-exported)
     build_candidates,
     cdp_clear_highlight,
     cdp_click_by_backend,
+    cdp_press_enter_by_backend,
     cdp_highlight_by_backend,
     cdp_hrefs_by_index,
     containment_filter,
@@ -384,6 +385,7 @@ class PlaywrightActuator(Actuator):
             _NATIVE_SETTER_JS, {"clarionId": clarion_id, "value": action.value}
         )
         ok = bool(res.get("ok"))
+        detail = "" if ok else f"native-setter failed: {res.get('reason')}"
         if ok:
             # Record the filled node by stable node_id BEFORE re-perceiving, so the
             # fresh map stamps ``state["filled"]=True`` (the AX tree itself loses the
@@ -391,11 +393,33 @@ class PlaywrightActuator(Actuator):
             filled_node_id = self._index_to_node_id.get(action.index)
             if filled_node_id:
                 self._filled_node_ids.add(filled_node_id)
+        if ok and action.submit:
+            # The consented SUBMIT half: press Enter on the SAME node (a search box
+            # with no separate search button submits only on Enter — live-probed on
+            # recreation.gov: Enter on the filled combobox navigates to the results
+            # page). The act's success includes the submit — a fill that typed but
+            # failed to commit must replan, not pass.
+            backend_id = self._index_to_backend_id.get(action.index)
+            if backend_id is None:
+                ok, detail = False, "submit: no backend id for the filled node"
+            else:
+                ok, detail = await cdp_press_enter_by_backend(self._cdp.send, backend_id)
+                print(
+                    f"  [fill+submit] idx={action.index} backend={backend_id} "
+                    f"ok={ok} {detail}",
+                    flush=True,
+                )
+                # Let the resulting navigation / DOM mutation settle (same wait the
+                # click path uses) so the re-perceive below sees the result page.
+                try:
+                    await self._page.wait_for_load_state("networkidle", timeout=2000)
+                except Exception:  # noqa: BLE001 - settle is best-effort
+                    pass
         after = await self.perceive()
         return Observation(
             selector_map=after,
             success=ok,
-            detail="" if ok else f"native-setter failed: {res.get('reason')}",
+            detail=detail,
         )
 
     async def _do_click(self, action: Action) -> Observation:

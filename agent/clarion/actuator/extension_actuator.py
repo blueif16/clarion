@@ -47,6 +47,7 @@ from clarion.actuator.pipeline import (
     build_candidates,
     cdp_clear_highlight,
     cdp_click_by_backend,
+    cdp_press_enter_by_backend,
     cdp_highlight_by_backend,
     cdp_hrefs_by_index,
     containment_filter,
@@ -320,17 +321,36 @@ class ExtensionActuator(Actuator):
         )
         value = (res.get("result") or {}).get("value") or {}
         ok = bool(value.get("ok"))
+        detail = "" if ok else f"native-setter failed: {value.get('reason')}"
         if ok:
             # Record the filled node by stable node_id BEFORE re-perceiving, so the
             # fresh map stamps ``state["filled"]=True`` (parity with Playwright).
             filled_node_id = self._index_to_node_id.get(action.index)
             if filled_node_id:
                 self._filled_node_ids.add(filled_node_id)
+        if ok and action.submit:
+            # The consented SUBMIT half: press Enter on the SAME node (parity with
+            # the Playwright transport — the relay forwards DOM/Input verbatim, so
+            # zero extension changes). Success includes the submit: a fill that
+            # typed but failed to commit must replan, not pass.
+            backend_id = self._index_to_backend_id.get(action.index)
+            if backend_id is None:
+                ok, detail = False, "submit: no backend id for the filled node"
+            else:
+                ok, detail = await cdp_press_enter_by_backend(self._relay.send, backend_id)
+                print(
+                    f"  [fill+submit] idx={action.index} backend={backend_id} "
+                    f"ok={ok} {detail}",
+                    flush=True,
+                )
+                # No Playwright load-state API over the relay — give a resulting
+                # navigation a beat to start so the re-perceive sees the new page.
+                await asyncio.sleep(1.2)
         after = await self.perceive()
         return Observation(
             selector_map=after,
             success=ok,
-            detail="" if ok else f"native-setter failed: {value.get('reason')}",
+            detail=detail,
         )
 
     async def _do_click(self, action: Action) -> Observation:
