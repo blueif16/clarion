@@ -579,6 +579,54 @@ async def test_failed_act_does_not_poison_once_flag() -> None:
     assert _already_acted(succeeded, pid) is True  # success → no double-act
 
 
+@pytest.mark.asyncio
+async def test_proposal_id_is_namespaced_per_replan_attempt() -> None:
+    """REGRESSION (live 2026-06-07, recreation.gov): a SUCCESSFUL-but-ineffective act
+    (a homepage carousel click that ran — ``success=True`` — but did NOT navigate)
+    set the §2.3 once-flag for ``prop-{stage}-{subgoal}``. Because that id was
+    CONSTANT per subgoal AND the seed carries the trace across replans, every later
+    replan act hit ``already-acted`` and the subgoal dead-ended (``gave_up``). The
+    ``75cb650`` fix only covered FAILED acts, so it did not help here.
+
+    The fix namespaces the proposal_id with the bounded-replan attempt
+    (``-a{attempt}``): a replan (attempt N+1) gets a FRESH id, so the prior attempt's
+    success marker no longer blocks the NEW action — while the SAME action re-executed
+    on a consent resume (same attempt → same id) is still blocked (test above)."""
+    from clarion.kernel.graph import _trace
+
+    facts = [_grounded_fact()]
+    actuator = _CountingActuator()
+    graph = build_kernel(
+        _fill_reasoner(facts), _ScriptedRetriever(facts), actuator, mode="normal"
+    )
+
+    seed = seed_state(goal="enter the amount", mode="normal")
+    seed["page_index"] = await actuator.perceive()
+    # Simulate the live failure: attempt 0 already SUCCEEDED on this subgoal (its
+    # ``-a0`` once-flag marker rides the carried trace), and we are now on attempt 1.
+    seed["trace"] = [_trace("ACT", "info", acted_proposal_id="prop-0-0-a0", success=True)]
+    seed["replan_attempt"] = 1
+    config = _cfg()
+
+    await graph.ainvoke(seed, config)
+    final = await graph.ainvoke(
+        Command(resume=ConsentDecision(decision="approve").model_dump()), config
+    )
+
+    # The replan's action DISPATCHES under its own per-attempt id — not skipped by
+    # attempt 0's marker (under the old constant ``prop-0-0`` it would have been).
+    # Exactly ONE real actuator call (the injected a0 is only a marker, no act).
+    assert len(actuator.act_calls) == 1
+    acted_ids = [
+        e.data["acted_proposal_id"]
+        for e in final["trace"]
+        if e.node == "ACT" and e.data.get("acted_proposal_id") and e.data.get("success")
+    ]
+    # The new act ran under the per-attempt id; the old constant id would have been
+    # blocked by the carried a0 marker → no a1 act at all.
+    assert "prop-0-0-a1" in acted_ids
+
+
 # ---------------------------------------------------------------------------
 # (5) Trace events emitted per node (incl. the new GATE node)
 # ---------------------------------------------------------------------------

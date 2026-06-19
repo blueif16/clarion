@@ -169,6 +169,14 @@ class _PlanState(ClarionState, total=False):
     # CONSENT; read by ``consent_gate`` to force a spoken progress beat after the
     # cap. A last-value-wins channel (NOT a reducer): ACT writes the running count.
     fast_acts: int
+    # The current bounded-replan ATTEMPT for this subgoal, seeded by the stage
+    # executor (its ``_replan_attempts``). Namespaces the per-step proposal_id
+    # (``prop-{stage}-{subgoal}-a{attempt}``) so a SUCCESSFUL-but-ineffective act in
+    # one attempt (e.g. a homepage click that ran but did NOT navigate) does not trip
+    # the §2.3 once-flag for the DIFFERENT action the next replan decides — while the
+    # SAME action re-executed on a consent resume is still blocked (the id is stable
+    # within an attempt). Read-only in the kernel; absent → 0 (the first attempt).
+    replan_attempt: int
 
 
 def make_checkpointer() -> InMemorySaver:
@@ -438,7 +446,15 @@ def build_kernel(
         facts = list(state["grounded_facts"])
         sayable = speakable(facts)
         k, _n = state["step"]
-        proposal_id = f"prop-{state['stage_idx']}-{k}"
+        # Per-ATTEMPT id: the bounded-replan counter namespaces the proposal so a
+        # replan's NEW action is not blocked by the PRIOR attempt's success once-flag
+        # marker (the trace carries across replans). It stays STABLE within one
+        # attempt, so a consent resume still hits the §2.3 double-act guard. (Was
+        # ``prop-{stage}-{subgoal}``, constant per subgoal → a successful-but-
+        # ineffective act, e.g. a homepage click that did not navigate, dead-ended
+        # every later replan with ``already-acted``.)
+        attempt = int(state.get("replan_attempt", 0) or 0)
+        proposal_id = f"prop-{state['stage_idx']}-{k}-a{attempt}"
         # The FULL decided-step trajectory this run (the history the reasoner reasons
         # over), not just the last step — so a replan can see it already tried a read.
         history = list(state.get("step_history") or [])

@@ -455,6 +455,11 @@ def build_stage_graph(
             "recall_hint": state.get("recall_hint", ""),
             "stage_idx": idx,
             "step": state["step"],
+            # The replan attempt namespaces the kernel's per-step proposal_id so a
+            # SUCCESSFUL-but-ineffective act in one attempt does not block (via the
+            # carried-trace §2.3 once-flag) the DIFFERENT action the next replan
+            # decides for this subgoal. Same value the inner-kernel thread id uses.
+            "replan_attempt": attempt,
             "page_index": state["page_index"],
             "grounded_facts": state["grounded_facts"],
             "pending_proposal": state["pending_proposal"],
