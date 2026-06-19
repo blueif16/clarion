@@ -21,8 +21,10 @@
 # Then: press Ctrl/Cmd+Shift+Y on a tab to attach. Stop with scripts/clarion-down.sh.
 #
 # Usage:  scripts/clarion-up.sh [START_URL]
-#   START_URL — the tab to open (default a blank gov-portal search start). Read-only
-#               up to the auth wall — no credentials, no submit (§9 recording rules).
+#   START_URL — the tab to open (default Recreation.gov home — the campground-booking
+#               demo landing: "make a reservation to Point Reyes" → SITE MAP → the
+#               campground's date grid). Read-only up to the auth wall — no
+#               credentials, no submit (§9 recording rules).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -30,7 +32,9 @@ AGENT="$ROOT/agent"
 EXT="$ROOT/web/extension"
 PY="$AGENT/.venv/bin/python"
 ROOM="${CLARION_ROOM:-clarion-hero}"
-START_URL="${1:-https://www.usa.gov/benefits}"
+# Default = Recreation.gov home (campground-booking demo landing): the user opens
+# with "make a reservation to Point Reyes" → SITE MAP → the campground's date grid.
+START_URL="${1:-https://www.recreation.gov/}"
 # Durable profile (logins persist across runs/reboots — unlike the old /tmp one).
 # Override with CLARION_CHROME_PROFILE; CDP port lets Playwright observe on demand.
 # Default profile is the Chrome-for-Testing one (the primary browser below).
@@ -75,6 +79,27 @@ export default {
 JS
 echo "      wrote $EXT/config.js (url + room '$ROOM' + fresh token)"
 
+# 1b. Delete any lingering LiveKit room so the FIRST join recreates it fresh ----
+# The voice worker uses AUTOMATIC dispatch, which fires only when a room is CREATED.
+# A room left over from a prior run (empty_timeout = 300s keeps it alive ~5 min)
+# means the human rejoins the SAME room → no dispatch → NO agent → silent voice.
+# Deleting it here guarantees the first join is a creation → the agent dispatches.
+echo "[1b] deleting any stale LiveKit room '$ROOM' (so the first join → agent dispatch)…"
+CLARION_ROOM="$ROOM" AGENT_ENV="$AGENT/.env" "$PY" - <<'PY' || echo "      (skipped — no room existed or API unavailable)"
+import os, asyncio
+from dotenv import load_dotenv
+load_dotenv(os.environ["AGENT_ENV"])
+from livekit import api
+async def main():
+    lk = api.LiveKitAPI()
+    try:
+        await lk.room.delete_room(api.DeleteRoomRequest(room=os.environ["CLARION_ROOM"]))
+        print("      deleted room", os.environ["CLARION_ROOM"])
+    finally:
+        await lk.aclose()
+asyncio.run(main())
+PY
+
 # If a previous stack is holding any relay port, clear it before a fresh start.
 if lsof -ti tcp:8771 >/dev/null 2>&1 || lsof -ti tcp:8773 >/dev/null 2>&1; then
   echo "[2/4] relay ports busy — clearing the old stack first…"
@@ -115,8 +140,21 @@ else
 fi
 
 # 3. Start the LiveKit voice worker (reaches the tab THROUGH the broker) -------
+# CLARION_SITE_KNOWLEDGE=1 lets the planner CONSULT the pre-warmed site map at PLAN
+# time (the SITE MAP beat: "donate to my government" → semantic hit on the donation
+# form + its URL → navigate). It only READS clarion-site-structure — pre-warm it
+# first (docs/clarion-demo-script.md §3★, the site_indexer command). Fail-open: an
+# empty/missing index just degrades to page-only planning, never errors. (Auto-index
+# stays OFF — pre-warm beats an always-on crawl contending with the live turn budget.)
+#
+# CLARION_STT_KEYTERMS = Deepgram keyterm prompting (recognition boost for the demo
+# task's proper nouns — the live 06-11 run heard "Point Reyes" as "Ponteries" and the
+# task plane chased the garbage string). Per-deploy ASR config, NOT a semantic
+# keyword list (nothing classifies/ranks/routes on these). Override per run:
+#   CLARION_STT_KEYTERMS="Zion,campsite" scripts/clarion-up.sh
+KEYTERMS="${CLARION_STT_KEYTERMS:-Point Reyes,Recreation.gov,campground,campsite,reservation}"
 echo "[3/4] starting the voice worker (LiveKit agent; actuator → broker client)…"
-( cd "$AGENT" && CLARION_ACTUATOR=extension nohup "$PY" -m clarion.app.voice_entry dev >"$WORKER_LOG" 2>&1 & echo $! >"$WORKER_PID_FILE" )
+( cd "$AGENT" && CLARION_ACTUATOR=extension CLARION_SITE_KNOWLEDGE=1 CLARION_STT_KEYTERMS="$KEYTERMS" nohup "$PY" -m clarion.app.voice_entry dev >"$WORKER_LOG" 2>&1 & echo $! >"$WORKER_PID_FILE" )
 sleep 4
 if kill -0 "$(cat "$WORKER_PID_FILE" 2>/dev/null)" 2>/dev/null; then
   echo "      worker PID $(cat "$WORKER_PID_FILE") — log: $WORKER_LOG"
