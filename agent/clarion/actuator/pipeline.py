@@ -731,8 +731,33 @@ def _group_affordances(
     return affordances, phrases
 
 
+def _grid_axis_phrase(
+    columns: list[str], rows: list[str], *, max_axis: int = 10
+) -> str:
+    """A spoken clause for a 2-D data grid (a date×site availability table, a price
+    matrix…), built from its STRUCTURAL axes — the ``columnheader`` / ``rowheader``
+    AX roles — NOT a lexical guess about what the grid 'means'. It hands the
+    communicator the AXES so the readback is "columns are these dates, rows are
+    these sites — which one?" instead of reading back hundreds of cells. Empty
+    unless BOTH axes are present (a real grid), so non-grid pages are untouched."""
+    cols = [c.strip() for c in columns if c.strip()]
+    rws = [r.strip() for r in rows if r.strip()]
+    if len(cols) < 2 or len(rws) < 2:
+        return ""
+
+    def _join(xs: list[str], n: int) -> str:
+        head = "; ".join(xs[:n])
+        return head + (f" (+{len(xs) - n} more)" if len(xs) > n else "")
+
+    return (
+        f"This page has a data grid with {len(cols)} columns and {len(rws)} rows. "
+        f"Columns: {_join(cols, max_axis)}. Rows: {_join(rws, max_axis)}. "
+        f"Name one column and one row to pick a cell."
+    )
+
+
 def _readout_summary(
-    title: str, headings: list[Fact], group_phrases: list[str]
+    title: str, headings: list[Fact], group_phrases: list[str], grid_phrase: str = ""
 ) -> str:
     """Compose the single spoken readback from grounded parts. Ends on an open
     prompt so the user states a goal (the goal is then confirmed, never assumed —
@@ -745,7 +770,9 @@ def _readout_summary(
         parts.append("The main sections are: " + "; ".join(h.value for h in headings) + ".")
     if group_phrases:
         parts.append("On this page I can see " + "; ".join(group_phrases) + ".")
-    if not headings and not group_phrases:
+    if grid_phrase:
+        parts.append(grid_phrase)
+    if not headings and not group_phrases and not grid_phrase:
         parts.append(
             "I can't find any labeled headings or controls on this page to read back."
         )
@@ -772,6 +799,8 @@ def summarize_ax_tree(
     transports (Playwright + extension)."""
     headings: list[Fact] = []
     by_role: dict[str, list[Fact]] = {}
+    columns: list[str] = []  # grid columnheader names (the data-grid X axis)
+    rows: list[str] = []     # grid rowheader names (the data-grid Y axis)
     for ax in ax_tree.get("nodes", []) or []:
         if ax.get("ignored"):
             continue
@@ -787,9 +816,14 @@ def summarize_ax_tree(
             headings.append(fact)
         elif role in _INTERACTIVE_ROLES:
             by_role.setdefault(role, []).append(fact)
+        elif role == "columnheader":
+            columns.append(name)
+        elif role == "rowheader":
+            rows.append(name)
 
     affordances, group_phrases = _group_affordances(by_role, max_per_group=max_per_group)
-    summary = _readout_summary(title, headings[:max_headings], group_phrases)
+    grid_phrase = _grid_axis_phrase(columns, rows)
+    summary = _readout_summary(title, headings[:max_headings], group_phrases, grid_phrase)
     return PageReadout(
         title=title,
         url=url,
