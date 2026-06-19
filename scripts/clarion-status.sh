@@ -43,7 +43,7 @@ proc "from multiprocessing.spawn"   "  └ LiveKit job subprocs"
 proc "clarion.actuator.relay_broker" "relay broker"
 proc "clarion-logsink.py"           "log sink"
 proc "clarion-sim.py"               "real-sim (test driver)"
-proc "user-data-dir=/tmp/clarion-chrome-profile" "Chrome (clarion profile)"
+proc "user-data-dir=${CLARION_CHROME_PROFILE:-$HOME/.clarion/chromium-profile-durable}" "Chrome (clarion profile)"
 hr
 for f in "$WORKER_LOG" "$BROKER_LOG" "$EXT_LOG"; do
   echo "LAST $N — $f"

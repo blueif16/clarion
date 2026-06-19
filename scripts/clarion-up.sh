@@ -132,11 +132,17 @@ fi
 # honors --load-extension → we launch THAT for true auto-load. Branded Chrome
 # stays a manual-load fallback (Load unpacked persists in the durable profile).
 echo "[4/4] launching the browser (Chrome for Testing; extension auto-loaded; CDP open)…"
-# A browser already on this profile makes a new launch a no-op for these flags
-# (it just opens a tab in the live instance) — warn loudly.
+# A browser already on this profile makes a new launch a no-op for these flags (it
+# just opens a tab in the live instance → --load-extension is IGNORED and the
+# extension stays STALE). Quit the stale instance first so the relaunch reloads it.
 if lsof -nP -iTCP:"$CDP_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "      NOTE: :$CDP_PORT already listening — a browser on this profile is likely up;"
-  echo "            its flags won't refresh. Quit it first for a clean relaunch."
+  echo "      :$CDP_PORT already listening — quitting the stale Chrome on this profile so"
+  echo "      --load-extension re-reads the unpacked files (else the extension stays STALE)."
+  pkill -f "user-data-dir=$PROFILE" 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    lsof -nP -iTCP:"$CDP_PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+    sleep 0.5
+  done
 fi
 CFT="$("$PY" -c 'from playwright.sync_api import sync_playwright
 with sync_playwright() as p: print(p.chromium.executable_path)' 2>/dev/null || true)"

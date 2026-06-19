@@ -6,7 +6,10 @@ set -uo pipefail
 
 WORKER_PID_FILE="/tmp/clarion-worker.pid"
 BROKER_PID_FILE="/tmp/clarion-broker.pid"
-PROFILE="/tmp/clarion-chrome-profile"
+# MUST match clarion-up.sh's profile. Was a stale /tmp path → `down` never matched
+# the real Chrome instance, so it never closed → the extension never reloaded between
+# runs (the "I restarted but still see old code / no toast" bug).
+PROFILE="${CLARION_CHROME_PROFILE:-$HOME/.clarion/chromium-profile-durable}"
 
 echo "== Clarion down =="
 
