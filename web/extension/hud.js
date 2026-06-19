@@ -240,6 +240,8 @@ function _renderHud(payload) {
     const mark = el("div", "cl-wordmark", "Clarion");
     const tag = el("div", "cl-tag", "telemetry");
     const spacer = el("div", "cl-spacer");
+    const refreshBtn = el("button", "cl-btn", "↻"); // ↻ restart fresh on the site
+    refreshBtn.title = "restart fresh on the site";
     const clearBtn = el("button", "cl-btn", "✕"); // ✕
     clearBtn.title = "clear log";
     const copyBtn = el("button", "cl-btn", "⧉"); // ⧉
@@ -248,7 +250,7 @@ function _renderHud(payload) {
     collapseBtn.title = "collapse";
     const chev = el("span", "cl-chev", "▾"); // ▾
     collapseBtn.appendChild(chev);
-    top.append(dot, mark, tag, spacer, clearBtn, copyBtn, collapseBtn);
+    top.append(dot, mark, tag, spacer, refreshBtn, clearBtn, copyBtn, collapseBtn);
 
     // body (everything that hides on collapse) -------------------------------
     const body = el("div", "cl-body");
@@ -362,6 +364,24 @@ function _renderHud(payload) {
     });
 
     collapseBtn.addEventListener("click", () => box.classList.toggle("cl-collapsed"));
+
+    // "restart fresh on the site": ask the worker to end the session, reload the
+    // page, and re-attach a fresh session. chrome.runtime.sendMessage is available
+    // in this injected ISOLATED world; guard it in case the extension was reloaded.
+    refreshBtn.addEventListener("click", () => {
+      refreshBtn.classList.add("cl-spin");
+      setTimeout(() => refreshBtn.classList.remove("cl-spin"), 700);
+      try {
+        if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.sendMessage) {
+          chrome.runtime.sendMessage({
+            target: "service-worker-control",
+            type: "clarion.refresh",
+          });
+        }
+      } catch {
+        /* extension context gone (reloaded) — nothing to do */
+      }
+    });
 
     // drag by the topbar (ignore clicks that land on a control)
     let drag = null;
@@ -776,6 +796,8 @@ function _renderHud(payload) {
 #${ID} .cl-chev{display:inline-block;transition:transform .2s ease;color:var(--soft);}
 #${ID}.cl-collapsed .cl-chev{transform:rotate(-90deg);}
 
+#${ID} .cl-btn.cl-spin{animation:cl-spin .7s ease;}
+@keyframes cl-spin{to{transform:rotate(360deg);}}
 @keyframes cl-in{from{opacity:0;transform:translateY(3px);}to{opacity:1;transform:none;}}
 @keyframes cl-breathe{0%,100%{opacity:.55;transform:scale(.88);}50%{opacity:1;transform:scale(1.15);}}
 `;

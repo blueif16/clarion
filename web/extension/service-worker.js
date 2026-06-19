@@ -83,7 +83,17 @@ async function startClarion() {
     setBadge("ERR", "err");
     return;
   }
+  await attachToTab(tab);
+}
 
+/**
+ * Attach Clarion to a specific tab: reuse a live session on the same tab, else
+ * tear down any prior session, attach the debugger, enable the CDP domains, open
+ * the relay, and start browser voice. Shared by the shortcut (the active tab) and
+ * the HUD "restart fresh" control (the bound tab, after a reload).
+ * @param {chrome.tabs.Tab} tab
+ */
+async function attachToTab(tab) {
   // If a session is already live on this exact tab, do nothing (idempotent).
   if (session && session.tabId === tab.id && session.attached) {
     console.log("[clarion] already attached to tab", tab.id);
@@ -148,6 +158,90 @@ async function startClarion() {
     pushHud(tabId, { phase: "voice start FAILED", detail: errorToMessage(err), level: "err" })
   );
   console.log("[clarion] attached to tab", tabId, "—", session.url);
+}
+
+// ---------------------------------------------------------------------------
+// HUD control channel: the on-page panel's "restart fresh" button posts here.
+// ---------------------------------------------------------------------------
+
+const CONTROL_TARGET = "service-worker-control";
+const CONTROL_REFRESH = "clarion.refresh";
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.target !== CONTROL_TARGET) return;
+  if (msg.type === CONTROL_REFRESH) {
+    refreshClarion().catch((err) => {
+      console.error("[clarion] refresh failed:", errorToMessage(err));
+      setBadge("ERR", "err");
+    });
+  }
+});
+
+/**
+ * "Restart fresh on the site": end the current Clarion session, reload the bound
+ * tab so the page returns to its initial state, then re-attach a fresh session
+ * (a new relay session.start + browser voice) on the same tab. Falls back to the
+ * active tab when nothing is attached. Triggered by the HUD refresh button.
+ */
+async function refreshClarion() {
+  let tabId = session ? session.tabId : null;
+  if (tabId == null) {
+    const tab = await getActiveTab();
+    tabId = tab ? tab.id : null;
+  }
+  if (tabId == null) {
+    setBadge("ERR", "err");
+    return;
+  }
+  setBadge("…", "info");
+
+  // 1) End the current session cleanly (detaches the debugger, ends relay + voice).
+  if (session) await teardown("refresh");
+
+  // 2) Recreate the LiveKit room so a FRESH agent re-dispatches. Automatic dispatch
+  //    fires only on room CREATION; rejoining the lingering room (empty_timeout
+  //    300s) gets NO agent → silent voice. The local sink endpoint deletes it for
+  //    us (the browser can't — it has no LiveKit API creds), then the rejoin below
+  //    recreates it. No-op for the relay-only path (voice config absent).
+  await resetRoom();
+
+  // 3) Reload the site so the page starts from a clean state.
+  try {
+    await chrome.tabs.reload(tabId);
+  } catch (err) {
+    console.warn("[clarion] refresh: reload failed:", errorToMessage(err));
+  }
+
+  // 4) Re-attach Clarion on the same tab, fresh (relay + voice rejoin the new room).
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (tab && tab.id != null) await attachToTab(tab);
+}
+
+/** Ask the local sink endpoint to delete the LiveKit room so the rejoin recreates
+ * it (and the worker auto-dispatches a fresh agent). Best-effort; text/plain body =
+ * no CORS preflight, same as the log POST. */
+async function resetRoom() {
+  let room = "";
+  try {
+    const cfg = await loadVoiceConfig();
+    room = (cfg && cfg.ROOM_NAME) || "";
+  } catch {
+    /* config unavailable — the sink falls back to its default room */
+  }
+  try {
+    await fetch("http://127.0.0.1:8772/reset-room", {
+      method: "POST",
+      body: room,
+      keepalive: true,
+    });
+    sinkLog({ phase: "refresh: room reset requested", detail: room || "(default)", level: "info" });
+  } catch (err) {
+    sinkLog({
+      phase: "refresh: room reset FAILED — agent may not rejoin",
+      detail: errorToMessage(err),
+      level: "warn",
+    });
+  }
 }
 
 async function getActiveTab() {
@@ -615,6 +709,14 @@ chrome.runtime.onMessage.addListener((msg) => {
     // on-page action-trace feed (toast + panel Activity history) instead of the
     // diagnostic event log. Needs an attached tab; no file-sink mirror.
     if (msg.activity) {
+      // Mark the file sink so a fired toast is PROVABLE from /tmp/clarion-ext.log
+      // (activity frames otherwise never touch the sink → undebuggable browser-side).
+      const a = msg.activity;
+      sinkLog({
+        phase: "[activity] pushActivity",
+        detail: `${a.kind} ${a.target} status=${a.status} tab=${session && session.tabId}`,
+        level: "info",
+      });
       if (session && session.tabId != null) pushActivity(session.tabId, msg.activity);
       return;
     }
