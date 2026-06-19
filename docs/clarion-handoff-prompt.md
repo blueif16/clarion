@@ -64,7 +64,7 @@ copy (`python scripts/copy_lint.py <file>`). Verify external methods against **C
 
 **Run / verify loop:**
 - `scripts/clarion-status.sh` — FIRST, to see ports/procs/logs at a glance.
-- `scripts/clarion-up.sh [URL]` — starts the stack (rotates logs → `.prev`); no arg = usa.gov/benefits.
+- `scripts/clarion-up.sh [URL]` — starts the stack (rotates logs → `.prev`); no arg = pay.gov/public/home (demo landing).
 - `cd agent && .venv/bin/python -m clarion.app.gov_proof` — the AUTONOMOUS de-hardcoded proof (no voice).
 - Gate: `cd agent && .venv/bin/python -m pytest clarion -q` (keep ≥178 green).
 - Gotchas: killing a job leaves the room's agent slot occupied → DELETE the room to re-dispatch;
