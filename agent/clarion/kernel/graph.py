@@ -796,7 +796,16 @@ def build_kernel(
             return {"irreversibility": "reversible"}
         model_judgment = step.irreversibility if step is not None else "unknown"
         cls = classify(proposal, state["page_index"], model_judgment)  # type: ignore[arg-type]
-        gated = proposal.model_copy(update={"irreversible": cls != "reversible"})
+        # Speak the GROUNDED reversibility verdict in the consent readback — keyed on
+        # the gate's classification (the kernel's own computation), NEVER the voice
+        # LLM's guess. Skipped for a read (no side-effect; never surfaced at a gate),
+        # so a grounded read-back never gets a spurious "I can undo this".
+        is_read = proposal.action is not None and proposal.action.kind == "read"
+        note = "" if is_read else _REVERSIBILITY_NOTE.get(cls, "")
+        utterance = f"{proposal.utterance} {note}".strip() if note else proposal.utterance
+        gated = proposal.model_copy(
+            update={"irreversible": cls != "reversible", "utterance": utterance}
+        )
         return {
             "pending_proposal": gated,
             "irreversibility": cls,

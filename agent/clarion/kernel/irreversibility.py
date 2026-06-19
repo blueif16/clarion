@@ -44,6 +44,66 @@ _ESCALATING_STATE_FLAGS = ("disabled", "haspopup", "expanded")
 # fail-closed to unknown (the UNKNOWN-on-no-grounded-undo rule).
 _UNDO_NAME_TOKENS = ("cancel", "undo", "go back", "back", "previous", "edit", "discard")
 
+# Roles whose click is RE-SELECTABLE — clicking one selects/toggles a state the user
+# can put back by clicking the alternative again (a "multiple choice": radio /
+# checkbox / switch / tab / menuitem and their menu variants). A STRUCTURAL role set
+# (the de-hardcoding rule), NOT a name match. These are reversible by OUR OWN
+# capability (we just re-click), so they are exempt from the fail-closed no-undo net.
+_REVERSIBLE_CLICK_ROLES = {
+    "radio",
+    "checkbox",
+    "switch",
+    "tab",
+    "menuitem",
+    "menuitemradio",
+    "menuitemcheckbox",
+    "option",
+}
+
+
+def _is_reversible_by_capability(
+    proposal: Proposal, page: SelectorMap
+) -> bool:
+    """True iff WE can put this action back ourselves, regardless of any on-page
+    cancel affordance — the "can we undo it?" axis, grounded on ``kind`` + the a11y
+    ``role`` (NEVER a name match):
+
+      - a NAVIGATE, or a CLICK on a LINK (``<a href>``): navigation. We record
+        ``url_before`` and re-navigate to it — a redirect is "no big deal"; browser-
+        back is the undo. (The reasoner navigates by clicking links, not by emitting
+        navigate actions, so the link case is the COMMON redirect path — without it
+        every "take me to X" read as ``unknown`` and got the wrong "treat-as-final".)
+      - a CLICK on a RE-SELECTABLE control (radio/checkbox/switch/tab/menuitem — a
+        "multiple choice"): re-clicking the alternative reverts the selection.
+
+    Used by BOTH the structural pre-screen (don't ESCALATE these for lacking an
+    on-page undo) and ``classify`` (DOWNGRADE the conservative ``unknown`` for these,
+    since the no-undo net is what made the model hedge ``unknown`` in the first
+    place). The model's CONFIDENT ``irreversible`` is still honoured in ``classify``
+    — only the ``unknown`` is relaxed."""
+    action = proposal.action
+    if action is None:
+        return False
+    if action.kind == "navigate":
+        return True
+    if action.kind == "click":
+        target = _target_node(action.index, page)
+        if target is not None and (
+            target.role == "link" or target.role in _REVERSIBLE_CLICK_ROLES
+        ):
+            return True
+    # A bare FILL commits nothing — the native setter types into a field we can
+    # re-type or clear (the submit is the commit, not the typing), so it is
+    # reversible by our own capability. NOT exempt when ``submit`` is set: a
+    # submitting fill presses Enter and commits the query — consequential, treated
+    # like a click by the structural net. (The live 06-11 run gated a search-box
+    # fill as "treat as final" — the model hedged ``unknown`` because the page has
+    # no on-screen undo, which is exactly the conservative hedge this capability
+    # axis exists to relax.)
+    if action.kind == "fill" and not action.submit:
+        return True
+    return False
+
 
 def classify(
     proposal: Proposal,
@@ -82,6 +142,18 @@ def classify(
         if reasoner_judgment in ("reversible", "irreversible", "unknown")
         else "unknown"
     )
+
+    # CAPABILITY DOWNGRADE (the fix for "every navigation got a treat-as-final
+    # consent"): a move WE can put back ourselves — a navigate / link-click (re-
+    # navigate to url_before) or a re-selectable click (re-click) — is reversible by
+    # construction. The model's conservative ``unknown`` (it hedges because the page
+    # has no on-screen undo) is therefore relaxed to ``reversible`` so navigation
+    # flows without a consent stop. A CONFIDENT ``irreversible`` is NEVER relaxed —
+    # if the model judged the link commits something final, it still gates; and a
+    # bare button that might submit is NOT capability-reversible, so it stays gated
+    # by the structural net below. The agentic invariant is intact.
+    if judgment != "irreversible" and _is_reversible_by_capability(proposal, page):
+        return "reversible"
 
     # --- the independent code structural pre-screen (the "net") --------------
     # The dual-signal half the model can never downgrade past. Escalate-only.
@@ -130,12 +202,31 @@ def _structural_prescreen(
     if action is None:
         return None
 
-    # A pure read has no side-effect; a fill into a field is reversible (you can
-    # re-type). Only click/navigate are structurally consequential here.
-    if action.kind not in ("click", "navigate"):
+    # A pure read has no side-effect; a BARE fill into a field is reversible (you
+    # can re-type). Only click/navigate — and a SUBMITTING fill (``submit=True``
+    # presses Enter, committing the query like a button press) — are structurally
+    # consequential here.
+    if action.kind == "fill" and action.submit:
+        # Fall through to the net below. Its target is an entry field (textbox/
+        # combobox), not a _CONSEQUENTIAL_ROLES control, so the role check yields
+        # ``unknown`` → a submitting fill ALWAYS gates (fail-closed: we cannot
+        # structurally prove what the Enter commits).
+        pass
+    elif action.kind not in ("click", "navigate"):
         return None
 
     target = _target_node(action.index, page)
+
+    # CAPABILITY-AWARE EXEMPTION (the "can WE put it back?" axis). A navigate /
+    # link-click / re-selectable click is reversible by OUR OWN capability,
+    # regardless of any on-page cancel affordance, so the fail-closed no-undo net
+    # below must not force it to ``unknown`` (``classify`` also DOWNGRADES these from
+    # the model's conservative ``unknown``). One source of truth for the role/kind
+    # conditions; ``None`` = no structural escalation → the model's judgement stands
+    # (escalate-only intact: a model ``irreversible`` is never relaxed, and a bare
+    # button that might submit is NOT exempt, so the commit net below still gates it).
+    if _is_reversible_by_capability(proposal, page):
+        return None
 
     # A consequential action whose target role isn't even an actionable control is
     # structurally unidentifiable → unknown (fail-closed).
