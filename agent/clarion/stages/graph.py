@@ -248,14 +248,30 @@ def _with_site_map(orient: PageReadout, site_facts: list[Fact]) -> PageReadout:
     """Return a COPY of the ORIENT readout whose summary carries a SITE MAP block
     built from the per-site structure facts — for PLANNING only (which page to
     navigate to). These are cross-page structure, NOT live current-page values, so
-    they never enter GROUND; the copy keeps the spoken readback path untouched."""
+    they never enter GROUND; the copy keeps the spoken readback path untouched.
+
+    The candidates are framed as MAY-NOT-CONTAIN-THE-TARGET on purpose: the
+    structure index is a vector retriever whose score is a normalized RANK, not a
+    calibrated relevance (a goal whose destination was never indexed still returns
+    the nearest page at a top-rank score — verified empirically), so a numeric
+    threshold cannot tell "indexed" from "absent." The reliable signal is the
+    RANK (the right page sorts first WHEN present); the absent case is rejected
+    SEMANTICALLY by the Reasoner — the LLM already in the loop — not by a cutoff.
+    Hence the instruction below: match a candidate only if it CLEARLY fits the
+    destination the user named, else fall back to the site's own search instead of
+    navigating to a best-guess page (the epistemic invariant at the nav layer:
+    say you can't find it rather than guess). Pure NL steering — no keyword list."""
     lines = "\n".join(
         f"  - {f.value.replace(chr(10), ' · ')[:200]}" for f in site_facts
     )
     extra = (
-        "\n\nSITE MAP (other pages on this site, from prior structure indexing — "
-        "use ONLY to decide which page to navigate to; these are NOT grounded "
-        "current-page values):\n" + lines
+        "\n\nSITE MAP (candidate pages from PRIOR structure indexing — NOT grounded "
+        "current-page values, and NOT guaranteed to include the destination the user "
+        "asked for). Use a candidate ONLY if it CLEARLY matches that destination. If "
+        "none clearly matches, do NOT navigate to a best-guess page — instead use "
+        "this site's own search control (if the page affords one) to look up the "
+        "exact destination, telling the user you're searching because no known page "
+        "matched; if there is no search control, say you could not find it:\n" + lines
     )
     return orient.model_copy(update={"summary": orient.summary + extra})
 
